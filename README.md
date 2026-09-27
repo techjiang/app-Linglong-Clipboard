@@ -284,20 +284,92 @@ linglong-clipboard --clear                   # 清理未固定记录
 linglong-clipboard --compact                 # 压缩数据库
 linglong-clipboard --quick                   # 唤起快速粘贴浮层
 linglong-clipboard --minimized               # 启动后最小化到托盘
+linglong-clipboard --storage-status          # 历史存在哪（SQLite 还是 JSON）
+linglong-clipboard --where                   # 只输出数据目录路径
+linglong-clipboard --storage json            # 切换存储方式
+linglong-clipboard --storage-migrate         # 把记录搬到另一种存储（原数据保留）
 ```
 
 ### 数据存放位置
 
-| 平台 | 位置 |
+历史记录有**两种存储方式**，都在同一个数据目录下，一处就能看全：
+
+| 存储方式 | 文件 | 适合谁 |
+| --- | --- | --- |
+| SQLite（默认） | `history.db` | 记录上万条以上、在意检索速度 |
+| JSON 单文件 | `.clipboard/clipboard.json` | 想看数据长什么样、拷一个文件就搬走 |
+
+数据目录按平台约定：
+
+| 平台 | 历史文件 |
 | --- | --- |
-| Windows | `%APPDATA%\LinglongClipboard\` |
+| Windows | `%APPDATA%\LinglongClipboard\history.db`　或　`…\.clipboard\clipboard.json` |
 | macOS | `~/Library/Application Support/LinglongClipboard/` |
 | Linux | `~/.local/share/linglong-clipboard/`（配置在 `~/.config/linglong-clipboard/`） |
 
-图片附件存在 `images/` 子目录，数据库只存相对路径，
-整体搬走目录也不会失联。
+选 JSON 方式时，历史落在数据目录下的 `.clipboard/clipboard.json`；
+选 SQLite 时是数据目录下的 `history.db`。两者可以共存，互不覆盖。
 
-设置环境变量 `LINGLONG_CLIPBOARD_HOME` 可覆盖全部路径（便携模式）。
+图片附件存在 `images/` 子目录，数据库只存相对路径，整体搬走目录也不会失联。
+JSON 方式下图片默认**内联进历史文件**（data URI），
+所以单个 `clipboard.json` 拷到别的机器，图片也一起跟着走；
+超过 2MB 的大图仍留在 `images/`（可在设置里调上限）。
+
+```bash
+linglong-clipboard --storage-status            # 现在存在哪
+linglong-clipboard --where                     # 只输出数据目录，便于脚本取用
+linglong-clipboard --storage json              # 切到 JSON 单文件
+linglong-clipboard --storage json --storage-migrate   # 切过去，并把已有记录搬过去
+```
+
+**切换存储不会丢数据**：`--storage-migrate` 只做复制，原文件保留，
+后悔了把 `--storage` 切回去即可。也可以在设置页「采集 → 历史存储」里改。
+
+### JSON 格式长什么样
+
+刻意做成一眼能读、能手改的样子：
+
+```json
+{
+  "version": 1,
+  "updated_at": 1790497962.232,
+  "items": [
+    {
+      "id": 1,
+      "kind": "link",
+      "content": "https://cnb.cool/x",
+      "created_at": 1790497962.23,
+      "preview": "https://cnb.cool/x",
+      "source_app": "chrome",
+      "hash": "c5cc4dd941e0914b",
+      "pinned": true,
+      "tags": ["link"],
+      "metadata": { "host": "cnb.cool" }
+    }
+  ],
+  "meta": {}
+}
+```
+
+- 空字段不写进文件（没有 `html`、`files` 就不出现），文件不会被一堆 `""` 撑大
+- 中文不转义，直接 `grep 玲珑 clipboard.json` 就能搜
+- 每条记录都有 `hash`，可用来去重、也可作为跨设备对账依据
+
+设置环境变量 `LINGLONG_CLIPBOARD_HOME` 可覆盖全部路径（便携模式）；
+单独指定 `LINGLONG_CLIPBOARD_JSON_HOME` 可以把 JSON 历史放到 U 盘或同步盘。
+
+### 该选哪种存储
+
+| | SQLite | JSON 单文件 |
+| --- | --- | --- |
+| 记录量 | 十万级无压力 | 几千条以内（每次写入重写整份文件） |
+| 检索 | FTS5 全文索引，毫秒级 | 进程内扫描 + 字段权重打分 |
+| 可读/可手改 | 二进制 | 纯文本 |
+| 备份搬运 | `history.db` + `-wal`/`-shm` | 一个文件 |
+| 崩溃安全 | WAL 日志 | 临时文件 + 原子替换 |
+
+**默认仍是 SQLite**，因为剪贴板历史天然会涨到上万条；
+JSON 是给「我要看得见我的数据」这个需求准备的，不是性能方案。
 
 ---
 
@@ -329,7 +401,7 @@ pytest tests/ --cov=linglong_clip --cov-report=html # 带覆盖率
 QT_QPA_PLATFORM=offscreen pytest tests/test_ui.py   # 无头环境跑界面测试
 ```
 
-454 个用例，覆盖核心逻辑、平台适配、界面组件与端到端流程。
+546 个用例，覆盖核心逻辑、平台适配、界面组件与端到端流程。
 界面测试统一走 Qt 的 `offscreen` 平台，无需真实显示器，CI 里也能跑。
 
 局域网同步的测试**用真实 socket 在 `127.0.0.1` 上起服务**（端口用 0 让系统分配，
@@ -352,6 +424,7 @@ src/linglong_clip/
 ├── core/                    # 与界面无关的核心逻辑（可独立测试）
 │   ├── models.py            #   数据模型与内容指纹
 │   ├── storage.py           #   SQLite + FTS5 持久化与检索
+│   ├── repository.py        #   JSON 单文件存储（与 storage 接口对齐）
 │   ├── classify.py          #   类型识别、敏感检测、标签抽取
 │   ├── privacy.py           #   隐私策略与脱敏
 │   ├── semantic.py          #   意图解析与多信号排序

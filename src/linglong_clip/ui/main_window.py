@@ -152,14 +152,21 @@ class PreviewPanel(QFrame):
         self._stack.setCurrentIndex(1)
 
     def _show_image(self, item: ClipboardItem) -> None:
+        from ..core.repository import is_data_uri
         from ..utils.paths import data_dir
 
-        raw = Path(item.image_path)
-        candidates = [raw] if raw.is_absolute() else [data_dir() / raw]
         pixmap = QPixmap()
-        for candidate in candidates:
-            if candidate.is_file() and pixmap.load(str(candidate)):
-                break
+        if is_data_uri(item.image_path):
+            # JSON 后端把图片内联在历史文件里，直接按字节加载
+            import base64
+
+            pixmap.loadFromData(base64.b64decode(item.image_path.partition(",")[2]))
+        else:
+            raw = Path(item.image_path)
+            candidates = [raw] if raw.is_absolute() else [data_dir() / raw]
+            for candidate in candidates:
+                if candidate.is_file() and pixmap.load(str(candidate)):
+                    break
         if pixmap.isNull():
             self._empty.setText("图片文件已不在本地")
             self._stack.setCurrentIndex(0)

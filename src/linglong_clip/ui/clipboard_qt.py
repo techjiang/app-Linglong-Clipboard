@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 from pathlib import Path
 from typing import List, Optional
@@ -26,12 +27,20 @@ MAX_IMAGE_BYTES = 32 * 1024 * 1024
 class QtClipboardAdapter:
     """实现 `ClipboardMonitor` 期望的 `read_clipboard()` 接口。"""
 
-    def __init__(self, clipboard: QClipboard, images_dir: Path, backend=None) -> None:
+    def __init__(
+        self,
+        clipboard: QClipboard,
+        images_dir: Path,
+        backend=None,
+        on_image_saved=None,
+    ) -> None:
         self._clipboard = clipboard
         self._images_dir = Path(images_dir)
         self._images_dir.mkdir(parents=True, exist_ok=True)
         self._backend = backend
         self._last_image_hash = ""
+        # 图片落盘后的回调：JSON 后端借此把图片内联进历史文件
+        self._on_image_saved = on_image_saved
 
     # ---- 读取 ----
 
@@ -102,6 +111,7 @@ class QtClipboardAdapter:
                 _log.warning("图片写入失败: %s", exc)
                 return None
 
+        self._notify_image_saved(relative=f"{self._images_dir.name}/{filename}", data=png)
         self._last_image_hash = digest
         relative = f"{self._images_dir.name}/{filename}"
         return ClipboardItem(
@@ -147,6 +157,15 @@ class QtClipboardAdapter:
         if html and not text:
             item.hash = content_hash("rich", html)
         return item
+
+    def _notify_image_saved(self, *, relative: str, data: bytes) -> None:
+        """回调失败不能影响采集：图片已经写好了，内联只是增强。"""
+        if self._on_image_saved is None:
+            return
+        try:
+            self._on_image_saved(relative, data)
+        except Exception:  # noqa: BLE001
+            _log.exception("图片落盘回调失败")
 
     @staticmethod
     def _encode_png(image: QImage) -> Optional[bytes]:
@@ -199,12 +218,21 @@ class QtClipboardAdapter:
         self._clipboard.clear(QClipboard.Mode.Clipboard)
 
     def _load_image(self, relative: str) -> Optional[QImage]:
-        """按「绝对路径 -> 数据目录下的相对路径 -> 相对 CWD」依次定位。
+        """按「内联数据 -> 绝对路径 -> 数据目录下的相对路径 -> 相对 CWD」依次定位。
 
         库里存的是相对数据目录的路径，但调用方也可能传入绝对路径，
         两种都要支持；必须用绝对路径交给 QImage，否则会随 CWD 变化而找不到文件。
+        JSON 后端把图片内联成 data URI，这种值本身就是完整载荷，不能再当路径拼。
         """
+        from ..core.repository import is_data_uri
         from ..utils.paths import data_dir
+
+        if is_data_uri(relative):
+            image = QImage.fromData(QByteArray(base64.b64decode(relative.partition(",")[2])))
+            if not image.isNull():
+                return image
+            _log.debug("内联图片解码失败")
+            return None
 
         raw = Path(relative)
         candidates = [raw] if raw.is_absolute() else [data_dir() / raw, Path.cwd() / raw]

@@ -9,6 +9,11 @@ from pathlib import Path
 APP_NAME = "LinglongClipboard"
 APP_DIR_NAME = "linglong-clipboard"
 
+#: JSON 单文件后端的数据目录名。与 SQLite 后端共用同一层目录，
+#: 用户在一处就能看到「历史数据库」和「历史 JSON」，不必猜第二个位置。
+JSON_DIR_NAME = ".clipboard"
+JSON_FILE_NAME = "clipboard.json"
+
 
 def is_windows() -> bool:
     return sys.platform.startswith("win")
@@ -71,6 +76,19 @@ def log_dir() -> Path:
 
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def json_dir() -> Path:
+    """JSON 单文件后端的数据目录（不自动创建，交给写文件时创建）。"""
+    override = os.environ.get("LINGLONG_CLIPBOARD_JSON_HOME")
+    if override:
+        return Path(override).expanduser()
+    return data_dir() / JSON_DIR_NAME
+
+
+def json_path() -> Path:
+    """JSON 历史文件路径。"""
+    return json_dir() / JSON_FILE_NAME
 
 
 def database_path() -> Path:

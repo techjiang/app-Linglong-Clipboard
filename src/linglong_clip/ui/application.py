@@ -24,13 +24,13 @@ from ..core.monitor import ClipboardMonitor, FocusTracker
 from ..core.ocr import build_engine as build_ocr_engine
 from ..core.privacy import PrivacyGuard
 from ..core.semantic import SemanticEngine
-from ..core.storage import Storage
+from ..core.repository import open_repository
 from ..core.lan_sync import LanSync, build_lan_sync
 from ..core.sync import FolderSync, SyncCipher
 from ..platform import detect_backend
 from ..utils.config import Config
 from ..utils.logger import get_logger, setup_logging
-from ..utils.paths import data_dir, is_linux
+from ..utils.paths import is_linux
 from .clipboard_qt import QtClipboardAdapter
 from .hotkeys import HotkeyManager
 from .main_window import MainWindow
@@ -127,7 +127,7 @@ class Application(QObject):
         self.config = Config()
         self._setup_logging()
 
-        self.storage = Storage()
+        self.storage = open_repository(self.config)
         self.backend = detect_backend()
         self.guard = PrivacyGuard(self.config)
         self.automation = AutomationEngine()
@@ -153,7 +153,10 @@ class Application(QObject):
         self.tray = TrayIcon(palette_for(self.config.get("ui.theme", "system")))
 
         self.clipboard = QtClipboardAdapter(
-            self.qt_app.clipboard(), data_dir() / "images", self.backend
+            self.qt_app.clipboard(),
+            self.storage.images_dir,
+            self.backend,
+            on_image_saved=self._on_image_saved,
         )
         self.monitor = ClipboardMonitor(
             self.clipboard,
@@ -178,6 +181,26 @@ class Application(QObject):
 
         level = logging.DEBUG if os.environ.get("LINGLONG_DEBUG") else logging.INFO
         setup_logging(level)
+
+    def _on_image_saved(self, relative: str, data: bytes) -> None:
+        """JSON 后端：把图片内联进历史文件，实现「单文件即可搬走」。
+
+        只在真正的 JSON 后端里做，SQLite 后端仍走 `images/` 目录，
+        不做无用的 base64 膨胀。
+        """
+        if not hasattr(self.storage, "set_image_data"):
+            return
+        if not self.config.get("storage.json_inline_images", True):
+            return
+        import base64
+
+        limit = int(self.config.get("storage.json_max_inline_image_kb", 2048) or 2048) * 1024
+        if len(data) > limit:
+            _log.info("图片 %.1fKB 超过内联上限，仍存为独立文件", len(data) / 1024)
+            return
+        self.storage.set_image_data(
+            relative, f"data:image/png;base64,{base64.b64encode(data).decode('ascii')}"
+        )
 
     def _device_name(self) -> str:
         import socket

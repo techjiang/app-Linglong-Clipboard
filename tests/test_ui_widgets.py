@@ -371,3 +371,69 @@ def test_null_backend_hotkeys():
     assert backend.is_available() is False
     assert backend.register(1, "Ctrl+A", lambda: None) is False
     backend.unregister_all([1])  # 不应抛出
+
+
+# ---- 设置页：历史存储 ----
+
+
+def test_settings_exposes_storage_backend(qt_app, home):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    dialog = SettingsDialog(config)
+    assert dialog._storage_backend.currentData() == "sqlite"
+    assert dialog._storage_backend.count() == 2
+
+
+def test_settings_saves_storage_backend(qt_app, home):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    dialog = SettingsDialog(config)
+    dialog._storage_backend.setCurrentIndex(dialog._storage_backend.findData("json"))
+    dialog._save()
+
+    assert config.get("storage.backend") == "json"
+    assert "storage.backend" in dialog.changes
+
+
+def test_settings_storage_hint_switches_with_backend(qt_app, home):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    dialog = SettingsDialog(Config(home / "config.json"))
+    dialog._storage_backend.setCurrentIndex(dialog._storage_backend.findData("sqlite"))
+    assert "SQLite" in dialog._storage_hint.text()
+    assert not dialog._storage_inline.isEnabled()
+
+    dialog._storage_backend.setCurrentIndex(dialog._storage_backend.findData("json"))
+    assert "storage-migrate" in dialog._storage_hint.text()
+    assert dialog._storage_inline.isEnabled()
+    assert dialog._storage_limit.isEnabled()
+
+
+def test_settings_about_shows_history_location(qt_app, home):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    config.set("storage.backend", "json")
+    dialog = SettingsDialog(config)
+    assert dialog._storage_location.endswith(".clipboard/clipboard.json")
+
+
+def test_settings_saves_json_inline_options(qt_app, home):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    dialog = SettingsDialog(config)
+    dialog._storage_backend.setCurrentIndex(dialog._storage_backend.findData("json"))
+    dialog._storage_inline.setChecked(False)
+    dialog._storage_limit.setValue(512)
+    dialog._save()
+
+    assert config.get("storage.json_inline_images") is False
+    assert config.get("storage.json_max_inline_image_kb") == 512

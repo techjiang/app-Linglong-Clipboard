@@ -210,3 +210,125 @@ def test_parser_has_all_modes():
     for expected in ("quick", "minimized", "list", "search", "get", "stats", "clear",
                      "compact", "json", "plain", "sync_status"):
         assert expected in options
+
+
+# ---- 历史存储切换 ----
+
+
+def test_storage_status_defaults_to_sqlite(home, capsys):
+    assert main(["--storage-status"]) == 0
+    out = capsys.readouterr().out
+    assert "SQLite" in out
+    assert "history.db" in out
+
+
+def test_storage_status_json_backend(home, capsys):
+    main(["--storage", "json"])
+    capsys.readouterr()
+    assert main(["--storage-status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["backend"] == "json"
+    assert payload["path"].endswith(".clipboard/clipboard.json")
+
+
+def test_storage_switch_is_idempotent(home, capsys):
+    main(["--storage", "json"])
+    capsys.readouterr()
+    assert main(["--storage", "json"]) == 0
+    assert "无需切换" in capsys.readouterr().out
+
+
+def test_where_prints_data_dir(home, capsys):
+    assert main(["--where"]) == 0
+    assert capsys.readouterr().out.strip() == str(home)
+
+
+def test_list_uses_json_backend(home, capsys):
+    """切到 JSON 后，CLI 读写的就是那个文件，而不是 history.db。"""
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.repository import JsonRepository
+    from linglong_clip.utils import paths
+
+    main(["--storage", "json"])
+    repo = JsonRepository(paths.json_path())
+    repo.add(ClipboardItem(kind="text", content="json 里的记录", preview="json 里的记录", hash="h"))
+    repo.close()
+    capsys.readouterr()
+
+    assert main(["--list"]) == 0
+    assert "json 里的记录" in capsys.readouterr().out
+    assert not (home / "history.db").exists()
+
+
+def test_migrate_sqlite_to_json(home, capsys):
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.repository import JsonRepository
+    from linglong_clip.core.storage import Storage
+    from linglong_clip.utils import paths
+
+    storage = Storage(home / "history.db")
+    storage.add(ClipboardItem(kind="text", content="要搬过去的记录", preview="p", hash="h1"))
+    storage.close()
+
+    assert main(["--storage", "json", "--storage-migrate"]) == 0
+    assert "复制 1 条" in capsys.readouterr().out
+
+    repo = JsonRepository(paths.json_path())
+    assert [item.content for item in repo.list()] == ["要搬过去的记录"]
+    repo.close()
+    # 原数据保留，用户后悔时还能切回去
+    assert (home / "history.db").exists()
+
+
+def test_migrate_skips_existing_hashes(home, capsys):
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.repository import JsonRepository
+    from linglong_clip.core.storage import Storage
+    from linglong_clip.utils import paths
+
+    repo = JsonRepository(paths.json_path())
+    repo.add(ClipboardItem(kind="text", content="已存在", preview="p", hash="dup"))
+    repo.close()
+
+    storage = Storage(home / "history.db")
+    storage.add(ClipboardItem(kind="text", content="已存在", preview="p", hash="dup"))
+    storage.close()
+
+    capsys.readouterr()
+    assert main(["--storage", "json", "--storage-migrate"]) == 0
+    assert "复制 0 条" in capsys.readouterr().out
+
+
+def test_migrate_json_to_sqlite(home, capsys):
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.repository import JsonRepository
+    from linglong_clip.core.storage import Storage
+    from linglong_clip.utils import paths
+
+    repo = JsonRepository(paths.json_path())
+    repo.add(ClipboardItem(kind="link", content="https://cnb.cool", preview="p", hash="h2"))
+    repo.close()
+
+    main(["--storage", "json"])
+    capsys.readouterr()
+    assert main(["--storage-migrate"]) == 0  # 当前是 sqlite 源，目标是 json
+    assert main(["--storage", "sqlite", "--storage-migrate"]) == 0  # 再搬回来
+    assert "复制 1 条" in capsys.readouterr().out
+
+    storage = Storage(home / "history.db")
+    assert [item.content for item in storage.list()] == ["https://cnb.cool"]
+    storage.close()
+
+
+def test_storage_status_mentions_other_backend(home, capsys):
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.storage import Storage
+
+    storage = Storage(home / "history.db")
+    storage.add(ClipboardItem(kind="text", content="x", preview="p", hash="h"))
+    storage.close()
+
+    main(["--storage", "json"])
+    capsys.readouterr()
+    assert main(["--storage-status"]) == 0
+    assert "另一种存储也有数据" in capsys.readouterr().out

@@ -258,3 +258,105 @@ def test_device_name_falls_back_to_hostname(app_instance):
 def test_sync_build_skipped_without_folder(app_instance):
     app_instance.config.set("sync.folder", "")
     assert app_instance._build_sync() is None
+
+
+# ---- 历史存储装配 ----
+
+def test_application_uses_sqlite_by_default(app_instance):
+    from linglong_clip.core.storage import Storage
+
+    assert isinstance(app_instance.storage, Storage)
+
+
+def test_application_uses_json_backend_when_configured(home, monkeypatch, qt_app):
+    monkeypatch.setenv("LINGLONG_CLIPBOARD_HOME", str(home))
+    from linglong_clip.core.repository import JsonRepository
+    from linglong_clip.ui.application import Application
+    from linglong_clip.utils.config import Config
+
+    Config(home / "config.json").set("storage.backend", "json")
+    instance = Application(["test"])
+    try:
+        assert isinstance(instance.storage, JsonRepository)
+        assert instance.storage.path == home / ".clipboard" / "clipboard.json"
+        # 图片目录跟着 JSON 走，采集出来的图片与历史文件同处一地
+        assert instance.clipboard._images_dir == instance.storage.images_dir
+    finally:
+        instance.monitor.stop()
+        instance.hotkeys.unregister_all()
+        instance.storage.close()
+
+
+def test_json_backend_creates_file_on_start(home, monkeypatch, qt_app):
+    monkeypatch.setenv("LINGLONG_CLIPBOARD_HOME", str(home))
+    from linglong_clip.ui.application import Application
+    from linglong_clip.utils.config import Config
+
+    Config(home / "config.json").set("storage.backend", "json")
+    instance = Application(["test"])
+    try:
+        assert (home / ".clipboard" / "clipboard.json").is_file()
+    finally:
+        instance.monitor.stop()
+        instance.hotkeys.unregister_all()
+        instance.storage.close()
+
+
+def test_image_saved_is_inlined_for_json_backend(home, monkeypatch, qt_app):
+    """JSON 后端下，图片落盘后应立刻以 data URI 内联进历史。"""
+    monkeypatch.setenv("LINGLONG_CLIPBOARD_HOME", str(home))
+    from linglong_clip.ui.application import Application
+    from linglong_clip.utils.config import Config
+
+    Config(home / "config.json").set("storage.backend", "json")
+    instance = Application(["test"])
+    try:
+        payload = b"\x89PNG fake image"
+        instance._on_image_saved("images/abc.png", payload)
+        assert instance.storage._images["images/abc.png"].startswith("data:image/png;base64,")
+        assert instance.storage.read_image_bytes("images/abc.png") == payload
+    finally:
+        instance.monitor.stop()
+        instance.hotkeys.unregister_all()
+        instance.storage.close()
+
+
+def test_image_inlining_can_be_disabled(home, monkeypatch, qt_app):
+    monkeypatch.setenv("LINGLONG_CLIPBOARD_HOME", str(home))
+    from linglong_clip.ui.application import Application
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    config.set("storage.backend", "json")
+    config.set("storage.json_inline_images", False)
+    instance = Application(["test"])
+    try:
+        instance._on_image_saved("images/abc.png", b"data")
+        assert "images/abc.png" not in instance.storage._images
+    finally:
+        instance.monitor.stop()
+        instance.hotkeys.unregister_all()
+        instance.storage.close()
+
+
+def test_oversized_image_is_not_inlined(home, monkeypatch, qt_app):
+    monkeypatch.setenv("LINGLONG_CLIPBOARD_HOME", str(home))
+    from linglong_clip.ui.application import Application
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    config.set("storage.backend", "json")
+    config.set("storage.json_max_inline_image_kb", 1)
+    instance = Application(["test"])
+    try:
+        instance._on_image_saved("images/big.png", b"x" * 4096)
+        assert "images/big.png" not in instance.storage._images
+    finally:
+        instance.monitor.stop()
+        instance.hotkeys.unregister_all()
+        instance.storage.close()
+
+
+def test_sqlite_backend_does_not_inline_images(app_instance):
+    app_instance._on_image_saved("images/abc.png", b"data")
+    assert not hasattr(app_instance.storage, "set_image_data")

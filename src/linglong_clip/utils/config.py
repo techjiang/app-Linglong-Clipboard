@@ -67,6 +67,13 @@ DEFAULTS: Dict[str, Any] = {
         # 自动发现依赖 UDP 广播，部分 Wi-Fi 会拦截，故默认关闭
         "lan_discovery": False,
     },
+    "storage": {
+        # sqlite = 单文件数据库（默认，记录量大更合适）
+        # json   = <数据目录>/.clipboard/clipboard.json（可直接阅读与搬运）
+        "backend": "sqlite",
+        "json_inline_images": True,
+        "json_max_inline_image_kb": 2048,
+    },
     "automation": {
         "workflows": [],
     },

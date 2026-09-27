@@ -20,6 +20,7 @@ sudo apt-get install -y libegl1 libglib2.0-0 libxkbcommon-x11-0 libdbus-1-3
 | `core/` 不导入 Qt | 核心逻辑要能在无图形环境下测试；也让换界面框架的代价可控 |
 | `ui/`、`core/` 里不出现 `sys.platform` 判断 | 平台差异必须收敛在 `platform/` |
 | `ui/` 不直接读写数据库 | 界面通过信号发意图，由 `Application` 统一处理 |
+| 历史仓库通过 `core/repository.py` 的 `open_repository()` 获取 | 存储有 SQLite 与 JSON 两种后端，调用方不该到处判分支 |
 
 ### 新增原生能力
 
@@ -27,6 +28,23 @@ sudo apt-get install -y libegl1 libglib2.0-0 libxkbcommon-x11-0 libdbus-1-3
 每个方法都有「不支持」的默认实现，子类只覆盖自己能做到的。
 
 并在 README 的「三平台原生适配」表格里补上对应格子。
+
+### 新增存储后端
+
+`core/storage.py`（SQLite）与 `core/repository.py`（JSON 单文件）是**并列**关系，
+不是继承关系。要加第三种后端，实现同一组方法即可：
+
+```
+add / touch / update_fields / delete / delete_many / clear
+get / find_by_hash / latest / list / search
+count / count_by_kind / top_sources / dedupe
+enforce_limits / purge_expired_sensitive
+get_meta / set_meta / optimize / stats / close
+```
+
+并在 `open_repository()` 里加分支、在 `config.DEFAULTS["storage"]` 里加可选项。
+注意 `images_dir` 属性必须存在 —— 采集器要用它决定图片放哪。
+`tests/test_repository.py` 的用例可以照着抄一份给新后端。
 
 ### 新增转换器
 

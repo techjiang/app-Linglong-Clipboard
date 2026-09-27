@@ -29,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  linglong-clipboard --get 12         输出第 12 条内容\n"
             "  linglong-clipboard --stats          查看统计与检索能力\n"
             "  linglong-clipboard --sync-status    查看同步模式与对端状态\n"
+            "  linglong-clipboard --storage-status 查看历史文件的存放位置\n"
         ),
     )
     parser.add_argument("--version", action="version", version=f"玲珑剪切板 {__version__}")
@@ -60,6 +61,28 @@ def build_parser() -> argparse.ArgumentParser:
     maintenance.add_argument("--export-sync", action="store_true", help="导出到同步来源")
     maintenance.add_argument("--sync-status", action="store_true", help="查看同步模式与对端状态")
 
+    storage_group = parser.add_argument_group("历史存储")
+    storage_group.add_argument(
+        "--storage-status",
+        action="store_true",
+        help="显示当前历史存到哪里（SQLite 或 JSON 单文件）",
+    )
+    storage_group.add_argument(
+        "--storage",
+        choices=["sqlite", "json"],
+        help="切换历史存储方式：sqlite（默认）或 json（<数据目录>/.clipboard/clipboard.json）",
+    )
+    storage_group.add_argument(
+        "--storage-migrate",
+        action="store_true",
+        help="把当前存储里的记录复制到另一种存储方式（不删除原数据）",
+    )
+    storage_group.add_argument(
+        "--where",
+        action="store_true",
+        help="只输出数据目录路径，便于脚本取用",
+    )
+
     output = parser.add_argument_group("输出")
     output.add_argument("--json", action="store_true", help="以 JSON 输出，便于脚本处理")
     output.add_argument("--plain", action="store_true", help="只输出内容，不带格式")
@@ -67,9 +90,100 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _load_storage(config=None):
-    from .core.storage import Storage
+    """按配置打开历史仓库（SQLite 或 JSON 单文件）。"""
+    from .core.repository import open_repository
+    from .utils.config import Config
 
-    return Storage()
+    return open_repository(config or Config())
+
+
+def _apply_storage_switch(args, config) -> int:
+    """处理 `--storage` / `--storage-migrate` / `--where` / `--storage-status`。"""
+    from .utils.paths import data_dir, database_path, json_path
+
+    if args.where:
+        print(data_dir())
+        return 0
+
+    # 搬运的源是「配置里原本的后端」，目标是切换后的那个，
+    # 所以这里必须在 `--storage` 生效前先记下来。
+    previous_backend = str(config.get("storage.backend", "sqlite") or "sqlite").lower()
+    if args.storage:
+        if args.storage == previous_backend:
+            print(f"当前已经是 {args.storage} 存储，无需切换")
+        else:
+            config.set("storage.backend", args.storage)
+
+    if args.storage_migrate:
+        return _migrate_storage(previous_backend=previous_backend, config=config)
+
+    if args.storage_status:
+        backend = str(config.get("storage.backend", "sqlite") or "sqlite")
+        target = json_path() if backend == "json" else database_path()
+        payload = {
+            "backend": backend,
+            "path": str(target),
+            "exists": target.exists(),
+            "size": target.stat().st_size if target.exists() else 0,
+            "sqlite_path": str(database_path()),
+            "json_path": str(json_path()),
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0
+        label = "JSON 单文件" if backend == "json" else "SQLite 数据库"
+        print(f"存储方式：{label}")
+        print(f"历史文件：{target}{'' if target.exists() else '（尚未创建）'}")
+        if target.exists():
+            print(f"文件大小：{target.stat().st_size / 1024:.1f} KB")
+        other = database_path() if backend == "json" else json_path()
+        if other.exists():
+            print(f"另一种存储也有数据：{other}（可用 --storage-migrate 合并）")
+        return 0
+
+    if args.storage:
+        backend = str(config.get("storage.backend", "sqlite") or "sqlite")
+        print(f"已切换为 {backend} 存储（下次启动生效）")
+        return 0
+
+    return -1
+
+
+def _migrate_storage(*, previous_backend: str, config) -> int:
+    """把记录从「原本的后端」复制到「配置里现在的后端」，原数据保留以便回退。
+
+    这样 `--storage json --storage-migrate` 一条命令就能「切过去 + 搬过去」。
+    """
+    from .core.repository import JsonRepository
+    from .core.storage import Storage
+    from .utils.paths import database_path, json_path
+
+    # 重新读一次配置：调用方可能刚用 `--storage` 改过，必须拿落盘后的新值
+    config.load()
+    to_backend = str(config.get("storage.backend", "sqlite") or "sqlite").lower()
+    if previous_backend == to_backend:
+        print(f"源与目标都是 {previous_backend} storage，无需搬运（用 --storage 指定要切到哪种）")
+        return 0
+
+    source_is_json = previous_backend == "json"
+    source = JsonRepository(json_path()) if source_is_json else Storage(database_path())
+    target = Storage(database_path()) if source_is_json else JsonRepository(json_path())
+
+    items = source.list(limit=100_000)
+    known = {item.hash for item in target.list(limit=100_000) if item.hash}
+    copied = 0
+    for item in items:
+        if item.hash and item.hash in known:
+            continue
+        item.id = None
+        target.add(item)
+        copied += 1
+    source.close()
+    target.close()
+
+    direction = "JSON -> SQLite" if source_is_json else "SQLite -> JSON"
+    print(f"已从 {direction} 复制 {copied} 条记录（共 {len(items)} 条，原数据保留）")
+    return 0
 
 
 def _print_items(items, *, as_json: bool, plain: bool, limit: int) -> None:
@@ -118,16 +232,21 @@ def _print_items(items, *, as_json: bool, plain: bool, limit: int) -> None:
 
 def _run_cli(args: argparse.Namespace) -> int:
     from .core.semantic import SemanticEngine
-    from .core.storage import Storage
+    from .utils.config import Config
 
-    storage = Storage()
+    config = Config()
+
+    handled = _apply_storage_switch(args, config)
+    if handled >= 0:
+        return handled
+
+    storage = _load_storage(config)
 
     if args.stats:
         from .core.ocr import build_engine
-        from .utils.config import Config
 
         stats = storage.stats()
-        ocr_status = build_engine(Config()).status()
+        ocr_status = build_engine(config).status()
         stats["ocr"] = ocr_status
         if args.json:
             print(json.dumps(stats, ensure_ascii=False, indent=2))
@@ -202,9 +321,7 @@ def _run_cli(args: argparse.Namespace) -> int:
 
     if args.sync_status:
         from .core.lan_sync import build_lan_sync
-        from .utils.config import Config
 
-        config = Config()
         mode = str(config.get("sync.mode", "folder") or "folder").lower()
         if mode == "lan":
             node = build_lan_sync(storage, config)
@@ -250,9 +367,7 @@ def _run_cli(args: argparse.Namespace) -> int:
 
     if args.import_sync or args.export_sync:
         from .core.sync import FolderSync, SyncCipher
-        from .utils.config import Config
 
-        config = Config()
         mode = str(config.get("sync.mode", "folder") or "folder").lower()
         import socket
 
@@ -317,6 +432,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.import_sync,
             args.export_sync,
             args.sync_status,
+            args.storage_status,
+            args.storage is not None,
+            args.storage_migrate,
+            args.where,
         ]
     ):
         return _run_cli(args)

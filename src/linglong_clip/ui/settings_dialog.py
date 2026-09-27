@@ -136,6 +136,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(self._build_ocr_group())
 
         layout.addWidget(history_group)
+        layout.addWidget(self._build_storage_group())
         layout.addStretch(1)
         return page
 
@@ -420,8 +421,76 @@ class SettingsDialog(QDialog):
         layout.addLayout(row)
         return page
 
+    def _build_storage_group(self) -> QGroupBox:
+        """历史存储方式：SQLite 数据库或 .clipboard/clipboard.json。
+
+        默认仍是 SQLite；JSON 单文件适合「想看数据长什么样」「拷一个文件搬机器」的场景，
+        代价是记录量大时每次写入都要重写整份文件。
+        """
+        from ..utils.paths import data_dir, database_path, json_path
+
+        group = QGroupBox("历史存储")
+        form = QFormLayout(group)
+
+        self._storage_backend = QComboBox()
+        self._storage_backend.addItem("SQLite 数据库（默认，记录多时更合适）", "sqlite")
+        self._storage_backend.addItem("JSON 单文件（.clipboard/clipboard.json，可读可搬）", "json")
+        current = str(self._config.get("storage.backend", "sqlite") or "sqlite")
+        self._storage_backend.setCurrentIndex(max(0, self._storage_backend.findData(current)))
+        form.addRow("存储方式", self._storage_backend)
+
+        self._storage_inline = QCheckBox("图片以 data URI 内联进 JSON 文件")
+        self._storage_inline.setChecked(bool(self._config.get("storage.json_inline_images", True)))
+        self._storage_inline.setToolTip("内联后单个文件即可搬走，代价是文件变大（约 +33%）。")
+        form.addRow("", self._storage_inline)
+
+        self._storage_limit = QSpinBox()
+        self._storage_limit.setRange(64, 32 * 1024)
+        self._storage_limit.setSingleStep(256)
+        self._storage_limit.setSuffix(" KB")
+        self._storage_limit.setValue(int(self._config.get("storage.json_max_inline_image_kb", 2048) or 2048))
+        self._storage_limit.setToolTip("超过该大小的图片仍存为 images/ 下的独立文件。")
+        form.addRow("内联图片上限", self._storage_limit)
+
+        path_label = QLabel(
+            f"数据目录：{data_dir()}\n"
+            f"SQLite：{database_path().name}　·　JSON：{json_path()}"
+        )
+        path_label.setWordWrap(True)
+        path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        form.addRow("存放位置", path_label)
+
+        self._storage_hint = QLabel()
+        self._storage_hint.setWordWrap(True)
+        form.addRow("", self._storage_hint)
+        self._storage_backend.currentIndexChanged.connect(self._refresh_storage_hint)
+        self._refresh_storage_hint()
+
+        self._storage_inline.setEnabled(self._storage_backend.currentData() == "json")
+        self._storage_limit.setEnabled(self._storage_backend.currentData() == "json")
+        return group
+
+    def _refresh_storage_hint(self) -> None:
+        is_json = self._storage_backend.currentData() == "json"
+        self._storage_inline.setEnabled(is_json)
+        self._storage_limit.setEnabled(is_json)
+        if is_json:
+            self._storage_hint.setText(
+                "切换后重启生效。已有记录可用命令行搬运："
+                "linglong-clipboard --storage-migrate（原数据保留，不会丢）。"
+            )
+        else:
+            self._storage_hint.setText(
+                "SQLite 仍是默认选择：记录量大、检索快。"
+                "想看数据长什么样或整份搬走时，再切到 JSON。"
+            )
+
     def _build_about_tab(self) -> QWidget:
         from .. import __version__
+        from ..utils.paths import database_path, json_path
+
+        backend = str(self._config.get("storage.backend", "sqlite") or "sqlite")
+        self._storage_location = str(json_path() if backend == "json" else database_path())
 
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -436,7 +505,8 @@ class SettingsDialog(QDialog):
             "<p style='color:#8d96a8'>"
             f"运行环境：{_platform.platform()}<br>"
             f"Python {sys.version.split()[0]}<br>"
-            f"配置目录：{self._config.path.parent}"
+            f"配置目录：{self._config.path.parent}<br>"
+            f"历史文件：{self._storage_location}"
             "</p>"
         )
         text.setWordWrap(True)
@@ -495,6 +565,9 @@ class SettingsDialog(QDialog):
             "privacy.sensitive_retention_seconds": self._sensitive_retention.value(),
             "privacy.sensitive_auto_clear_seconds": self._auto_clear.value(),
             "privacy.redact_on_copy_out": self._redact.isChecked(),
+            "storage.backend": self._storage_backend.currentData(),
+            "storage.json_inline_images": self._storage_inline.isChecked(),
+            "storage.json_max_inline_image_kb": self._storage_limit.value(),
             "ocr.enabled": self._ocr_enabled.isChecked(),
             "ocr.languages": self._ocr_languages.text().strip(),
             "ocr.min_confidence": self._ocr_min_confidence.value(),

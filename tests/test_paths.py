@@ -32,3 +32,23 @@ def test_database_and_config_paths_are_under_home(home, monkeypatch):
 def test_log_dir_created(home, monkeypatch):
     monkeypatch.setenv("LINGLONG_CLIPBOARD_HOME", str(home))
     assert paths.log_dir().is_dir()
+
+
+def test_json_paths_follow_data_dir(home, monkeypatch):
+    monkeypatch.setenv("LINGLONG_CLIPBOARD_HOME", str(home))
+    assert paths.json_dir() == home / ".clipboard"
+    assert paths.json_path() == home / ".clipboard" / "clipboard.json"
+
+
+def test_json_dir_can_be_overridden(home, monkeypatch):
+    """JSON 目录可单独指定，便于把历史放到同步盘或 U 盘。"""
+    monkeypatch.setenv("LINGLONG_CLIPBOARD_HOME", str(home))
+    monkeypatch.setenv("LINGLONG_CLIPBOARD_JSON_HOME", str(home / "usb"))
+    assert paths.json_dir() == home / "usb"
+    assert paths.json_path() == home / "usb" / "clipboard.json"
+
+
+def test_json_dir_is_not_created_eagerly(home, monkeypatch):
+    """与 data_dir 不同：目录留给写文件时创建，避免只读环境里启动就报错。"""
+    monkeypatch.setenv("LINGLONG_CLIPBOARD_HOME", str(home / "fresh"))
+    assert not paths.json_dir().exists()
