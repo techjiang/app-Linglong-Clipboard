@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -159,3 +160,101 @@ def test_tags_survive_storage_roundtrip(pipeline):
     reloaded = storage.get(saved.id)
     assert "bug" in reloaded.tags
     assert "urgent" in reloaded.tags
+
+
+# ---- OCR 端到端：截图 → 文字 → 检索 ----
+
+
+class _StubOcrBackend:
+    """按文件名决定识别结果，避免端到端测试依赖系统装了 tesseract。"""
+
+    name = "stub"
+
+    def __init__(self, text: str):
+        self.text = text
+
+    def available(self) -> bool:
+        return True
+
+    def languages(self):
+        return ("eng",)
+
+    def recognize(self, image_path, languages):
+        from linglong_clip.core.ocr import OcrResult
+
+        return OcrResult(text=self.text, confidence=93.0, language=languages, backend=self.name)
+
+
+def _image_item(home, name="shot.png", digest="img"):
+    """造一张真实的 PNG，让 OcrEngine 的「文件存在」检查能通过。"""
+    from PySide6.QtGui import QColor, QImage
+
+    target = home / name
+    image = QImage(32, 32, QImage.Format.Format_RGB32)
+    image.fill(QColor("#ffffff"))
+    image.save(str(target))
+    return ClipboardItem(
+        kind="image", image_path=str(target), hash=digest, preview="", image_width=32, image_height=32
+    )
+
+
+@pytest.fixture()
+def ocr_pipeline(storage, config, home):
+    from linglong_clip.core.ocr import OcrEngine
+
+    collector = Collector(
+        storage, config, PrivacyGuard(config), ocr=OcrEngine(backend=_StubOcrBackend("release notes 2024"))
+    )
+    return collector, storage
+
+
+def test_screenshot_text_is_searchable(ocr_pipeline):
+    collector, storage = ocr_pipeline
+
+    outcome, saved = collector.process(_image_item(Path(storage.path).parent))
+    assert outcome == CAPTURED
+    assert saved.kind == "image"
+    # 识别文本进入 content 后，即可被全文检索命中
+    assert saved.content == "release notes 2024"
+    assert "release" in saved.preview
+
+    engine = SemanticEngine(storage)
+    hits = engine.search("release")
+    assert len(hits) == 1
+    assert hits[0].kind == "image"
+
+
+def test_screenshot_with_secret_is_blocked(storage, config, home):
+    """截图里是密钥时必须和纯文本一样被拦下，不能因为「是图片」就放行。"""
+    from linglong_clip.core.ocr import OcrEngine
+
+    collector = Collector(
+        storage,
+        config,
+        PrivacyGuard(config),
+        ocr=OcrEngine(backend=_StubOcrBackend("token: sk-abcdefghijklmnopqrstuvwxyz")),
+    )
+
+    outcome, saved = collector.process(_image_item(home, "secret.png", "img-secret"))
+    assert outcome == SKIPPED_PRIVACY
+    assert saved is None
+    assert storage.count() == 0
+
+
+def test_screenshot_without_ocr_still_captured(storage, config, home):
+    collector = Collector(storage, config, PrivacyGuard(config))
+    outcome, saved = collector.process(_image_item(home, "plain.png", "img-plain"))
+
+    assert outcome == CAPTURED
+    assert saved.content == ""
+    assert saved.preview == "[图片]"
+
+
+def test_semantic_search_mixes_text_and_ocr_results(ocr_pipeline):
+    collector, storage = ocr_pipeline
+    collector.process(_image_item(Path(storage.path).parent, "a.png", "img-a"))
+    collector.process(ClipboardItem(kind="text", content="release 计划", hash="t-1"))
+
+    engine = SemanticEngine(storage)
+    hits = engine.search("release")
+    assert {hit.kind for hit in hits} == {"image", "text"}

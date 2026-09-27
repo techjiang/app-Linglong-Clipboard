@@ -107,6 +107,93 @@ def test_dialog_about_tab_shows_version(dialog):
     assert __version__
 
 
+# ---- 设置对话框：OCR ----
+
+
+def test_dialog_reflects_ocr_config(dialog, config):
+    assert dialog._ocr_enabled.isChecked() == config.get("ocr.enabled")
+    assert dialog._ocr_languages.text() == (config.get("ocr.languages") or "")
+    assert dialog._ocr_min_confidence.value() == config.get("ocr.min_confidence")
+
+
+def test_dialog_saves_ocr_config(dialog, config):
+    dialog._ocr_enabled.setChecked(False)
+    dialog._ocr_languages.setText("chi_sim+eng")
+    dialog._ocr_min_confidence.setValue(45)
+    dialog._save()
+
+    assert config.get("ocr.enabled") is False
+    assert config.get("ocr.languages") == "chi_sim+eng"
+    assert config.get("ocr.min_confidence") == 45
+
+
+def test_ocr_status_reports_unavailable_when_disabled(dialog):
+    dialog._ocr_enabled.setChecked(False)
+    assert "已关闭" in dialog._ocr_status.text()
+
+
+def test_ocr_status_reflects_environment(dialog):
+    dialog._ocr_enabled.setChecked(True)
+    text = dialog._ocr_status.text()
+    # 已装 tesseract 时报告可用，未装时报告不可用，两者都不能是空白
+    assert ("可用" in text) or ("不可用" in text)
+
+
+# ---- 设置对话框：局域网同步 ----
+
+
+def test_dialog_reflects_lan_config(dialog, config):
+    assert dialog._sync_mode.currentData() == config.get("sync.mode")
+    assert dialog._lan_port.value() == config.get("sync.lan_port")
+    assert dialog._lan_discovery.isChecked() == config.get("sync.lan_discovery")
+
+
+def test_lan_fields_disabled_in_folder_mode(dialog):
+    dialog._sync_mode.setCurrentIndex(dialog._sync_mode.findData("folder"))
+    assert dialog._lan_token.isEnabled() is False
+    assert dialog._lan_peers.isEnabled() is False
+    assert "共享文件夹" in dialog._lan_status.text()
+
+
+def test_lan_fields_enabled_in_lan_mode(dialog):
+    dialog._sync_mode.setCurrentIndex(dialog._sync_mode.findData("lan"))
+    assert dialog._lan_token.isEnabled() is True
+    assert dialog._lan_peers.isEnabled() is True
+    assert "局域网直连" in dialog._lan_status.text()
+
+
+def test_dialog_saves_lan_config(dialog, config):
+    dialog._sync_enabled.setChecked(True)
+    dialog._sync_mode.setCurrentIndex(dialog._sync_mode.findData("lan"))
+    dialog._lan_token.setText("topsecret")
+    dialog._lan_port.setValue(49000)
+    dialog._lan_peers.setPlainText("192.168.1.8\n\n  192.168.1.9:49000  ")
+    dialog._lan_discovery.setChecked(True)
+    dialog._save()
+
+    assert config.get("sync.mode") == "lan"
+    assert config.get("sync.lan_token") == "topsecret"
+    assert config.get("sync.lan_port") == 49000
+    # 空行被清掉，条目两端空白被裁剪
+    assert config.get("sync.lan_peers") == ["192.168.1.8", "192.168.1.9:49000"]
+    assert config.get("sync.lan_discovery") is True
+
+
+def test_lan_peers_rendered_one_per_line(config, qt_app):
+    from linglong_clip.core.automation import AutomationEngine
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+
+    config.set("sync.lan_peers", ["10.0.0.1", "10.0.0.2:9000"], persist=False)
+    dlg = SettingsDialog(config, AutomationEngine())
+    assert dlg._lan_peers.toPlainText().splitlines() == ["10.0.0.1", "10.0.0.2:9000"]
+
+
+def test_lan_token_is_masked(dialog):
+    from PySide6.QtWidgets import QLineEdit
+
+    assert dialog._lan_token.echoMode() == QLineEdit.EchoMode.Password
+
+
 # ---- 转换窗口 ----
 
 @pytest.fixture()

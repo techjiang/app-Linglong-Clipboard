@@ -42,13 +42,30 @@ DEFAULTS: Dict[str, Any] = {
         "close_to_tray": True,
         "card_density": "comfortable",  # comfortable / compact
     },
+    "ocr": {
+        # 截图文字识别：让图片能被文字搜到。默认开启，缺 tesseract 时静默降级。
+        "enabled": True,
+        "executable": "tesseract",
+        # 留空表示按 ui.language 自动推断；多语言用 + 连接，如 chi_sim+eng
+        "languages": "",
+        "min_confidence": 0.0,
+        "max_chars": 10_000,
+        "timeout": 8.0,
+    },
     "sync": {
         "enabled": False,
         "mode": "folder",  # folder / lan
         "folder": "",
         "device_name": "",
-        "lan_port": 48620,
         "encrypt": True,
+        # ---- 局域网直连模式（mode = lan）----
+        "lan_port": 48620,
+        # 共享口令：同网段不等于可信，留空表示不做鉴权（仅建议在可信内网使用）
+        "lan_token": "",
+        # 对端地址列表，支持 "host" / "host:port"，一行一个
+        "lan_peers": [],
+        # 自动发现依赖 UDP 广播，部分 Wi-Fi 会拦截，故默认关闭
+        "lan_discovery": False,
     },
     "automation": {
         "workflows": [],

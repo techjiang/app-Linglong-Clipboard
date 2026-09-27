@@ -13,6 +13,7 @@ from ..platform.base import FocusInfo
 from ..utils.logger import get_logger
 from . import classify
 from .models import ClipboardItem, content_hash
+from .ocr import OcrEngine
 from .privacy import PrivacyGuard
 from .storage import Storage
 
@@ -39,13 +40,20 @@ class Collector:
         *,
         device_name: str = "",
         on_captured: Optional[Callable[[ClipboardItem, str], None]] = None,
+        ocr: Optional[OcrEngine] = None,
     ) -> None:
         self._storage = storage
         self._config = config
         self._guard = guard or PrivacyGuard(config)
         self._device_name = device_name
         self._on_captured = on_captured
+        self._ocr = ocr
         self._lock = threading.RLock()
+
+    def set_ocr(self, engine: Optional[OcrEngine]) -> None:
+        """热替换 OCR 引擎，供设置变更后即时生效。"""
+        with self._lock:
+            self._ocr = engine
 
     # ---- 主入口 ----
 
@@ -121,6 +129,10 @@ class Collector:
 
     def _enrich(self, item: ClipboardItem) -> None:
         """补齐类型、摘要、标签等派生字段。"""
+        # OCR 必须在 analyze 与隐私判定之前跑：识别出的文字要进入 content，
+        # 才能被 FTS 检索到，也才能让「截图里是 API Key」这种情况被拦下。
+        self._ocr_enrich(item)
+
         analysis = classify.analyze(
             item.content,
             has_html=bool(item.html),
@@ -145,6 +157,37 @@ class Collector:
                 if classify.is_private_host(parts["host"]):
                     item.metadata.setdefault("private_host", True)
         item.tags = list(dict.fromkeys(item.tags + tags))
+
+    def _ocr_enrich(self, item: ClipboardItem) -> None:
+        """对截图做文字识别，把结果写进 `content` 供检索使用。
+
+        没有 OCR 引擎、图片不存在或识别为空时静默跳过，
+        图片记录本身照常入库，只是搜不到文字。
+        """
+        if item.kind != "image" or item.content or not item.image_path:
+            return
+        engine = self._ocr
+        if engine is None or not engine.enabled:
+            return
+
+        try:
+            result = engine.recognize_full(item.image_path)
+        except Exception as exc:  # noqa: BLE001 - OCR 是增强能力，不能影响采集
+            _log.debug("OCR 失败，跳过图片文字识别：%s", exc)
+            return
+
+        if result.is_empty:
+            item.metadata.setdefault("ocr", {"text": "", "backend": result.backend})
+            return
+
+        item.content = result.text
+        item.metadata["ocr"] = {
+            "text": result.text,
+            "backend": result.backend,
+            "language": result.language,
+            "confidence": result.confidence,
+            "duration_ms": result.duration_ms,
+        }
 
     @staticmethod
     def _hash_payload(item: ClipboardItem) -> str:

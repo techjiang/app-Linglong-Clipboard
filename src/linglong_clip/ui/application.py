@@ -21,9 +21,11 @@ from ..core.automation import AutomationEngine
 from ..core.collector import CAPTURED, MERGED, Collector
 from ..core.models import ClipboardItem
 from ..core.monitor import ClipboardMonitor, FocusTracker
+from ..core.ocr import build_engine as build_ocr_engine
 from ..core.privacy import PrivacyGuard
 from ..core.semantic import SemanticEngine
 from ..core.storage import Storage
+from ..core.lan_sync import LanSync, build_lan_sync
 from ..core.sync import FolderSync, SyncCipher
 from ..platform import detect_backend
 from ..utils.config import Config
@@ -111,6 +113,7 @@ class Application(QObject):
         self._argv = argv
         self._start_minimized = start_minimized
         self._shutting_down = False
+        self._sync_signature_cache: Optional[tuple] = None
 
         # 复用已存在的实例：Qt 全局只允许一个 QApplication，
         # 嵌入到宿主进程中时（如 IDE 插件）不能重复创建。
@@ -130,6 +133,7 @@ class Application(QObject):
         self.automation = AutomationEngine()
         self.automation.load_from_config(self.config.get("automation.workflows", []) or [])
         self.engine = SemanticEngine(self.storage)
+        self.ocr = build_ocr_engine(self.config)
 
         self.collector = Collector(
             self.storage,
@@ -137,8 +141,10 @@ class Application(QObject):
             self.guard,
             device_name=self._device_name(),
             on_captured=self._on_collected_threadsafe,
+            ocr=self.ocr,
         )
         self.sync = self._build_sync()
+        self._sync_signature_cache = self._sync_signature()
 
         self.hotkeys = HotkeyManager()
         self.window = MainWindow(self.storage, self.config, self.engine, self.automation)
@@ -179,7 +185,62 @@ class Application(QObject):
         configured = str(self.config.get("sync.device_name", "") or "").strip()
         return configured or socket.gethostname()
 
-    def _build_sync(self) -> Optional[FolderSync]:
+    def _stop_sync(self) -> None:
+        """释放旧同步后端的资源，尤其是局域网监听端口。"""
+        previous = self.sync
+        if previous is not None and hasattr(previous, "stop"):
+            try:
+                previous.stop()
+            except Exception:  # noqa: BLE001
+                _log.debug("关闭旧同步后端失败", exc_info=True)
+
+    def refresh_sync(self, *, force: bool = False):
+        """配置变化后重建同步后端，避免旧监听端口一直占着。
+
+        配置没实质变化时直接复用现有后端，跳过整轮重建。
+        """
+        signature = self._sync_signature()
+        if not force and signature == self._sync_signature_cache and self.sync is not None:
+            return self.sync
+        self._stop_sync()
+        self.sync = self._build_sync()
+        self._sync_signature_cache = signature
+        return self.sync
+
+    def refresh_ocr(self) -> None:
+        """配置变化后重建 OCR 引擎，并同步给采集器（无需重启应用）。"""
+        self.ocr = build_ocr_engine(self.config)
+        self.collector.set_ocr(self.ocr)
+
+    def _sync_signature(self) -> tuple:
+        """同步相关配置的指纹，用于判断是否需要重建后端。
+
+        没有它的话，设置页一次保存会逐键触发重建，每次都要重开监听端口。
+        """
+        keys = (
+            "sync.enabled", "sync.mode", "sync.folder", "sync.device_name",
+            "sync.encrypt", "sync.lan_port", "sync.lan_token",
+            "sync.lan_discovery",
+        )
+        peers = self.config.get("sync.lan_peers", []) or []
+        return tuple(self.config.get(k) for k in keys) + (tuple(peers),)
+
+    def _build_sync(self):
+        """按 `sync.mode` 构造同步后端：共享文件夹或局域网直连。
+
+        两者对外形状一致（`export`/`import_all` 或 `sync_all`/`status`），
+        所以 `run_sync` 不需要为模式分支。
+        """
+        if not self.config.get("sync.enabled", False):
+            return None
+
+        mode = str(self.config.get("sync.mode", "folder") or "folder").lower()
+        if mode == "lan":
+            lan = build_lan_sync(self.storage, self.config, self.guard)
+            if lan is not None and lan.start():
+                _log.info("局域网同步已就绪：%s", lan.status())
+            return lan
+
         folder = str(self.config.get("sync.folder", "") or "").strip()
         if not folder:
             return None
@@ -308,6 +369,7 @@ class Application(QObject):
         self.hotkeys.unregister_all()
         self._sync_timer.stop()
         self._sweep_timer.stop()
+        self._stop_sync()
         self.storage.close()
         self.tray.hide()
         self.qt_app.quit()
@@ -515,11 +577,17 @@ class Application(QObject):
             self.window.notify("同步未启用（请在设置中配置同步目录）")
             return
 
+        sync = self.sync
+
         def work() -> None:
             try:
-                exported = self.sync.export()
-                imported = self.sync.import_all()
-                self.sync.compact()
+                if isinstance(sync, LanSync):
+                    imported = sync.sync_all()
+                    _log.info("局域网同步完成：导入 %d 条", imported)
+                    return
+                exported = sync.export()
+                imported = sync.import_all()
+                sync.compact()
                 _log.info("同步完成：导出 %d 条，导入 %d 条", exported, imported)
             except Exception:  # noqa: BLE001
                 _log.exception("同步执行失败")
@@ -537,8 +605,18 @@ class Application(QObject):
             else:
                 self.monitor.pause()
             self.tray.set_paused(self.monitor.is_paused)
-        elif key == "sync.enabled":
-            if value and self.sync is not None:
+        elif key.startswith("sync."):
+            # 开关与具体参数分开处理：关掉时要释放监听端口，打开时再重建
+            if key == "sync.enabled" and not value:
+                self._stop_sync()
+                self.sync = None
+                self._sync_signature_cache = self._sync_signature()
+                self._sync_timer.stop()
+                return
+            self.refresh_sync()
+            if self.sync is not None and self.config.get("sync.enabled", False):
                 self._sync_timer.start()
             else:
                 self._sync_timer.stop()
+        elif key.startswith("ocr.") or key == "ui.language":
+            self.refresh_ocr()

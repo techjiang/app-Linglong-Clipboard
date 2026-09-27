@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""重新生成文档用的界面截图。
+
+为什么做成脚本而不是手工截屏：手工截的图会随代码改动过期，
+而 README 里的截图一旦失真就会误导读者。这里走与界面测试相同的
+Qt `offscreen` 渲染路径，因此 CI 里也能跑，代码改了重新执行即可。
+
+用法：
+    QT_QPA_PLATFORM=offscreen python packaging/screenshots.py
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SRC = ROOT / "src"
+OUT = ROOT / "docs" / "screenshots"
+
+# 必须在导入 Qt 之前设好，否则无头环境起不来
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("LINGLONG_CLIPBOARD_HOME", tempfile.mkdtemp(prefix="linglong-shots-"))
+
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+
+def seed_storage(storage) -> None:
+    """造一批有代表性的记录，让截图看起来像真实使用场景。"""
+    from linglong_clip.core.models import ClipboardItem, content_hash
+
+    now = time.time()
+    rows = [
+        ("text", "会议纪要：下周二评审设计稿，记得带上交互说明", "chrome", False),
+        ("link", "https://cnb.cool/asoe/TechSauce?utm_source=chat", "google-chrome", False),
+        ("code", "def handler(event):\n    return event['key']", "code", True),
+        ("color", "#4c8dff", "figma", False),
+        ("text", "docker run -p 8080:80 -v $PWD:/app nginx:alpine", "terminal", False),
+        ("image", "", "flameshot", False),
+    ]
+    for index, (kind, content, source, pinned) in enumerate(rows):
+        storage.add(
+            ClipboardItem(
+                kind=kind,
+                content=content,
+                preview=content,
+                hash=content_hash(kind, f"{kind}{index}"),
+                source_app=source,
+                created_at=now - index * 300,
+                pinned=pinned,
+            )
+        )
+
+
+def _render(widget, target: Path) -> None:
+    from PySide6.QtWidgets import QApplication
+
+    widget.show()
+    widget.repaint()
+    QApplication.processEvents()
+    widget.grab().save(str(target))
+    widget.hide()
+    print(f"  ✓ {target.relative_to(ROOT)} ({widget.width()}x{widget.height()})")
+
+
+def main() -> int:
+    from PySide6.QtWidgets import QApplication
+
+    from linglong_clip.core.automation import AutomationEngine
+    from linglong_clip.core.semantic import SemanticEngine
+    from linglong_clip.core.storage import Storage
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    OUT.mkdir(parents=True, exist_ok=True)
+
+    storage = Storage()
+    seed_storage(storage)
+    engine = SemanticEngine(storage)
+    automation = AutomationEngine()
+
+    print("生成截图中：")
+    for theme, name in (("dark", "main-dark.png"), ("light", "main-light.png")):
+        from linglong_clip.ui.main_window import MainWindow
+
+        config = _config({"ui.theme": theme})
+        window = MainWindow(storage, config, engine, automation)
+        window.resize(1180, 720)
+        _render(window, OUT / name)
+
+    # 检索结果：体现「已理解」提示
+    from linglong_clip.ui.main_window import MainWindow
+
+    window = MainWindow(storage, _config({"ui.theme": "dark"}), engine, automation)
+    window.resize(1180, 720)
+    window.show()
+    QApplication.processEvents()
+    window._search.setText("最近的链接")
+    # 搜索有 120ms 防抖，需要等定时器真的触发才会刷新结果
+    window._search_timer.timeout.emit()
+    QApplication.processEvents()
+    _render(window, OUT / "search-dark.png")
+
+    # 快速粘贴浮层
+    from linglong_clip.ui.quick_paste import QuickPasteOverlay
+
+    overlay = QuickPasteOverlay(storage, engine, _config({}))
+    # show_centered() 才会触发加载；无头环境里定位到屏幕中心，随后抓图
+    overlay.show_centered()
+    _render(overlay, OUT / "quick-paste.png")
+
+    # 设置页：体现新增的 OCR 与局域网选项
+    dialog = SettingsDialog(_config({}), automation)
+    dialog.resize(760, 640)
+    _render(dialog, OUT / "settings-ocr.png")
+
+    storage.close()
+    app.quit()
+    print("完成。")
+    return 0
+
+
+def _config(overrides: dict):
+    from linglong_clip.utils.config import Config
+
+    home = Path(os.environ["LINGLONG_CLIPBOARD_HOME"])
+    config = Config(home / f"shots-{abs(hash(str(overrides)))}.json")
+    for key, value in overrides.items():
+        config.set(key, value, persist=False)
+    return config
+
+
+if __name__ == "__main__":
+    sys.exit(main())

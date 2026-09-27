@@ -133,9 +133,59 @@ class SettingsDialog(QDialog):
         self._pin_immune.setChecked(bool(self._config.get("history.pin_immune", True)))
         history_form.addRow("", self._pin_immune)
 
+        layout.addWidget(self._build_ocr_group())
+
         layout.addWidget(history_group)
         layout.addStretch(1)
         return page
+
+    def _build_ocr_group(self) -> QGroupBox:
+        """截图 OCR：图片能被文字搜到。默认开启，缺 tesseract 时自动降级。"""
+        group = QGroupBox("截图文字识别（OCR）")
+        form = QFormLayout(group)
+
+        self._ocr_enabled = QCheckBox("识别截图中的文字，让图片能被搜索到")
+        self._ocr_enabled.setChecked(bool(self._config.get("ocr.enabled", True)))
+        self._ocr_enabled.setToolTip(
+            "需要系统安装 tesseract。未安装时静默跳过，图片照常记录，只是搜不到文字。"
+        )
+        form.addRow("", self._ocr_enabled)
+
+        self._ocr_languages = QLineEdit(str(self._config.get("ocr.languages", "") or ""))
+        self._ocr_languages.setPlaceholderText("留空按界面语言推断，多语言用 + 连接，如 chi_sim+eng")
+        form.addRow("识别语言", self._ocr_languages)
+
+        self._ocr_min_confidence = QSpinBox()
+        self._ocr_min_confidence.setRange(0, 100)
+        self._ocr_min_confidence.setSuffix(" %")
+        self._ocr_min_confidence.setValue(int(self._config.get("ocr.min_confidence", 0) or 0))
+        self._ocr_min_confidence.setToolTip("低于该置信度的识别结果直接丢弃，避免把噪音写进历史。")
+        form.addRow("最低置信度", self._ocr_min_confidence)
+
+        self._ocr_status = QLabel()
+        self._ocr_status.setWordWrap(True)
+        form.addRow("状态", self._ocr_status)
+        self._refresh_ocr_status()
+        self._ocr_enabled.toggled.connect(self._refresh_ocr_status)
+
+        return group
+
+    def _refresh_ocr_status(self) -> None:
+        """探测当前环境是否真的能做 OCR，把结论直白地告诉用户。"""
+        if not self._ocr_enabled.isChecked():
+            self._ocr_status.setText("已关闭（截图只记录图片本身）")
+            return
+        try:
+            from ..core.ocr import TesseractBackend
+
+            backend = TesseractBackend()
+            if backend.available():
+                langs = "、".join(backend.languages()) or "未知"
+                self._ocr_status.setText(f"可用 · 已安装语言：{langs}")
+            else:
+                self._ocr_status.setText("不可用 · 未找到 tesseract（截图将无法被文字搜索）")
+        except Exception:  # noqa: BLE001 - 状态展示失败不该挡住设置页
+            self._ocr_status.setText("无法探测（不影响其它功能）")
 
     def _build_privacy_tab(self) -> QWidget:
         page = QWidget()
@@ -213,6 +263,8 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(group)
 
+        layout.addWidget(self._build_lan_group())
+
         if self._device_status:
             info = QGroupBox("状态")
             info_form = QFormLayout(info)
@@ -229,6 +281,76 @@ class SettingsDialog(QDialog):
 
         layout.addStretch(1)
         return page
+
+    def _build_lan_group(self) -> QGroupBox:
+        """局域网直连：同网段设备互相拉取，不经过任何服务器。"""
+        group = QGroupBox("局域网直连")
+        form = QFormLayout(group)
+
+        self._sync_mode = QComboBox()
+        self._sync_mode.addItem("共享文件夹（配合 OneDrive / iCloud / Syncthing）", "folder")
+        self._sync_mode.addItem("局域网直连（同网段设备互连，不经服务器）", "lan")
+        current = str(self._config.get("sync.mode", "folder") or "folder")
+        index = max(0, self._sync_mode.findData(current))
+        self._sync_mode.setCurrentIndex(index)
+        form.addRow("同步方式", self._sync_mode)
+
+        self._lan_token = QLineEdit(str(self._config.get("sync.lan_token", "") or ""))
+        self._lan_token.setEchoMode(QLineEdit.Password)
+        self._lan_token.setPlaceholderText("设备间共享口令，留空表示不鉴权（仅限可信内网）")
+        self._lan_token.setToolTip("同网段不等于可信：不设口令时，同网络内任何人都能读取你的剪贴板。")
+        form.addRow("共享口令", self._lan_token)
+
+        self._lan_port = QSpinBox()
+        self._lan_port.setRange(0, 65535)
+        self._lan_port.setValue(int(self._config.get("sync.lan_port", 48620) or 0))
+        self._lan_port.setToolTip("监听端口，0 表示由系统分配。多台设备需用相同端口才能互连。")
+        form.addRow("监听端口", self._lan_port)
+
+        peers = self._config.get("sync.lan_peers", []) or []
+        if isinstance(peers, str):
+            peers = [line for line in peers.splitlines() if line.strip()]
+        self._lan_peers = QPlainTextEdit("\n".join(str(peer) for peer in peers))
+        self._lan_peers.setPlaceholderText("对端地址，一行一个\n例如：\n192.168.1.8\n192.168.1.9:48620")
+        self._lan_peers.setFixedHeight(80)
+        form.addRow("对端地址", self._lan_peers)
+
+        self._lan_discovery = QCheckBox("自动发现同网段设备（UDP 广播）")
+        self._lan_discovery.setChecked(bool(self._config.get("sync.lan_discovery", False)))
+        self._lan_discovery.setToolTip("部分 Wi-Fi 会拦组播/广播，发现不到时请手动填对端地址。")
+        form.addRow("", self._lan_discovery)
+
+        self._lan_status = QLabel()
+        self._lan_status.setWordWrap(True)
+        form.addRow("状态", self._lan_status)
+        self._sync_mode.currentIndexChanged.connect(self._refresh_lan_state)
+        self._sync_enabled.toggled.connect(self._refresh_lan_state)
+        self._refresh_lan_state()
+
+        return group
+
+    def _refresh_lan_state(self) -> None:
+        """局域网相关输入只在选中「局域网直连」且启用同步时才可用。"""
+        is_lan = self._sync_mode.currentData() == "lan"
+        for widget in (
+            self._sync_folder,
+            self._lan_token,
+            self._lan_port,
+            self._lan_peers,
+            self._lan_discovery,
+        ):
+            widget.setEnabled(is_lan or widget is self._sync_folder)
+
+        if is_lan:
+            self._lan_status.setText(
+                "已选择局域网直连 · 本机监听 %d 端口" % self._lan_port.value()
+            )
+        else:
+            self._lan_status.setText("当前使用共享文件夹模式，局域网选项不生效")
+        self._lan_port.setEnabled(is_lan)
+        self._lan_token.setEnabled(is_lan)
+        self._lan_peers.setEnabled(is_lan)
+        self._lan_discovery.setEnabled(is_lan)
 
     def _build_ui_tab(self) -> QWidget:
         page = QWidget()
@@ -373,10 +495,22 @@ class SettingsDialog(QDialog):
             "privacy.sensitive_retention_seconds": self._sensitive_retention.value(),
             "privacy.sensitive_auto_clear_seconds": self._auto_clear.value(),
             "privacy.redact_on_copy_out": self._redact.isChecked(),
+            "ocr.enabled": self._ocr_enabled.isChecked(),
+            "ocr.languages": self._ocr_languages.text().strip(),
+            "ocr.min_confidence": self._ocr_min_confidence.value(),
             "sync.enabled": self._sync_enabled.isChecked(),
+            "sync.mode": self._sync_mode.currentData(),
             "sync.folder": self._sync_folder.text().strip(),
             "sync.device_name": self._device_name.text().strip(),
             "sync.encrypt": self._sync_encrypt.isChecked(),
+            "sync.lan_token": self._lan_token.text().strip(),
+            "sync.lan_port": self._lan_port.value(),
+            "sync.lan_peers": [
+                line.strip()
+                for line in self._lan_peers.toPlainText().splitlines()
+                if line.strip()
+            ],
+            "sync.lan_discovery": self._lan_discovery.isChecked(),
             "ui.theme": self._theme.currentText(),
             "ui.fuzzy_search": self._fuzzy.isChecked(),
             "ui.global_hotkey": self._hotkey.text().strip(),

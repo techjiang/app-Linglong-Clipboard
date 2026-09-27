@@ -9,3 +9,12 @@
 | `main-light.png` | 主界面（浅色主题） |
 | `quick-paste.png` | Ctrl+Shift+V 快速粘贴浮层 |
 | `search-dark.png` | 自然语言检索结果 |
+| `settings-ocr.png` | 设置页（含 OCR 与局域网同步选项） |
+
+重新生成：
+
+```bash
+QT_QPA_PLATFORM=offscreen python packaging/screenshots.py
+```
+
+脚本走的是与界面测试相同的 offscreen 渲染路径，无需显示器，CI 里也能跑。

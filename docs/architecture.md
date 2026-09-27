@@ -46,6 +46,7 @@ ClipboardItem（原始载荷）
    │
    │ ③ Collector.process()（仍在采集线程，不碰 Qt）
    │    · 补齐来源（FocusTracker，按秒缓存）
+   │    · 截图 OCR（OcrEngine）—— 识别结果写回 content
    │    · 类型识别 / 标签抽取（classify）
    │    · 隐私风控（PrivacyGuard）
    │    · 按内容指纹去重（命中则只更新使用次数）
@@ -169,6 +170,76 @@ shared-folder/
 
 导出侧的过滤规则与采集侧一致：敏感内容、图片默认都不出本机。
 
+局域网直连是另一种模式（不依赖网盘），见下面「局域网同步」一节。
+
+## OCR
+
+`core/ocr.py` 把「图片里的文字」变成可检索的 `content`，从而复用既有的
+FTS5 索引与排序，检索路径零改动。
+
+```
+图片 ClipboardItem（kind=image, content=''）
+   │
+   │ Collector._enrich() 里最先执行
+   ▼
+OcrEngine.recognize_full()
+   │  · 语言解析：ui.language → tesseract 语言串（chi_sim+eng）
+   │  · 缓存：按「路径 + 大小 + mtime」命中，同一张图不重复识别
+   │  · 降级：后端不可用 / 超时 / 识别为空 → 返回空结果，不抛异常
+   ▼
+item.content = 识别文本；item.metadata['ocr'] = {置信度, 语言, 耗时}
+```
+
+**顺序很关键：OCR 必须排在 `PrivacyGuard.inspect()` 之前。**
+因为 `inspect()` 读的就是 `item.content`，先识别再判定，
+「截图里是 API Key」这种情况才会被和文本一样拦下；
+反过来则会把密钥当成一张普通图片放行。
+
+设计要点：
+
+- **后端可插拔**（`OcrBackend` 协议）。默认给 tesseract 实现与 `NullBackend`，
+  测试注入桩后端，因此**不依赖系统是否装了 tesseract**。
+- **失败一律降级**。OCR 是增强能力，缺依赖或识别失败时截图照常入库，
+  只是搜不到文字；`_ocr_enrich()` 里用宽泛的 `except` 兜底，不让它影响采集。
+- **tesseract 调用要串行化**。它内部有共享状态、非线程安全，
+  引擎里用锁保护。
+- **置信度过滤**（`ocr.min_confidence`）。低置信结果往往是噪音，
+  写进历史反而会污染检索，默认 0 不过滤，用户可按需调高。
+
+## 局域网同步
+
+`core/lan_sync.py` 与 `sync.py` 的共享文件夹模式**互补而非替代**，
+两者复用同一个 `SyncRecord` 传输单元、同一个 `SyncCipher` 加密、
+同一份 `PrivacyGuard` 判定，避免两条路径的过滤强度不一致。
+
+```
+A 设备                                        B 设备
+┌────────────────────┐                  ┌────────────────────┐
+│ LanSyncServer      │  GET /records    │ LanSyncClient      │
+│  · 只提供读取       │ ◄────────────────│  · 主动拉取        │
+│  · X-Linglong-Token│   since / limit  │  · 解密 + 导入     │
+│  · 过隐私后编码     │ ────────────────►│  · 跳过重复与敏感  │
+└────────────────────┘                  └────────────────────┘
+        ▲                                        │
+        └──────── DiscoveryService（可选 UDP）────┘
+```
+
+几个刻意的选择：
+
+- **拉取而非推送**。发送方不接收写入（`POST` 直接返回 405），
+  攻击面只剩「读取」一条路径；接收方自己决定何时拉，不必处理对端离线队列。
+- **标准库 `http.server`**。同步是几十毫秒级的小请求，
+  不值得为一个功能引入 aiohttp/requests。
+- **鉴权用共享口令 + 定时安全比较**。同网段不等于可信，
+  请求头带上口令，服务端用 `hmac.compare_digest` 比较，避免时序侧信道；
+  `/ping` 不校验口令，且只回设备名与版本，不含任何内容。
+- **发现默认手动配置**。mDNS/zeroconf 要额外依赖，且不少企业 Wi-Fi 拦组播；
+  UDP 广播发现作为可选项，默认关闭。
+- **图片与敏感项不外发**。与共享文件夹模式一致。
+
+`LanSync` 对外的形状（`start` / `stop` / `sync_all` / `status`）刻意与
+`FolderSync` 对齐，因此 `Application.run_sync` 不需要为模式写分支。
+
 ## 线程模型
 
 | 线程 | 职责 | 约束 |
@@ -176,6 +247,7 @@ shared-folder/
 | GUI 线程 | 所有 Qt 对象、界面刷新、剪贴板读写 | 不做耗时 I/O |
 | 采集线程 | 轮询、识别、风控、落库 | 不碰任何 Qt 对象 |
 | 同步线程 | 按需启动，文件读写与加解密 | 不碰 UI |
+| 局域网服务线程 | `ThreadingHTTPServer`，每请求一线程 | 只读，不碰 UI |
 
 跨线程通信只有两条通道：
 

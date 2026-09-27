@@ -118,6 +118,84 @@ def test_sync_requires_folder(cli_env, capsys):
     assert "未配置同步目录" in capsys.readouterr().err
 
 
+# ---- OCR 与局域网同步在 CLI 里的可见性 ----
+
+
+def test_stats_reports_ocr_capability(cli_env, capsys):
+    assert main(["--stats"]) == 0
+    out = capsys.readouterr().out
+    assert "截图 OCR" in out
+    # 已装 tesseract 报可用，未装报不可用，两者都不能缺失
+    assert ("可用" in out) or ("不可用" in out)
+
+
+def test_stats_json_includes_ocr(cli_env, capsys):
+    main(["--stats", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert "ocr" in payload
+    assert set(payload["ocr"]) >= {"enabled", "backend", "languages", "available"}
+
+
+def test_sync_status_folder_mode(cli_env, capsys):
+    assert main(["--sync-status"]) == 0
+    out = capsys.readouterr().out
+    assert "共享文件夹" in out
+
+
+def test_sync_status_folder_json(cli_env, capsys):
+    main(["--sync-status", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "folder"
+
+
+def test_sync_status_lan_mode(cli_env, capsys, config):
+    """局域网模式应能报出监听端口与鉴权状态。"""
+    config.update(
+        {
+            "sync.enabled": True,
+            "sync.mode": "lan",
+            "sync.lan_port": 0,
+            "sync.lan_token": "pw",
+            "sync.device_name": "cli-node",
+        },
+        persist=True,
+    )
+    assert main(["--sync-status"]) == 0
+    out = capsys.readouterr().out
+    assert "局域网直连" in out
+    assert "cli-node" in out
+    assert "已启用共享口令" in out
+
+
+def test_sync_status_lan_json(cli_env, capsys, config):
+    config.update(
+        {"sync.enabled": True, "sync.mode": "lan", "sync.lan_port": 0},
+        persist=True,
+    )
+    main(["--sync-status", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["mode"] == "lan"
+    assert payload["running"] is True
+    assert isinstance(payload["port"], int)
+
+
+def test_sync_status_lan_disabled(cli_env, capsys, config):
+    config.update({"sync.enabled": False, "sync.mode": "lan"}, persist=True)
+    assert main(["--sync-status"]) == 1
+    assert "未启用" in capsys.readouterr().out
+
+
+def test_import_sync_lan_mode(cli_env, capsys, config):
+    """局域网模式下 --import-sync 应走拉取逻辑而不是找文件夹。"""
+    config.update(
+        {"sync.enabled": True, "sync.mode": "lan", "sync.lan_port": 0},
+        persist=True,
+    )
+    assert main(["--import-sync"]) == 0
+    assert "局域网对端" in capsys.readouterr().out
+    assert "未配置同步目录" not in capsys.readouterr().err
+
+
 def test_version_flag():
     from linglong_clip import __version__
 
@@ -130,5 +208,5 @@ def test_parser_has_all_modes():
     parser = build_parser()
     options = {action.dest for action in parser._actions}
     for expected in ("quick", "minimized", "list", "search", "get", "stats", "clear",
-                     "compact", "json", "plain"):
+                     "compact", "json", "plain", "sync_status"):
         assert expected in options

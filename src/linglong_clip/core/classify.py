@@ -273,6 +273,10 @@ def extract_tags(text: str, *, kind: str = "") -> List[str]:
 def make_preview(kind: str, text: str, *, files: Optional[List[str]] = None) -> str:
     """生成列表里展示的一行摘要。"""
     if kind == IMAGE:
+        # 有 OCR 文本时把识别结果带上，列表里不用点开就知道截图内容
+        snippet = " ".join((text or "").split())
+        if snippet:
+            return f"[图片] {snippet[:220]}"
         return "[图片]"
     if kind == FILE:
         items = files or ([text] if text else [])

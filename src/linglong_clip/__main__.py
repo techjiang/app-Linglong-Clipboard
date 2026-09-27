@@ -28,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  linglong-clipboard --search '上周的截图'\n"
             "  linglong-clipboard --get 12         输出第 12 条内容\n"
             "  linglong-clipboard --stats          查看统计与检索能力\n"
+            "  linglong-clipboard --sync-status    查看同步模式与对端状态\n"
         ),
     )
     parser.add_argument("--version", action="version", version=f"玲珑剪切板 {__version__}")
@@ -55,8 +56,9 @@ def build_parser() -> argparse.ArgumentParser:
     maintenance.add_argument("--stats", action="store_true", help="显示统计信息")
     maintenance.add_argument("--clear", action="store_true", help="清空未固定记录")
     maintenance.add_argument("--compact", action="store_true", help="压缩数据库")
-    maintenance.add_argument("--import-sync", action="store_true", help="从同步目录导入")
-    maintenance.add_argument("--export-sync", action="store_true", help="导出到同步目录")
+    maintenance.add_argument("--import-sync", action="store_true", help="从同步来源导入")
+    maintenance.add_argument("--export-sync", action="store_true", help="导出到同步来源")
+    maintenance.add_argument("--sync-status", action="store_true", help="查看同步模式与对端状态")
 
     output = parser.add_argument_group("输出")
     output.add_argument("--json", action="store_true", help="以 JSON 输出，便于脚本处理")
@@ -121,7 +123,12 @@ def _run_cli(args: argparse.Namespace) -> int:
     storage = Storage()
 
     if args.stats:
+        from .core.ocr import build_engine
+        from .utils.config import Config
+
         stats = storage.stats()
+        ocr_status = build_engine(Config()).status()
+        stats["ocr"] = ocr_status
         if args.json:
             print(json.dumps(stats, ensure_ascii=False, indent=2))
         else:
@@ -136,6 +143,11 @@ def _run_cli(args: argparse.Namespace) -> int:
                 print("常用来源：")
                 for source, count in stats["sources"]:
                     print(f"  {source:<20} {count}")
+            if ocr_status["enabled"]:
+                langs = "、".join(ocr_status["available"]) or "未知"
+                print(f"截图 OCR：可用（{ocr_status['backend']} · 语言 {ocr_status['languages']} · 已装 {langs}）")
+            else:
+                print("截图 OCR：不可用（未找到 tesseract，截图将无法被文字搜索）")
         storage.close()
         return 0
 
@@ -188,11 +200,83 @@ def _run_cli(args: argparse.Namespace) -> int:
         storage.close()
         return 0
 
+    if args.sync_status:
+        from .core.lan_sync import build_lan_sync
+        from .utils.config import Config
+
+        config = Config()
+        mode = str(config.get("sync.mode", "folder") or "folder").lower()
+        if mode == "lan":
+            node = build_lan_sync(storage, config)
+            if node is None:
+                print("局域网同步未启用（需要 sync.enabled = true 且 sync.mode = lan）")
+                storage.close()
+                return 1
+            if node.start():
+                status = node.status()
+                if args.json:
+                    print(json.dumps(status, ensure_ascii=False, indent=2))
+                else:
+                    print(f"模式：局域网直连（{'运行中' if status['running'] else '已停止'}）")
+                    print(f"监听：{status['device']}:{status['port']}")
+                    print(f"鉴权：{'已启用共享口令' if status['auth_required'] else '未启用（同网段均可读取，慎用）'}")
+                    print(f"加密：{'已启用' if status['encrypted'] else '未启用'}")
+                    peers = status.get("peers") or []
+                    print(f"对端：{len(peers)} 个")
+                    for peer in peers:
+                        label = f"{peer['host']}:{peer['port']}"
+                        if peer.get("device"):
+                            label += f" ({peer['device']})"
+                        print(f"  {label}")
+                node.stop()
+            else:
+                print("局域网同步服务启动失败（端口可能被占用）", file=sys.stderr)
+                storage.close()
+                return 1
+        else:
+            folder = str(config.get("sync.folder", "") or "").strip()
+            payload = {
+                "mode": "folder",
+                "folder": folder,
+                "configured": bool(folder),
+            }
+            if args.json:
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            else:
+                print("模式：共享文件夹")
+                print(f"同步目录：{folder or '未配置'}")
+        storage.close()
+        return 0
+
     if args.import_sync or args.export_sync:
         from .core.sync import FolderSync, SyncCipher
         from .utils.config import Config
 
         config = Config()
+        mode = str(config.get("sync.mode", "folder") or "folder").lower()
+        import socket
+
+        device = str(config.get("sync.device_name", "") or "") or socket.gethostname()
+
+        if mode == "lan":
+            from .core.lan_sync import build_lan_sync
+
+            node = build_lan_sync(storage, config)
+            if node is None:
+                print("局域网同步未启用（需要 sync.enabled = true 且 sync.mode = lan）", file=sys.stderr)
+                storage.close()
+                return 1
+            if not node.start():
+                print("局域网同步服务启动失败（端口可能被占用）", file=sys.stderr)
+                storage.close()
+                return 1
+            try:
+                print(f"已从局域网对端导入 {node.sync_all()} 条记录")
+            finally:
+                node.stop()
+            storage.close()
+            return 0
+
         folder = str(config.get("sync.folder", "") or "").strip()
         if not folder:
             print("未配置同步目录（请在设置中填写，或设置 sync.folder）", file=sys.stderr)
@@ -200,9 +284,6 @@ def _run_cli(args: argparse.Namespace) -> int:
             return 1
         from pathlib import Path
 
-        import socket
-
-        device = str(config.get("sync.device_name", "") or "") or socket.gethostname()
         sync = FolderSync(
             storage,
             Path(folder).expanduser(),
@@ -235,6 +316,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.get is not None,
             args.import_sync,
             args.export_sync,
+            args.sync_status,
         ]
     ):
         return _run_cli(args)
