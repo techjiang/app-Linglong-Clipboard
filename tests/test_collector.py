@@ -53,7 +53,20 @@ def test_deduplicates_by_hash(collector, storage):
     outcome, saved = collector.process(_item("duplicate"))
     assert outcome == MERGED
     assert storage.count() == 1
-    assert saved.metadata["copies"] == 2
+    # 复制次数落在 use_count 上：它是排序与界面共用的唯一频次口径
+    assert saved.use_count == 1
+    assert "last_source" in saved.metadata
+
+
+def test_merge_counts_agree_with_use_count(collector, storage):
+    """连续复制同一内容：合并次数与 use_count 必须一致，不能各算一套。"""
+    collector.process(_item("repeat"))
+    for _ in range(4):
+        collector.process(_item("repeat"))
+    item = storage.list()[0]
+    assert item.use_count == 4
+    # 重复内容不会在列表里堆成多行
+    assert storage.count() == 1
 
 
 def test_dedupe_disabled_keeps_new_row(storage, config):

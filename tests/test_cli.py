@@ -118,6 +118,57 @@ def test_sync_requires_folder(cli_env, capsys):
     assert "未配置同步目录" in capsys.readouterr().err
 
 
+# ---- 重复项合并 ----
+
+
+def _add_duplicates(home, times=3, content="重复内容", digest="dup"):
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.storage import Storage
+
+    storage = Storage(home / "history.db")
+    for index in range(times):
+        storage.add(
+            ClipboardItem(
+                kind="text",
+                content=content,
+                preview=content,
+                hash=digest,
+                created_at=100 + index,
+            )
+        )
+    storage.close()
+
+
+def test_merge_duplicates_cli(cli_env, capsys):
+    _add_duplicates(cli_env)
+    assert main(["--merge-duplicates"]) == 0
+    assert "已合并 2 条重复记录" in capsys.readouterr().out
+
+
+def test_merge_duplicates_cli_noop(cli_env, capsys):
+    # cli_env 里三条记录 hash 各不相同，没有可合并的
+    assert main(["--merge-duplicates"]) == 0
+    assert "没有重复记录" in capsys.readouterr().out
+
+
+def test_merge_duplicates_preserves_usage_in_list(cli_env, capsys):
+    """合并后列表里只剩一条，且带上复制次数，不再堆成多行。"""
+    _add_duplicates(cli_env)
+    main(["--merge-duplicates"])
+    capsys.readouterr()
+
+    assert main(["--search", "重复内容"]) == 0
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert "x2" in lines[0]
+
+
+def test_json_output_includes_use_count(cli_env, capsys):
+    main(["--list", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert all("use_count" in entry for entry in payload)
+
+
 # ---- OCR 与局域网同步在 CLI 里的可见性 ----
 
 

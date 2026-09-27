@@ -58,6 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
     maintenance.add_argument("--stats", action="store_true", help="显示统计信息")
     maintenance.add_argument("--clear", action="store_true", help="清空未固定记录")
     maintenance.add_argument("--compact", action="store_true", help="压缩数据库")
+    maintenance.add_argument(
+        "--merge-duplicates",
+        action="store_true",
+        help="合并重复内容（保留复制次数，不会丢使用频次）",
+    )
     maintenance.add_argument("--import-sync", action="store_true", help="从同步来源导入")
     maintenance.add_argument("--export-sync", action="store_true", help="导出到同步来源")
     maintenance.add_argument("--sync-status", action="store_true", help="查看同步模式与对端状态")
@@ -211,6 +216,7 @@ def _print_items(items, *, as_json: bool, plain: bool, limit: int) -> None:
                 "favorite": item.favorite,
                 "tags": item.tags,
                 "size": item.size,
+                "use_count": item.use_count,
             }
             for item in items[:limit]
         ]
@@ -238,7 +244,12 @@ def _print_items(items, *, as_json: bool, plain: bool, limit: int) -> None:
             ]
         )
         preview = item.preview.replace("\n", " ")[:70]
-        print(f"{str(item.id):>5}  [{markers}] {stamp}  {item.kind_label:<4} {preview}")
+        # 合并重复项后「复制过几次」是判断片段重要性的唯一线索，值得露出来
+        count = f"x{item.use_count:<3}" if item.use_count > 1 else "    "
+        print(
+            f"{str(item.id):>5}  [{markers}] {stamp}  {item.kind_label:<4} "
+            f"{count} {preview}"
+        )
 
 
 def _run_cli(args: argparse.Namespace) -> int:
@@ -290,6 +301,15 @@ def _run_cli(args: argparse.Namespace) -> int:
     if args.compact:
         storage.optimize()
         print("数据库已压缩")
+        storage.close()
+        return 0
+
+    if args.merge_duplicates:
+        removed = storage.dedupe()
+        if removed:
+            print(f"已合并 {removed} 条重复记录（复制次数已折算到保留项上）")
+        else:
+            print("没有重复记录需要合并")
         storage.close()
         return 0
 
@@ -474,6 +494,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.stats,
             args.clear,
             args.compact,
+            args.merge_duplicates,
             args.list,
             args.search,
             args.get is not None,

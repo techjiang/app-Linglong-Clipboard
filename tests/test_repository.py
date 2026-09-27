@@ -259,6 +259,40 @@ def test_dedupe(repo):
     assert repo.count() == 2
 
 
+def test_dedupe_folds_usage_into_keeper(repo):
+    """与 SQLite 后端语义一致：合并重复项时要保留复制次数。"""
+    for index in range(3):
+        _add(repo, content="hot", hash="dup", created_at=100 + index)
+    _add(repo, content="cold", hash="cold", created_at=100)
+
+    assert repo.dedupe() == 2
+    assert repo.count() == 2
+    assert repo.find_by_hash("dup").use_count == 2
+
+
+def test_dedupe_is_idempotent(repo):
+    for index in range(3):
+        _add(repo, content="same", hash="dup", created_at=index)
+    repo.dedupe()
+    count = repo.find_by_hash("dup").use_count
+    assert repo.dedupe() == 0
+    assert repo.find_by_hash("dup").use_count == count
+
+
+def test_dedupe_keeps_last_used_at(repo):
+    for created in (100.0, 500.0, 300.0):
+        _add(repo, content="same", hash="dup", created_at=created, used_at=created)
+    repo.dedupe()
+    assert repo.find_by_hash("dup").used_at == 500.0
+
+
+def test_dedupe_ignores_empty_hash(repo):
+    _add(repo, content="a", hash="")
+    _add(repo, content="b", hash="")
+    assert repo.dedupe() == 0
+    assert repo.count() == 2
+
+
 def test_enforce_limits_by_count_skips_pinned(repo):
     now = time.time()
     for index in range(10):

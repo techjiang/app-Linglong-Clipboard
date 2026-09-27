@@ -161,6 +161,65 @@ def test_dedupe(storage):
     assert storage.count() == 2
 
 
+def test_dedupe_folds_usage_into_keeper(storage):
+    """合并重复项不能把「复制过多次」这个信号丢掉。
+
+    3 条同内容重复行意味着这段内容被复制了 3 次（约定：N 次 -> N-1）。
+    旧实现直接删掉多余行，保留项 use_count 仍是 0，高频片段反而排在低频片段之后。
+    """
+    for index in range(3):
+        _add(storage, content="hot", hash="dup", created_at=100 + index)
+    _add(storage, content="cold", hash="cold", created_at=100)
+
+    assert storage.dedupe() == 2
+    keeper = storage.find_by_hash("dup")
+    assert keeper.use_count == 2
+    # 高频片段应当排到列表最前
+    assert storage.list()[0].content == "hot"
+
+
+def test_dedupe_keeps_last_used_at(storage):
+    for created in (100.0, 500.0, 300.0):
+        _add(storage, content="same", hash="dup", created_at=created, used_at=created)
+    storage.dedupe()
+    keeper = storage.find_by_hash("dup")
+    assert keeper.used_at == 500.0
+
+
+def test_dedupe_accumulates_explicit_use_count(storage):
+    """重复行里若已记过 use_count，合并时要一并累加，不能互相覆盖。"""
+    first = _add(storage, content="same", hash="dup", created_at=1)
+    _add(storage, content="same", hash="dup", created_at=2)
+    storage.touch(first.id)
+    storage.dedupe()
+    keeper = storage.find_by_hash("dup")
+    # 2 行（多 1 次）+ 1 次显式使用 = 2
+    assert keeper.use_count == 2
+
+
+def test_dedupe_is_idempotent(storage):
+    for index in range(4):
+        _add(storage, content="same", hash="dup", created_at=index)
+    storage.dedupe()
+    after_first = storage.find_by_hash("dup").use_count
+    assert storage.dedupe() == 0
+    assert storage.find_by_hash("dup").use_count == after_first
+
+
+def test_dedupe_ignores_empty_hash(storage):
+    """没有 hash 的记录无从判断是否重复，不该被合并掉。"""
+    _add(storage, content="a", hash="")
+    _add(storage, content="b", hash="")
+    assert storage.dedupe() == 0
+    assert storage.count() == 2
+
+
+def test_dedupe_single_row_untouched(storage):
+    _add(storage, content="only", hash="dup")
+    assert storage.dedupe() == 0
+    assert storage.find_by_hash("dup").use_count == 0
+
+
 def test_meta_kv(storage):
     assert storage.get_meta("missing", "fallback") == "fallback"
     storage.set_meta("k", "v1")

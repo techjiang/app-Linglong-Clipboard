@@ -99,6 +99,10 @@ class Collector:
         existing = self._storage.find_by_hash(item.hash) if item.hash else None
         if existing is not None:
             if self._config.get("history.merge_duplicates", True):
+                # `touch()` 是复制频次的唯一来源：它同时推进 `used_at` 与
+                # `use_count`，而 `use_count` 既参与排序也会展示给用户。
+                # 早期这里另写过一个 `metadata["copies"]` 计数，它没人读、
+                # 还和 `use_count` 差一位，成了两个互相打脸的频次口径 —— 已移除。
                 self._storage.touch(existing.id)
                 # 重复内容也要更新来源：同一段文本可能被不同应用复制过
                 self._storage.update_fields(
@@ -106,7 +110,6 @@ class Collector:
                     metadata={
                         **existing.metadata,
                         "last_source": item.source_app,
-                        "copies": int(existing.metadata.get("copies", 1)) + 1,
                     },
                 )
                 merged = self._storage.get(existing.id)

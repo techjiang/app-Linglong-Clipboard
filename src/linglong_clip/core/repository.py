@@ -457,21 +457,51 @@ class JsonRepository:
         return ranked[:limit]
 
     def dedupe(self) -> int:
-        seen: Dict[str, int] = {}
-        doomed: List[int] = []
+        """合并重复内容（保留排序最高的一条）。
+
+        与 SQLite 后端保持同样的语义：删除前先把重复项的使用次数与
+        最近使用时间折算到保留项上，否则「复制过多次」这个信号会随重复行
+        一起被丢掉，高频片段反而排到低频片段后面。
+        """
+        groups: Dict[str, List[int]] = {}
         with self._lock:
-            for item_id in sorted(self._items):
-                item = self._items[item_id]
-                if not item.hash:
+            for item_id, item in self._items.items():
+                if item.hash:
+                    groups.setdefault(item.hash, []).append(item_id)
+
+            removed = 0
+            for ids in groups.values():
+                if len(ids) < 2:
                     continue
-                if item.hash in seen:
-                    doomed.append(item_id)
-                else:
-                    seen[item.hash] = item_id
-            for item_id in doomed:
-                self._items.pop(item_id, None)
-            self._maybe_save()
-            return len(doomed)
+                # 保留排序靠前（最近使用/固定）的那条，与列表展示一致
+                keeper_id = max(ids, key=lambda i: _sort_key(self._items[i]))
+                keeper = self._items[keeper_id]
+                # 频次 = 各行显式 use_count 之和 + 「多出来的行数」。
+                # 后者不可省：重复行本身就代表「又复制了一次」，只是没记在
+                # use_count 上（`merge_duplicates` 关闭期间的老数据就是这样）。
+                total_use = 0
+                last_seen = 0.0
+                for item_id in ids:
+                    other = self._items[item_id]
+                    total_use += int(other.use_count or 0)
+                    # `used_at` 提到组内最新的时间戳（含 created_at）：
+                    # 合并后这一条代表「最近一次见到这段内容」，
+                    # 否则保留的可能最旧时刻，在按最近使用排序时直接沉底。
+                    last_seen = max(
+                        last_seen,
+                        float(other.used_at or 0.0),
+                        float(other.created_at or 0.0),
+                    )
+                total_use += max(0, len(ids) - 1)
+                keeper.use_count = total_use
+                keeper.used_at = last_seen
+                for item_id in ids:
+                    if item_id != keeper_id:
+                        self._items.pop(item_id, None)
+                        removed += 1
+            if removed:
+                self._maybe_save()
+            return removed
 
     def enforce_limits(self, max_items: int, max_days: int = 0) -> int:
         removed = 0

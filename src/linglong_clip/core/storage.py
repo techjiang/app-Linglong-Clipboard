@@ -399,15 +399,45 @@ class Storage:
         return [(row["source_app"], int(row["n"])) for row in rows]
 
     def dedupe(self) -> int:
-        """删除重复内容（保留首条），用于「合并重复项」策略的收尾清理。"""
+        """合并重复内容（保留首条），用于「合并重复项」策略的收尾清理。
+
+        合并是**非破坏性**的：直接把重复行删掉会把「这段内容被复制了 3 次」
+        变成「被复制了 1 次」——一个高频片段反而排在低频片段后面。
+        所以删除前先把重复行的使用次数与最近使用时间折算到保留项上。
+        """
         with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM items WHERE id NOT IN ("
-                "  SELECT MIN(id) FROM items GROUP BY hash"
-                ") AND hash <> ''"
-            )
+            rows = self._conn.execute(
+                "SELECT hash, MIN(id) AS keep_id, COUNT(*) AS total_rows, "
+                "       SUM(use_count) AS total_use, "
+                "       MAX(MAX(COALESCE(used_at, 0), COALESCE(created_at, 0))) "
+                "           AS last_seen "
+                "FROM items WHERE hash <> '' GROUP BY hash HAVING COUNT(*) > 1"
+            ).fetchall()
+            if not rows:
+                return 0
+            removed = 0
+            for row in rows:
+                keep_id = int(row["keep_id"])
+                # 频次 = 各行显式记录的 use_count 之和 + 「多出来的行数」。
+                # 后者是关键：`merge_duplicates` 关闭期间（或历史遗留）产生的重复
+                # 是**以行数**承载「复制了几次」这一信息的，行本身不记 use_count。
+                # 只累加 use_count 会得到 0，等于把「复制过 3 次」合并成「从没复制」。
+                total = int(row["total_use"] or 0) + max(0, int(row["total_rows"]) - 1)
+                # `used_at` 提到整个重复组里最新的时间戳：合并后这一条代表的是
+                # 「最近一次见到这段内容」，否则保留的可能是组里最旧的那个时刻，
+                # 在按最近使用排序的列表里直接沉底。
+                self._conn.execute(
+                    "UPDATE items SET use_count = ?, "
+                    "used_at = MAX(COALESCE(used_at, 0), ?) WHERE id = ?",
+                    (total, float(row["last_seen"] or 0), keep_id),
+                )
+                cursor = self._conn.execute(
+                    "DELETE FROM items WHERE hash = ? AND id <> ?",
+                    (row["hash"], keep_id),
+                )
+                removed += cursor.rowcount
             self._conn.commit()
-            return cursor.rowcount
+            return removed
 
     def enforce_limits(self, max_items: int, max_days: int = 0) -> int:
         """按条数与天数淘汰历史，固定项不受影响。"""
