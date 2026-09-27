@@ -36,7 +36,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..utils.logger import get_logger
-from .models import ClipboardItem
+from .models import ClipboardItem, content_hash
+from .normalize import canonical_key
 
 _log = get_logger("jsonstore")
 
@@ -455,6 +456,31 @@ class JsonRepository:
                     counts[item.source_app] = counts.get(item.source_app, 0) + 1
         ranked = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))
         return ranked[:limit]
+
+    def recanonicalize(self, options: Optional[dict] = None) -> int:
+        """按当前归一规则重算历史记录的指纹，返回被改写的条数。
+
+        与 SQLite 后端同一套语义：老数据的指纹是拿原始内容算的，
+        不重算的话「同一页面被不同渠道分享出的多条链接」永远合不到一起。
+        只改 `hash`，`content` 原样保留。
+        """
+        options = options or {}
+        changed = 0
+        with self._lock:
+            for item in self._items.values():
+                payload = canonical_key(
+                    item.kind or "",
+                    item.content or "",
+                    files=item.files or None,
+                    options=options,
+                )
+                digest = content_hash(item.kind or "", payload)
+                if digest and digest != item.hash:
+                    item.hash = digest
+                    changed += 1
+            if changed:
+                self._maybe_save()
+        return changed
 
     def dedupe(self) -> int:
         """合并重复内容（保留排序最高的一条）。

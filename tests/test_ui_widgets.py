@@ -437,3 +437,20 @@ def test_settings_saves_json_inline_options(qt_app, home):
 
     assert config.get("storage.json_inline_images") is False
     assert config.get("storage.json_max_inline_image_kb") == 512
+
+
+# ---- 归一化去重开关 ----
+
+
+def test_dialog_reflects_canonical_options(dialog, config):
+    assert dialog._canonical_url.isChecked() == bool(config.get("history.canonical_dedupe.url"))
+    assert dialog._canonical_path.isChecked() == bool(config.get("history.canonical_dedupe.path"))
+
+
+def test_dialog_saves_canonical_options(dialog, config):
+    dialog._canonical_url.setChecked(False)
+    dialog._canonical_path.setChecked(False)
+    dialog._save()
+
+    assert config.get("history.canonical_dedupe.url") is False
+    assert config.get("history.canonical_dedupe.path") is False

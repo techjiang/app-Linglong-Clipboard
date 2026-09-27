@@ -210,3 +210,87 @@ def test_purge_sensitive(storage, config):
 
 def test_purge_sensitive_noop_without_ttl(collector):
     assert collector.purge_sensitive() == 0
+
+
+# ---- 归一化去重：同一页面不同渠道的链接应算同一条 ----
+
+
+def test_tracking_params_do_not_split_history(collector, storage):
+    """同一个页面从不同 App 复制出的链接，不该在历史里各占一行。
+
+    微博、微信分享出的链接尾巴不一样（`?utm_source=weibo&spm=...` vs
+    `?utm_source=wechat&ref=...`），但用户眼里那就是一个页面。
+    """
+    links = [
+        "https://shop.example.com/item/42?utm_source=weibo&spm=a1z.123",
+        "https://shop.example.com/item/42?utm_source=wechat&ref=abc",
+        "https://shop.example.com/item/42",
+    ]
+    outcomes = [collector.process(_item(links[0], kind="link"))[0]]
+    outcomes += [collector.process(_item(url, kind="link"))[0] for url in links[1:]]
+
+    assert outcomes == [CAPTURED, MERGED, MERGED]
+    assert storage.count() == 1
+    # 复制过 3 次 -> 累加 2 次，频次信号不能丢
+    assert storage.list()[0].use_count == 2
+
+
+def test_canonical_hash_keeps_original_content(collector, storage):
+    """归一只用于算指纹，用户看到的仍是原文。"""
+    raw = "https://a.com/p?utm_source=weibo&q=1"
+    collector.process(_item(raw, kind="link"))
+    stored = storage.list()[0]
+    assert stored.content == raw
+    assert "utm_source" in stored.preview
+
+
+def test_equivalent_paths_merge(collector, storage):
+    collector.process(_item("/tmp/a/../b/x.txt", kind="file"))
+    outcome, _ = collector.process(_item("/tmp/b/x.txt", kind="file"))
+    assert outcome == MERGED
+    assert storage.count() == 1
+
+
+def test_different_urls_still_separate(collector, storage):
+    """归一必须保守：路径/参数确实不同的链接不能合并。"""
+    collector.process(_item("https://a.com/p?v=1", kind="link"))
+    collector.process(_item("https://a.com/p?v=2", kind="link"))
+    collector.process(_item("https://a.com/other", kind="link"))
+    assert storage.count() == 3
+
+
+def test_canonical_dedupe_can_be_disabled(storage, config):
+    """关掉归一后行为与改造前一致：不同尾巴的链接各占一行。"""
+    config.set("history.canonical_dedupe", False)
+    instance = Collector(storage, config)
+    instance.process(_item("https://a.com/p?utm_source=weibo", kind="link"))
+    outcome, _ = instance.process(_item("https://a.com/p?utm_source=wechat", kind="link"))
+    assert outcome == CAPTURED
+    assert storage.count() == 2
+
+
+def test_canonical_dedupe_url_only(storage, config):
+    """只关链接归一：路径仍归一，链接不再归一。"""
+    config.set("history.canonical_dedupe.url", False)
+    instance = Collector(storage, config)
+    instance.process(_item("https://a.com/p?utm_source=weibo", kind="link"))
+    assert instance.process(_item("https://a.com/p?utm_source=wechat", kind="link"))[0] == CAPTURED
+    instance.process(_item("/tmp/a//b.txt", kind="file"))
+    assert instance.process(_item("/tmp/a/b.txt", kind="file"))[0] == MERGED
+
+
+def test_image_hash_not_normalized(collector, storage):
+    """图片按字节指纹去重，没有归一的空间，不能把它算成别的。"""
+    item = ClipboardItem(kind="image", content="", image_path="/nonexistent/x.png")
+    item.hash = "image-digest"
+    collector.process(item)
+    assert storage.count() == 1
+    assert storage.list()[0].hash == "image-digest"
+
+
+def test_provided_hash_is_respected(collector, storage):
+    """调用方显式给了 hash 就不该被改写（同步导入等路径依赖这一点）。"""
+    item = ClipboardItem(kind="link", content="https://a.com/p?utm_source=x",
+                         preview="x", hash="explicit-hash")
+    collector.process(item)
+    assert storage.find_by_hash("explicit-hash") is not None

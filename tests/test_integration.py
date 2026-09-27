@@ -258,3 +258,50 @@ def test_semantic_search_mixes_text_and_ocr_results(ocr_pipeline):
     engine = SemanticEngine(storage)
     hits = engine.search("release")
     assert {hit.kind for hit in hits} == {"image", "text"}
+
+
+# ---- 归一化去重端到端：采集 -> 检索 -> 合并 ----
+
+
+def test_channel_links_collapse_end_to_end(storage, config):
+    """同一页面从三个渠道各复制一次，最终只有一条，且检索得到。"""
+    collector = Collector(storage, config)
+    for url in (
+        "https://shop.example.com/item/42?utm_source=weibo&spm=a1z.123",
+        "https://shop.example.com/item/42?utm_source=wechat&ref=abc",
+        "https://shop.example.com/item/42",
+    ):
+        collector.process(ClipboardItem(kind="link", content=url, preview=url))
+
+    assert storage.count() == 1
+    hits = SemanticEngine(storage).search("item/42")
+    assert len(hits) == 1
+    assert hits[0].use_count == 2
+
+
+def test_legacy_records_repaired_by_cli_flow(storage, config):
+    """升级前入库的重复链接，经「重算指纹 + 合并」后收敛成一条。
+
+    这是 recanonicalize 的完整用途：新规则只对新数据生效，
+    历史数据必须走一遍重算才能被正确判重。
+    """
+    from linglong_clip.core.models import content_hash
+
+    urls = [
+        "https://a.com/p?utm_source=weibo",
+        "https://a.com/p?utm_source=wechat",
+        "https://a.com/p",
+    ]
+    for index, url in enumerate(urls):
+        storage.add(
+            ClipboardItem(
+                kind="link", content=url, preview=url,
+                hash=content_hash("link", url), created_at=100 + index,
+            )
+        )
+
+    assert storage.recanonicalize() == 2
+    assert storage.dedupe() == 2
+    assert storage.count() == 1
+    # 原始文本未被改写
+    assert storage.list()[0].content in urls

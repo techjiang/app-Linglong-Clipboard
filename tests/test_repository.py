@@ -286,6 +286,40 @@ def test_dedupe_keeps_last_used_at(repo):
     assert repo.find_by_hash("dup").used_at == 500.0
 
 
+def test_recanonicalize_rewrites_legacy_hash(repo):
+    from linglong_clip.core.models import ClipboardItem, content_hash
+
+    legacy = "https://a.com/p?utm_source=weibo"
+    repo.add(ClipboardItem(kind="link", content=legacy, preview=legacy,
+                           hash=content_hash("link", legacy)))
+    assert repo.recanonicalize() == 1
+    assert repo.list()[0].content == legacy
+
+
+def test_recanonicalize_then_dedupe_merges_legacy_duplicates(repo):
+    from linglong_clip.core.models import ClipboardItem, content_hash
+
+    urls = [
+        "https://a.com/p?utm_source=weibo",
+        "https://a.com/p?utm_source=wechat",
+        "https://a.com/p",
+    ]
+    for index, url in enumerate(urls):
+        repo.add(ClipboardItem(kind="link", content=url, preview=url,
+                               hash=content_hash("link", url), created_at=100 + index))
+
+    assert repo.count() == 3
+    assert repo.recanonicalize() == 2
+    assert repo.dedupe() == 2
+    assert repo.count() == 1
+    assert repo.list()[0].use_count == 2
+
+
+def test_recanonicalize_is_idempotent(repo):
+    repo.recanonicalize()
+    assert repo.recanonicalize() == 0
+
+
 def test_dedupe_ignores_empty_hash(repo):
     _add(repo, content="a", hash="")
     _add(repo, content="b", hash="")

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -16,7 +17,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..utils.logger import get_logger
 from ..utils.paths import data_dir
-from .models import ClipboardItem
+from .models import ClipboardItem, content_hash
+from .normalize import canonical_key
 
 _log = get_logger("storage")
 
@@ -397,6 +399,45 @@ class Storage:
                 (limit,),
             ).fetchall()
         return [(row["source_app"], int(row["n"])) for row in rows]
+
+    def recanonicalize(self, options: Optional[Dict[str, Any]] = None) -> int:
+        """按当前归一规则重算历史记录的指纹，返回被改写的条数。
+
+        归一规则（链接去跟踪参数、路径收敛）是在某次升级里加进来的，加之前
+        入库的记录指纹仍是原始内容算的。若不回头重算，「微博链接」与
+        「地址栏链接」在库里就是两串不同的 hash，`dedupe()` 按 hash 分组
+        自然看不出它们重复 —— 新规则只对新数据生效，老数据永远合不了。
+
+        只改 `hash` 一个字段，`content` 不动：用户看到的仍是原文。
+        改完由调用方接着跑 `dedupe()` 把同组收敛成一条。
+        """
+        options = options or {}
+        changed = 0
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, kind, content, files, hash FROM items"
+            ).fetchall()
+            for row in rows:
+                try:
+                    files = json.loads(row["files"]) if row["files"] else []
+                except (ValueError, TypeError):
+                    files = []
+                payload = canonical_key(
+                    str(row["kind"] or ""),
+                    str(row["content"] or ""),
+                    files=files if isinstance(files, list) else None,
+                    options=options,
+                )
+                digest = content_hash(str(row["kind"] or ""), payload)
+                if not digest or row["hash"] == digest:
+                    continue
+                self._conn.execute(
+                    "UPDATE items SET hash = ? WHERE id = ?", (digest, row["id"])
+                )
+                changed += 1
+            if changed:
+                self._conn.commit()
+        return changed
 
     def dedupe(self) -> int:
         """合并重复内容（保留首条），用于「合并重复项」策略的收尾清理。

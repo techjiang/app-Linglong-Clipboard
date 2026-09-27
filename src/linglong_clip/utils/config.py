@@ -22,6 +22,14 @@ DEFAULTS: Dict[str, Any] = {
         "max_items": 2_000,
         "max_days": 0,  # 0 表示不按时间淘汰
         "merge_duplicates": True,
+        # 归一化去重：判断「两条内容算不算同一条」时先做规范化处理
+        "canonical_dedupe": {
+            # 链接去掉 utm_* / fbclid 等跟踪参数：同一页面被不同渠道分享出的
+            # 多条链接应当算同一条，而不是各占一行
+            "url": True,
+            # 路径收敛写法（折叠 //、消解 . 与 ..）：指向同一文件的不同写法算同一条
+            "path": True,
+        },
         "pin_immune": True,
     },
     "privacy": {

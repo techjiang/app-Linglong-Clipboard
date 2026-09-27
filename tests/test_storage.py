@@ -220,6 +220,66 @@ def test_dedupe_single_row_untouched(storage):
     assert storage.find_by_hash("dup").use_count == 0
 
 
+def test_recanonicalize_rewrites_legacy_hash(storage):
+    """老记录的指纹是拿原始内容算的，重算后才能被归一分组识别出来。"""
+    from linglong_clip.core.models import content_hash
+
+    legacy = "https://a.com/p?utm_source=weibo"
+    _add(storage, kind="link", content=legacy, hash=content_hash("link", legacy))
+    assert storage.recanonicalize() == 1
+    # 内容一个字节都没改，只换了指纹
+    assert storage.list()[0].content == legacy
+
+
+def test_recanonicalize_then_dedupe_merges_legacy_duplicates(storage):
+    """升级前入库的「同一页面不同渠道链接」应当能合到一起。
+
+    这是 recanonicalize 存在的理由：新规则只对新数据生效，
+    历史里的三条链接若不重算指纹，永远合不了。
+    """
+    from linglong_clip.core.models import content_hash
+
+    urls = [
+        "https://a.com/p?utm_source=weibo",
+        "https://a.com/p?utm_source=wechat",
+        "https://a.com/p",
+    ]
+    for index, url in enumerate(urls):
+        _add(storage, kind="link", content=url, hash=content_hash("link", url),
+             created_at=100 + index)
+
+    assert storage.count() == 3
+    assert storage.recanonicalize() == 2
+    assert storage.dedupe() == 2
+    assert storage.count() == 1
+    # 复制次数要保住：3 行 = 复制过 2 次
+    assert storage.list()[0].use_count == 2
+
+
+def test_recanonicalize_is_idempotent(storage):
+    storage.recanonicalize()
+    assert storage.recanonicalize() == 0
+
+
+def test_recanonicalize_noop_on_clean_records(storage):
+    from linglong_clip.core.models import content_hash
+    from linglong_clip.core.normalize import canonical_content
+
+    content = "已经归一的链接"
+    _add(storage, kind="text", content=content,
+         hash=content_hash("text", canonical_content("text", content)))
+    assert storage.recanonicalize() == 0
+
+
+def test_recanonicalize_respects_disabled_options(storage):
+    from linglong_clip.core.models import content_hash
+
+    legacy = "https://a.com/p?utm_source=weibo"
+    _add(storage, kind="link", content=legacy, hash=content_hash("link", legacy))
+    options = {"url_strip_tracking": False, "path_normalize": False}
+    assert storage.recanonicalize(options) == 0
+
+
 def test_meta_kv(storage):
     assert storage.get_meta("missing", "fallback") == "fallback"
     storage.set_meta("k", "v1")

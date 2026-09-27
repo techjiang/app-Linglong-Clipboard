@@ -129,6 +129,20 @@ class SettingsDialog(QDialog):
         self._merge_dup.setChecked(bool(self._config.get("history.merge_duplicates", True)))
         history_form.addRow("", self._merge_dup)
 
+        # 判重前先做归一的开关。单独放出来是因为它会改变「相同」的定义：
+        # 关掉后同一页面被不同渠道分享出的链接会各占一行，属于用户可见行为。
+        self._canonical_url = QCheckBox("链接去掉跟踪参数后判重（utm_*、fbclid 等）")
+        self._canonical_url.setChecked(
+            bool(self._config.get("history.canonical_dedupe.url", True))
+        )
+        history_form.addRow("", self._canonical_url)
+
+        self._canonical_path = QCheckBox("路径收敛写法后判重（折叠 //、消解 . 与 ..）")
+        self._canonical_path.setChecked(
+            bool(self._config.get("history.canonical_dedupe.path", True))
+        )
+        history_form.addRow("", self._canonical_path)
+
         self._pin_immune = QCheckBox("固定项不受清理影响")
         self._pin_immune.setChecked(bool(self._config.get("history.pin_immune", True)))
         history_form.addRow("", self._pin_immune)
@@ -571,6 +585,8 @@ class SettingsDialog(QDialog):
             "history.max_items": self._max_items.value(),
             "history.max_days": self._max_days.value(),
             "history.merge_duplicates": self._merge_dup.isChecked(),
+            "history.canonical_dedupe.url": self._canonical_url.isChecked(),
+            "history.canonical_dedupe.path": self._canonical_path.isChecked(),
             "history.pin_immune": self._pin_immune.isChecked(),
             "privacy.exclude_password_managers": self._exclude_pm.isChecked(),
             "privacy.blocked_apps": [

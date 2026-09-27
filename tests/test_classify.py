@@ -130,3 +130,26 @@ def test_summarize_url():
     assert parts["host"] == "cnb.cool"
     assert parts["scheme"] == "https"
     assert parts["path"] == "/asoe/repo"
+
+
+# ---- 路径识别：冗余分隔符也应当被认出来 ----
+# 若在这里判成「不是路径」，它会被归为普通文本，后面针对路径的归一
+# （折叠 `//`、消解 `..`）就没机会执行，同一文件的不同写法会各占一行。
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["/tmp/a//b.txt", "/a//b", "//srv/share/x", "/tmp/a/./b", "/tmp/a/../c", "C:\\a\\\\b"],
+)
+def test_file_path_accepts_redundant_separators(text):
+    assert classify.is_file_path(text) is True
+    assert classify.analyze(text)["kind"] == "file"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["/ 这是一句话 with spaces", "/usr/bin 和 /usr/local", "/path/to/file with spaces.txt"],
+)
+def test_file_path_rejects_text_with_spaces(text):
+    # 放宽分隔符不能顺带把带空格的句子也当路径
+    assert classify.is_file_path(text) is False

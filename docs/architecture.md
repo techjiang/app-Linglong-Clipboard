@@ -49,6 +49,7 @@ ClipboardItem（原始载荷）
    │    · 截图 OCR（OcrEngine）—— 识别结果写回 content
    │    · 类型识别 / 标签抽取（classify）
    │    · 隐私风控（PrivacyGuard）
+   │    · 内容归一（normalize）后算指纹 —— 同一页面的不同渠道链接算同一条
    │    · 按内容指纹去重（命中则只更新使用次数）
    │    · 落库 + 按条数/天数淘汰
    ▼
@@ -172,6 +173,58 @@ items_fts(content, preview, source_app, tags)   -- external content 表
   复杂度不值得。记录量到十万级时应改用 SQLite，而不是优化这里。
 - **并发**：单把 `RLock` 保住「读-改-写」，因为每次写都基于内存态整体重写，
   分片锁换不来收益。
+
+### 内容归一（判重的前置步骤）
+
+「相同内容只保留一条」需要一个判据，而这个判据不能是原始字节。
+同一个页面被不同渠道分享出的链接、同一个文件的不同写法，字节不同但语义相同：
+
+```
+https://shop.example.com/item/42?utm_source=weibo&spm=a1z.123
+https://shop.example.com/item/42?utm_source=wechat&ref=abc
+https://shop.example.com/item/42
+```
+
+按字节比是三条，按用户的理解是一条。`core/normalize.py` 在算指纹之前
+先做一次归一：
+
+- `normalize_url()` — 去跟踪参数（`utm_*` / `spm` / `fbclid` / `ref` 等）、
+  查询参数排序、主机名小写、去末尾斜杠、折叠重复 `/`
+- `normalize_path()` — 折叠重复分隔符、消解 `.` 与 `..`、去末尾斜杠
+- `canonical_content(kind, text)` — 按类型分发，其余类型原样返回
+
+**归一只用于算指纹，不写回 `item.content`。** 用户看到的、粘贴的、搜索的
+仍是原文；改写内容等于篡改用户数据。数据流上的位置：
+
+```
+剪贴板 → classify 识别类型 → normalize 归一 → content_hash 算指纹 → 落库
+                              ↑
+                    只用归一结果算 hash，content 保持原样
+```
+
+**判据必须保守。** 误合并比不合并更糟：不合并只是列表多几行，
+误合并会让用户找不到东西，且原始内容已被删除、无法恢复。所以只剥掉
+明确无意义的装饰，拿不准的一律保留：
+
+| 保留 | 原因 |
+| --- | --- |
+| `?v=` / `?id=` / `?page=` 等参数 | 可能真的决定页面内容 |
+| `#` 片段 | 单页应用靠它区分页面 |
+| 无 scheme 的写法 | `example.com/x` 与 `https://example.com/x` 可能真是两个东西 |
+| 短链 | 展开要发网络请求，且结果不可控 |
+
+`history.canonical_dedupe` 及其子项 `url` / `path` 可分别关闭。
+关掉后行为与改造前完全一致（按原始字节判重）。
+
+**存量数据需要重算。** 归一是后加的规则，此前入库的记录指纹是按原始内容
+算的，不重算就永远合不了。两个后端都提供 `recanonicalize(options)`：
+只改 `hash` 字段，`content` 不动。CLI 的 `--merge-duplicates` 会先调它
+再调 `dedupe()`，顺序不能反 —— 反过来 `dedupe()` 按 hash 分组根本
+看不出老记录之间重复。
+
+同一份跟踪参数定义还被 `automation.py` 的 `url.strip_tracking` 转换器复用：
+两处各维护一份名单迟早分叉，用户会看到「转换说没有跟踪参数、去重却认为
+这是两条不同的链接」这种自相矛盾的结果。
 
 ### 重复内容合并
 

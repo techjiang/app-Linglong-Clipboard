@@ -31,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  linglong-clipboard --sync-status    查看同步模式与对端状态\n"
             "  linglong-clipboard --sync-cursor    查看各同步来源的增量游标\n"
             "  linglong-clipboard --storage-status 查看历史文件的存放位置\n"
+            "  linglong-clipboard --merge-duplicates 合并重复项（含归一后新出现的）\n"
         ),
     )
     parser.add_argument("--version", action="version", version=f"玲珑剪切板 {__version__}")
@@ -62,6 +63,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--merge-duplicates",
         action="store_true",
         help="合并重复内容（保留复制次数，不会丢使用频次）",
+    )
+    maintenance.add_argument(
+        "--recanonicalize",
+        action="store_true",
+        help="按归一规则重算历史指纹（不动数据，只让老记录能被正确判重）",
+    )
+    maintenance.add_argument(
+        "--normalize",
+        metavar="TEXT",
+        help="预览归一结果：这段内容会被当成哪一条（用于排查「为什么没合并」）",
     )
     maintenance.add_argument("--import-sync", action="store_true", help="从同步来源导入")
     maintenance.add_argument("--export-sync", action="store_true", help="导出到同步来源")
@@ -202,6 +213,22 @@ def _migrate_storage(*, previous_backend: str, config) -> int:
     return 0
 
 
+def _canonical_options(config) -> dict:
+    """把 `history.canonical_dedupe` 配置翻译成归一模块认识的参数名。
+
+    单独抽出来是为了让 CLI 与采集路径读的是同一份配置，
+    避免「CLI 合并时按新规则、采集时按旧规则」这种两边不一致的状态。
+    """
+    enabled = config.get("history.canonical_dedupe", True)
+    if not enabled:
+        # 传 False 给两个开关，等价于完全不做归一
+        return {"url_strip_tracking": False, "path_normalize": False}
+    return {
+        "url_strip_tracking": bool(config.get("history.canonical_dedupe.url", True)),
+        "path_normalize": bool(config.get("history.canonical_dedupe.path", True)),
+    }
+
+
 def _print_items(items, *, as_json: bool, plain: bool, limit: int) -> None:
     if as_json:
         payload = [
@@ -253,6 +280,7 @@ def _print_items(items, *, as_json: bool, plain: bool, limit: int) -> None:
 
 
 def _run_cli(args: argparse.Namespace) -> int:
+    from .core.normalize import canonical_content
     from .core.semantic import SemanticEngine
     from .utils.config import Config
 
@@ -304,12 +332,46 @@ def _run_cli(args: argparse.Namespace) -> int:
         storage.close()
         return 0
 
+    if args.normalize is not None:
+        # 排查用：告诉用户「这段内容按归一规则被当成什么」。
+        # 「为什么我复制的链接没有被合并」这类问题，看这一行就有答案。
+        from .core.classify import analyze
+
+        raw = args.normalize
+        kind = str(analyze(raw)["kind"])
+        canonical = canonical_content(kind, raw, options=_canonical_options(config))
+        print(f"类型：{kind}")
+        print(f"原文：{raw}")
+        print(f"归一：{canonical}")
+        print("相同" if canonical == raw else "已归一（不同写法会被判为同一条）")
+        storage.close()
+        return 0
+
+    if args.recanonicalize:
+        rehashed = storage.recanonicalize(_canonical_options(config))
+        if rehashed:
+            print(f"已重算 {rehashed} 条记录的指纹（内容未改动）")
+        else:
+            print("所有记录的指纹都已是最新，无需重算")
+        storage.close()
+        return 0
+
     if args.merge_duplicates:
+        # 先按当前归一规则重算指纹，再分组合并。
+        # 顺序不能反：老记录的指纹是拿原始内容算的，「同一页面被不同渠道分享」
+        # 会是几串不同的 hash，直接 dedupe() 分组根本看不出它们重复，
+        # 于是这次升级对历史数据等于没生效。
+        options = _canonical_options(config)
+        rehashed = storage.recanonicalize(options)
         removed = storage.dedupe()
+        if rehashed:
+            print(f"已按归一规则重算 {rehashed} 条记录的指纹")
         if removed:
             print(f"已合并 {removed} 条重复记录（复制次数已折算到保留项上）")
-        else:
+        elif not rehashed:
             print("没有重复记录需要合并")
+        else:
+            print("重算后未发现新的重复项")
         storage.close()
         return 0
 
@@ -495,6 +557,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.clear,
             args.compact,
             args.merge_duplicates,
+            args.recanonicalize,
+            args.normalize is not None,
             args.list,
             args.search,
             args.get is not None,

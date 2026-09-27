@@ -20,6 +20,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from ..utils.logger import get_logger
 from .models import CODE, FILE, LINK, TEXT, ClipboardItem
+from .normalize import is_tracking_param, normalize_path, normalize_url
 
 _log = get_logger("automation")
 
@@ -66,25 +67,41 @@ def _url_encode(text: str) -> Optional[str]:
 
 
 def _url_strip_tracking(text: str) -> Optional[str]:
-    """去掉链接里的 utm_*、fbclid 等跟踪参数，保留下来的才是有效信息。"""
+    """去掉链接里的 utm_*、fbclid 等跟踪参数，保留下来的才是有效信息。
+
+    跟踪参数名单与「去重时怎么判断两条链接算同一条」共用 `core/normalize.py`
+    里的同一份定义 —— 两处各维护一份迟早会分叉，让用户看到「转换说没跟踪参数，
+    去重却说这是两条不同的链接」这种自相矛盾的结果。
+    """
     stripped = text.strip()
     if not stripped.startswith(("http://", "https://")):
         return None
     parsed = urllib.parse.urlsplit(stripped)
     if not parsed.query:
         return None
-    tracking_prefixes = ("utm_", "fbclid", "gclid", "mc_", "ref_", "igshid", "spm")
-    kept = [
-        (key, value)
-        for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-        if not key.lower().startswith(tracking_prefixes)
-    ]
-    if len(kept) == len(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)):
+    if not any(is_tracking_param(key) for key, _ in
+               urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)):
         return None
-    query = urllib.parse.urlencode(kept)
-    return urllib.parse.urlunsplit(
-        (parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment)
-    )
+    return normalize_url(stripped, strip_tracking=True)
+
+
+def _path_normalize(text: str) -> Optional[str]:
+    """把路径写法收敛成规范形式：折叠 `//`、消解 `.` / `..`、去末尾斜杠。
+
+    纯字符串处理，不碰文件系统 —— 剪贴板里的路径常指向还不存在的位置。
+    只有真的变了才返回结果，否则返回 None 让上层提示「不适用于该转换」。
+    """
+    stripped = text.strip()
+    if not stripped:
+        return None
+    if "\n" in stripped:
+        lines = stripped.splitlines()
+        rewritten = [normalize_path(line) if line.strip() else line for line in lines]
+        if rewritten == lines:
+            return None
+        return "\n".join(rewritten)
+    normalized = normalize_path(stripped)
+    return normalized if normalized != stripped else None
 
 
 def _base64_encode(text: str) -> Optional[str]:
@@ -399,6 +416,8 @@ def _build_registry() -> Dict[str, Action]:
         Action("case.camel", "转 camelCase", _case_camel, [TEXT], "命名", ""),
         Action("case.pascal", "转 PascalCase", _case_pascal, [TEXT], "命名", ""),
         Action("case.kebab", "转 kebab-case", _case_kebab, [TEXT], "命名", ""),
+        Action("path.normalize", "规范化路径", _path_normalize, [FILE, TEXT], "路径",
+               "折叠重复分隔符、消解 . 与 .."),
         Action("path.basename", "只留文件名", _path_basenames, [FILE, TEXT], "路径", ""),
         Action("path.quote", "路径加引号", _path_quoted, [FILE, TEXT], "路径", ""),
         Action("shell.escape", "Shell 转义", _escape_shell, [TEXT, FILE, CODE], "路径", ""),

@@ -5,6 +5,8 @@ import json
 import pytest
 
 from linglong_clip.__main__ import build_parser, main
+from linglong_clip.core.models import content_hash
+from linglong_clip.core.normalize import canonical_content
 
 
 @pytest.fixture()
@@ -18,9 +20,16 @@ def cli_env(home, monkeypatch, capsys):
     for index, (kind, content) in enumerate(
         [("text", "hello world"), ("link", "https://cnb.cool/x"), ("code", "def f(): pass")]
     ):
+        # 用真实指纹而不是编造的 `h0/h1`：`--merge-duplicates` 会先按归一规则
+        # 重算指纹，假的 hash 会被认成「需要重算」，让「无重复可合并」的用例失真
         storage.add(
-            ClipboardItem(kind=kind, content=content, preview=content, hash=f"h{index}",
-                          source_app="chrome")
+            ClipboardItem(
+                kind=kind,
+                content=content,
+                preview=content,
+                hash=content_hash(kind, canonical_content(kind, content)),
+                source_app="chrome",
+            )
         )
     storage.close()
     return home
@@ -146,9 +155,11 @@ def test_merge_duplicates_cli(cli_env, capsys):
 
 
 def test_merge_duplicates_cli_noop(cli_env, capsys):
-    # cli_env 里三条记录 hash 各不相同，没有可合并的
+    # cli_env 里三条记录内容与指纹都不同，也没有跟踪参数差异，没有可合并的
     assert main(["--merge-duplicates"]) == 0
-    assert "没有重复记录" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "没有重复记录" in out
+    assert "重算" not in out  # 指纹本已是最新，不该报告重算
 
 
 def test_merge_duplicates_preserves_usage_in_list(cli_env, capsys):
@@ -418,3 +429,57 @@ def test_storage_status_mentions_other_backend(home, capsys):
     capsys.readouterr()
     assert main(["--storage-status"]) == 0
     assert "另一种存储也有数据" in capsys.readouterr().out
+
+
+# ---- 归一化去重：--normalize / --recanonicalize ----
+
+
+def test_normalize_preview_for_link(cli_env, capsys):
+    assert main(["--normalize", "https://a.com/p?utm_source=x&q=1"]) == 0
+    out = capsys.readouterr().out
+    assert "https://a.com/p?q=1" in out
+    assert "已归一" in out
+
+
+def test_normalize_preview_for_clean_input(cli_env, capsys):
+    assert main(["--normalize", "普通文本"]) == 0
+    out = capsys.readouterr().out
+    assert "相同" in out
+
+
+def test_normalize_preview_reports_kind(cli_env, capsys):
+    assert main(["--normalize", "/tmp/a//b.txt"]) == 0
+    out = capsys.readouterr().out
+    assert "类型：file" in out
+    assert "/tmp/a/b.txt" in out
+
+
+def test_recanonicalize_reports_count(cli_env, capsys):
+    assert main(["--recanonicalize"]) == 0
+    out = capsys.readouterr().out
+    # cli_env 的记录指纹已是归一后的，应当报告无需重算
+    assert "无需重算" in out
+
+
+def test_recanonicalize_then_merge_legacy(cli_env, capsys):
+    """老数据经重算后能被合并，且合并结果保住复制次数。"""
+    from linglong_clip.core.models import ClipboardItem, content_hash
+    from linglong_clip.core.storage import Storage
+
+    storage = Storage(cli_env / "history.db")
+    storage.clear()
+    for index, url in enumerate(
+        ["https://a.com/p?utm_source=weibo", "https://a.com/p?utm_source=wechat", "https://a.com/p"]
+    ):
+        storage.add(ClipboardItem(kind="link", content=url, preview=url,
+                                  hash=content_hash("link", url), created_at=100 + index))
+    storage.close()
+
+    assert main(["--merge-duplicates"]) == 0
+    out = capsys.readouterr().out
+    assert "已按归一规则重算 2 条记录的指纹" in out
+    assert "已合并 2 条重复记录" in out
+
+    assert main(["--list"]) == 0
+    listing = capsys.readouterr().out
+    assert "x2" in listing

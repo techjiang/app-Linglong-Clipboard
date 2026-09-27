@@ -48,6 +48,7 @@ def _item(kind="text", content=""):
         ("csv.to_markdown", "a,b\n1,2", "| a | b |"),
         ("encode.base64", "hello", "aGVsbG8="),
         ("encode.base64_decode", "aGVsbG8=", "hello"),
+        ("path.normalize", "/tmp//a/../b.txt", "/tmp/b.txt"),
     ],
 )
 def test_builtin_transforms(engine, key, source, expected_substring):
@@ -231,3 +232,53 @@ def test_all_registry_actions_have_metadata():
         assert action.name
         assert action.category
         assert callable(action.transform)
+
+
+# ---- 跟踪参数清理与路径归一 ----
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["ref", "fbclid", "gclid", "spm", "mc_cid", "igshid", "pk_campaign"],
+)
+def test_strip_tracking_covers_common_params(engine, key):
+    """`ref` / `fbclid` 这类无前缀的参数曾因只做前缀匹配而漏掉。"""
+    result = engine.apply("url.strip_tracking", _item(content=f"https://a.com/p?{key}=x&q=1", kind="link"))
+    assert result.ok, result.error
+    assert result.output == "https://a.com/p?q=1"
+
+
+def test_strip_tracking_returns_none_when_nothing_to_strip(engine):
+    """没有跟踪参数时返回 None，让上层提示「不适用于该转换」。"""
+    result = engine.apply("url.strip_tracking", _item(content="https://a.com/p?q=1", kind="link"))
+    assert not result.ok
+
+
+def test_strip_tracking_shares_definition_with_dedupe(engine):
+    """转换器与去重必须用同一份跟踪参数名单。
+
+    两处各维护一份迟早分叉，用户会看到「转换说没有跟踪参数，
+    去重却认为这是两条不同的链接」这种自相矛盾的结果。
+    """
+    from linglong_clip.core.normalize import is_tracking_param, normalize_url
+
+    url = "https://a.com/p?ref=abc&utm_source=x&q=1"
+    result = engine.apply("url.strip_tracking", _item(content=url, kind="link"))
+    assert result.output == normalize_url(url)
+    assert is_tracking_param("ref")
+
+
+def test_path_normalize_multiline(engine):
+    result = engine.apply("path.normalize", _item(content="/a//b.txt\n/c/./d.txt", kind="file"))
+    assert result.ok, result.error
+    assert result.output == "/a/b.txt\n/c/d.txt"
+
+
+def test_path_normalize_none_when_already_clean(engine):
+    result = engine.apply("path.normalize", _item(content="/a/b.txt", kind="file"))
+    assert not result.ok
+
+
+def test_path_normalize_rejects_empty(engine):
+    result = engine.apply("path.normalize", _item(content="   ", kind="file"))
+    assert not result.ok

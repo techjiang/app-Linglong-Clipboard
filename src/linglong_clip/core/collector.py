@@ -13,6 +13,7 @@ from ..platform.base import FocusInfo
 from ..utils.logger import get_logger
 from . import classify
 from .models import ClipboardItem, content_hash
+from .normalize import canonical_content
 from .ocr import OcrEngine
 from .privacy import PrivacyGuard
 from .storage import Storage
@@ -82,7 +83,9 @@ class Collector:
                 _log.info("敏感内容不入库：%s", verdict.summary)
                 return SKIPPED_PRIVACY, None
 
-        item.hash = item.hash or content_hash(item.kind, self._hash_payload(item))
+        item.hash = item.hash or content_hash(
+            item.kind, self._canonical_payload(item)
+        )
         item.tags = list(
             dict.fromkeys(item.tags + classify.extract_tags(item.content, kind=item.kind))
         )
@@ -199,6 +202,35 @@ class Collector:
         if item.kind == "file" and item.files:
             return "\n".join(item.files)
         return item.content
+
+    def _canonical_payload(self, item: ClipboardItem) -> str:
+        """指纹载荷的「归一版」：链接去掉跟踪参数、路径写法收敛。
+
+        不归一的话，同一个页面从微博、微信、地址栏各复制一次就是三条独立记录
+        （`?utm_source=weibo&spm=...` 与 `?utm_source=wechat&ref=...` 是两串
+        不同的字节），但用户眼里那就是一个页面。归一后它们共用一个指纹，
+        按既有的「重复项只留一条并累加复制次数」逻辑自动并成一条。
+
+        归一结果**只用于算指纹**，`item.content` 保持原样：用户看到的、粘贴的、
+        搜索的仍是原文，我们只是换了个方式判断「这两条算不算同一条」。
+
+        可通过配置关掉（`history.canonical_dedupe`），关掉后行为与改造前一致。
+        """
+        options = {
+            "url_strip_tracking": bool(
+                self._config.get("history.canonical_dedupe.url", True)
+            ),
+            "path_normalize": bool(
+                self._config.get("history.canonical_dedupe.path", True)
+            ),
+        }
+        if not self._config.get("history.canonical_dedupe", True):
+            return self._hash_payload(item)
+        payload = self._hash_payload(item)
+        # 图片按字节指纹去重，没有归一的空间
+        if item.kind == "image":
+            return payload
+        return canonical_content(item.kind, payload, options=options)
 
     @staticmethod
     def _estimate_size(item: ClipboardItem) -> int:

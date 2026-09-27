@@ -37,7 +37,7 @@ sudo apt-get install -y libegl1 libglib2.0-0 libxkbcommon-x11-0 libdbus-1-3
 ```
 add / touch / update_fields / delete / delete_many / clear
 get / find_by_hash / latest / list / search
-count / count_by_kind / top_sources / dedupe
+count / count_by_kind / top_sources / dedupe / recanonicalize
 enforce_limits / purge_expired_sensitive
 get_meta / set_meta / optimize / stats / close
 ```
@@ -65,6 +65,23 @@ def _my_transform(text: str, option: str = "default") -> Optional[str]:
 - 其它异常 → 被捕获并记日志，不影响界面
 
 同时补 `tests/test_automation.py` 里 `test_builtin_transforms` 的参数化用例。
+
+### 修改判重规则
+
+「两条内容算不算同一条」由 `core/collector.py` 的 `_canonical_payload()`
+决定，它把内容交给 `core/normalize.py` 归一后再算指纹。
+
+改这里要记住三件事：
+
+1. **归一结果不写回 `content`**。它只用于算 `hash`，用户看到的必须仍是原文。
+2. **判据要保守**。误合并比不合并更糟 —— 不合并只是列表多几行，
+   误合并会让用户找不到东西且无法恢复。拿不准的一律不归一。
+3. **存量数据要能重算**。新增归一规则后，老记录的指纹是旧规则算的，
+   必须让 `recanonicalize()` 能识别并改写它们（两个后端各实现一次），
+   否则新规则只对新数据生效，历史里的重复永远合不了。
+
+跟踪参数名单只在 `core/normalize.py` 里定义一份，
+`automation.py` 的 `url.strip_tracking` 转换器要复用它而不是另抄一份。
 
 ## 测试
 
