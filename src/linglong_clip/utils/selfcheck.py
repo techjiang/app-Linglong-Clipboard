@@ -1,0 +1,330 @@
+"""原生能力自检：把「这台机器上到底哪些原生能力真的可用」问清楚。
+
+存在的理由：平台相关的代码在 CI 上跑不到（Windows 的 `user32`、macOS 的
+`Quartz` 在 Linux 机器上无法真实调用），此前只验过「接口形状」。
+于是出现一种最坏情况——接口对得上，功能是空的（例如 macOS 的全局快捷键
+只探测了 pyobjc 是否可导入，`register()` 从未覆写，永远返回 False）。
+
+这个模块按「与真实运行完全相同的顺序」调用一遍后端，
+把每一步的结果、耗时、失败原因摊开，供真机排查使用：
+
+    linglong-clipboard --selfcheck
+
+判定分三级，不合并成一句「不支持」：
+
+- `ok`   —— 调通了
+- `degraded` —— 调不通但已按设计降级，功能由别的路径提供
+- `fail` —— 预期应能用却没有，需要排查
+"""
+
+from __future__ import annotations
+
+import platform
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List
+
+OK = "ok"
+DEGRADED = "degraded"
+FAIL = "fail"
+SKIP = "skip"
+
+#: 自检用的探测组合：极不常用，避免抢占用户正在使用的快捷键
+PROBE_SEQUENCE = "Ctrl+Alt+Shift+F24"
+
+
+@dataclass
+class CheckResult:
+    """单项自检结果。"""
+
+    name: str
+    status: str
+    detail: str = ""
+    hint: str = ""
+    elapsed_ms: float = 0.0
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "name": self.name,
+            "status": self.status,
+            "detail": self.detail,
+            "hint": self.hint,
+            "elapsed_ms": round(self.elapsed_ms, 3),
+        }
+
+
+@dataclass
+class SelfCheckReport:
+    platform_label: str = ""
+    python_version: str = ""
+    backend: str = ""
+    results: List[CheckResult] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def failures(self) -> List[CheckResult]:
+        return [r for r in self.results if r.status == FAIL]
+
+    @property
+    def degraded(self) -> List[CheckResult]:
+        return [r for r in self.results if r.status == DEGRADED]
+
+    @property
+    def ok_count(self) -> int:
+        return sum(1 for r in self.results if r.status == OK)
+
+    @property
+    def healthy(self) -> bool:
+        return not self.failures
+
+    @property
+    def summary(self) -> str:
+        parts = [f"{self.ok_count} 项正常"]
+        if self.degraded:
+            parts.append(f"{len(self.degraded)} 项降级")
+        if self.failures:
+            parts.append(f"{len(self.failures)} 项失败")
+        return "、".join(parts)
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "platform": self.platform_label,
+            "python": self.python_version,
+            "backend": self.backend,
+            "summary": self.summary,
+            "healthy": self.healthy,
+            "checks": [r.to_dict() for r in self.results],
+            "notes": self.notes,
+        }
+
+
+class NativeSelfCheck:
+    """对平台后端与全局快捷键做一次真实调用链的自检。
+
+    只做只读探测：除注册/撤销一次全局快捷键外，不产生任何副作用，
+    也不会改写用户的剪贴板。
+    """
+
+    def __init__(self, backend=None, hotkeys_factory=None) -> None:
+        self._backend = backend
+        self._hotkeys_factory = hotkeys_factory
+
+    # ---- 入口 ----
+
+    def run(self) -> SelfCheckReport:
+        report = SelfCheckReport(
+            platform_label=platform.platform(),
+            python_version=sys.version.split()[0],
+        )
+        backend = self._backend
+        if backend is None:
+            from ..platform import detect_backend
+
+            backend = detect_backend()
+        report.backend = getattr(backend, "name", "unknown")
+
+        checks: List[Callable[[], CheckResult]] = [
+            lambda: self._check_backend(backend),
+            lambda: self._check_capabilities(backend),
+            lambda: self._check_clipboard_probe(backend),
+            lambda: self._check_focus(backend),
+            self._check_hotkey_backend,
+            self._check_hotkey_probe,
+        ]
+        for check in checks:
+            report.results.append(self._timed(check))
+        report.notes = self._build_notes(report)
+        return report
+
+    @staticmethod
+    def _timed(fn: Callable[[], CheckResult]) -> CheckResult:
+        started = time.perf_counter()
+        try:
+            result = fn()
+        except Exception as exc:  # noqa: BLE001 - 自检自身绝不能抛异常
+            result = CheckResult("未命名检查", FAIL, f"检查过程抛出异常：{exc!r}")
+        result.elapsed_ms = (time.perf_counter() - started) * 1000
+        return result
+
+    def _make_hotkeys(self):
+        if self._hotkeys_factory is not None:
+            return self._hotkeys_factory()
+        from ..ui.hotkeys import HotkeyManager
+
+        return HotkeyManager()
+
+    # ---- 各项检查 ----
+
+    @staticmethod
+    def _check_backend(backend) -> CheckResult:
+        from ..platform.base import NullBackend
+
+        name = getattr(backend, "name", "unknown")
+        if isinstance(backend, NullBackend):
+            return CheckResult(
+                "被选中的后端",
+                DEGRADED,
+                f"{name}（兜底后端）",
+                "未匹配到平台后端，剪贴板读写全部落在 Qt 层，功能可用但没有原生增强",
+            )
+        return CheckResult("被选中的后端", OK, name)
+
+    @staticmethod
+    def _check_capabilities(backend) -> CheckResult:
+        try:
+            caps = backend.capabilities()
+        except Exception as exc:  # noqa: BLE001
+            return CheckResult("后端能力矩阵", FAIL, f"capabilities() 失败：{exc!r}")
+        text = "、".join(f"{key}={'是' if value else '否'}" for key, value in caps.items())
+        return CheckResult("后端能力矩阵", OK, text)
+
+    @staticmethod
+    def _check_clipboard_probe(backend) -> CheckResult:
+        """验证后端真实读取能力（只读，不改写剪贴板）。"""
+        from ..platform.base import NullBackend
+
+        if isinstance(backend, NullBackend):
+            return CheckResult(
+                "剪贴板原生读取",
+                DEGRADED,
+                "兜底后端不提供原生读取",
+                "该项由 Qt 层提供，不影响使用",
+            )
+        probe = getattr(backend, "sanity_check", None)
+        if probe is None:
+            return CheckResult(
+                "剪贴板原生读取",
+                SKIP,
+                "该后端未实现 sanity_check()",
+                "只影响自检的深度，不代表功能缺失",
+            )
+        ok, detail = probe()
+        if ok:
+            return CheckResult("剪贴板原生读取", OK, detail)
+        return CheckResult(
+            "剪贴板原生读取",
+            DEGRADED,
+            detail,
+            "读取失败会回落到 Qt 剪贴板，功能仍可用",
+        )
+
+    @staticmethod
+    def _check_focus(backend) -> CheckResult:
+        try:
+            info = backend.current_focus()
+        except Exception as exc:  # noqa: BLE001
+            return CheckResult("前台窗口识别", FAIL, f"current_focus() 失败：{exc!r}")
+        if info.is_empty:
+            return CheckResult(
+                "前台窗口识别",
+                DEGRADED,
+                "未取到前台窗口",
+                "无图形会话（SSH / 无桌面）时属正常；有桌面却为空则需排查",
+            )
+        return CheckResult(
+            "前台窗口识别", OK, f"{info.display}（{info.window_title or '无标题'}）"
+        )
+
+    def _check_hotkey_backend(self) -> CheckResult:
+        manager = self._make_hotkeys()
+        name = manager.backend_name
+        if name == "none":
+            return CheckResult(
+                "全局快捷键后端",
+                DEGRADED,
+                "无可用后端",
+                manager.reason or "当前平台未提供全局快捷键实现",
+            )
+        if not manager.is_available:
+            return CheckResult(
+                "全局快捷键后端",
+                DEGRADED,
+                f"{name} 当前不可用",
+                manager.reason or "后端存在但环境条件不满足",
+            )
+        return CheckResult("全局快捷键后端", OK, name)
+
+    def _check_hotkey_probe(self) -> CheckResult:
+        """真实注册一次快捷键再撤销，确认能力不是「只在代码里存在」。"""
+        probe = self._make_hotkeys()
+        if probe.backend_name == "none":
+            return CheckResult("全局快捷键注册", SKIP, "无后端，跳过注册探测")
+        if not probe.is_available:
+            return CheckResult(
+                "全局快捷键注册",
+                SKIP,
+                f"后端不可用（{probe.reason or '环境不满足'}）",
+                "先解决上方「全局快捷键后端」一项",
+            )
+
+        registered = probe.register(PROBE_SEQUENCE, lambda: None)
+        try:
+            if registered:
+                return CheckResult(
+                    "全局快捷键注册", OK, f"已成功注册并撤销 {PROBE_SEQUENCE}"
+                )
+            return CheckResult(
+                "全局快捷键注册",
+                DEGRADED,
+                f"注册失败：{probe.reason or '未知原因'}",
+                "被其它程序占用属正常；若是权限问题（macOS 辅助功能 / X11 被其它抓键者独占）需另行处理",
+            )
+        finally:
+            probe.unregister_all()
+
+    # ---- 结论 ----
+
+    @staticmethod
+    def _build_notes(report: SelfCheckReport) -> List[str]:
+        notes: List[str] = []
+        for failure in report.failures:
+            notes.append(
+                f"{failure.name}：{failure.detail}（{failure.hint or '需要排查'}）"
+            )
+        for item in report.degraded:
+            notes.append(f"{item.name} 已降级：{item.detail}")
+        if not notes:
+            notes.append("全部原生能力均按预期可用")
+        return notes
+
+
+def format_report(report: SelfCheckReport) -> str:
+    """人类可读输出。"""
+    icon = {OK: "✓", DEGRADED: "~", FAIL: "✗", SKIP: "-"}
+    lines = [
+        "玲珑剪切板 · 原生能力自检",
+        f"平台：{report.platform_label}",
+        f"Python：{report.python_version}",
+        f"后端：{report.backend or '未知'}",
+        "",
+    ]
+    for item in report.results:
+        mark = icon.get(item.status, "?")
+        lines.append(f"  {mark} {item.name}：{item.detail}（{item.elapsed_ms:.1f}ms）")
+        if item.hint and item.status in (FAIL, DEGRADED):
+            lines.append(f"      提示：{item.hint}")
+    lines.append("")
+    lines.append(f"结论：{report.summary}")
+    for note in report.notes:
+        lines.append(f"  · {note}")
+    return "\n".join(lines)
+
+
+def run_self_check(backend=None, hotkeys_factory=None) -> SelfCheckReport:
+    """便捷入口。"""
+    return NativeSelfCheck(backend=backend, hotkeys_factory=hotkeys_factory).run()
+
+
+__all__ = [
+    "CheckResult",
+    "NativeSelfCheck",
+    "SelfCheckReport",
+    "FAIL",
+    "DEGRADED",
+    "OK",
+    "SKIP",
+    "PROBE_SEQUENCE",
+    "format_report",
+    "run_self_check",
+]

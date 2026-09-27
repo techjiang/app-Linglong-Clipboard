@@ -41,11 +41,20 @@ CAPTURE_TYPES = ["text", "rich", "image", "file", "link", "color", "code"]
 class SettingsDialog(QDialog):
     """配置编辑器。`changes` 里是本次被改动的配置键。"""
 
-    def __init__(self, config, automation=None, device_status: Dict[str, object] = None, parent=None) -> None:
+    def __init__(
+        self,
+        config,
+        automation=None,
+        device_status: Dict[str, object] = None,
+        parent=None,
+        native_report=None,
+    ) -> None:
         super().__init__(parent)
         self._config = config
         self._automation = automation
         self._device_status = device_status or {}
+        #: `utils.selfcheck.SelfCheckReport`，为 None 时跳过原生能力面板
+        self._native_report = native_report
         self.changes: Dict[str, object] = {}
 
         self.setWindowTitle("设置 — 玲珑剪切板")
@@ -542,8 +551,44 @@ class SettingsDialog(QDialog):
         text.setWordWrap(True)
         text.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(text)
+
+        if self._native_report is not None:
+            layout.addWidget(self._build_native_group())
         layout.addStretch(1)
         return page
+
+    def _build_native_group(self) -> QWidget:
+        """原生能力面板。
+
+        把 `--selfcheck` 的结论搬进界面：用户不该为了知道
+        「全局快捷键为什么没生效」去翻日志或开终端。
+        """
+        from ..utils.selfcheck import DEGRADED, FAIL
+
+        group = QGroupBox("原生能力")
+        form = QFormLayout(group)
+        report = self._native_report
+
+        form.addRow("自检结论", QLabel(report.summary))
+        for item in report.results:
+            value = QLabel(item.detail or "-")
+            value.setWordWrap(True)
+            if item.status == FAIL:
+                value.setStyleSheet("color:#e5484d")
+                value.setText(f"{item.detail}\n{item.hint}")
+            elif item.status == DEGRADED:
+                value.setStyleSheet("color:#e5a00d")
+                value.setText(f"{item.detail}\n{item.hint}")
+            form.addRow(item.name, value)
+
+        hint = QLabel(
+            "<p style='color:#8d96a8'>命令行可随时复查："
+            "<code>linglong-clipboard --selfcheck</code></p>"
+        )
+        hint.setTextFormat(Qt.TextFormat.RichText)
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+        return group
 
     # ---- 保存 ----
 

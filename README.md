@@ -241,18 +241,49 @@ linglong-clipboard --merge-duplicates  # 重算 + 合并（含历史里的存量
 
 | 能力 | Windows | Linux (X11) | Linux (Wayland) | macOS |
 | --- | --- | --- | --- | --- |
-| 剪贴板采集 | ✅ 事件驱动 | ✅ 轮询 | ✅ 轮询 | ✅ 轮询 |
+| 剪贴板采集 | ✅ 事件驱动（1s 兜底轮询） | ✅ 轮询 | ✅ 轮询 | ✅ 轮询 |
+| 原生剪贴板读写 | ✅ Win32 | ✅ Xlib/xclip | ✅ wl-paste | ✅ pbpaste/pbcopy |
 | 来源应用识别 | ✅ Win32 | ✅ Xlib/xdotool | ⚠️ 受限 | ✅ osascript |
 | 主选择区（PRIMARY） | — | ✅ | ✅ wl-paste | — |
-| 安全粘贴标记 | ✅ 系统级 | — | — | — |
-| 全局快捷键 | ✅ RegisterHotKey | ✅ XGrabKey | ⚠️ 需桌面环境绑定 | ⚠️ 需 pyobjc |
+| 安全粘贴标记 | ✅ 系统级 | — | — | ⚠️ 定时清空（有条件） |
+| 全局快捷键 | ✅ RegisterHotKey | ✅ XGrabKey | ⚠️ 需桌面环境绑定 | ✅ Quartz 事件 tap |
 
 所有原生能力失败都会**优雅降级**（退回 Qt 剪贴板 + 轮询 + 应用内快捷键），
 不会因为缺依赖而无法启动。
 
-Windows 上走 `AddClipboardFormatListener` 事件驱动，避免轮询空转；
-写入时附加 `ExcludeClipboardContentFromMonitorProcessing`，
-让敏感内容不进系统剪贴板历史。
+- **Windows**：走 `AddClipboardFormatListener` 事件驱动，避免轮询空转；
+  写入时附加 `ExcludeClipboardContentFromMonitorProcessing`，
+  让敏感内容不进系统剪贴板历史
+- **macOS**：全局快捷键用 Quartz 事件 tap，需要辅助功能权限，
+  未授权时降级并给出可执行的授权路径
+- **Linux/Wayland**：协议不允许抓全局按键，需在桌面环境自行绑定
+  `linglong-clipboard --quick`
+
+**别猜，直接问文档没用 —— 让程序自己说。** 换机器或报障时先跑：
+
+```bash
+linglong-clipboard --selfcheck
+```
+
+它按与真实运行完全相同的顺序调用一遍后端，逐项给出
+`ok` / `degraded` / `fail` 三级判定与耗时，例如：
+
+```
+  ✓ 被选中的后端：windows（0.0ms）
+  ✓ 后端能力矩阵：native_history=是、focus_detection=是…（0.1ms）
+  ✓ 剪贴板原生读取：Win32 剪贴板可访问（序列号 4213）（0.4ms）
+  ~ 前台窗口识别：未取到前台窗口（0.2ms）
+      提示：无图形会话（SSH / 无桌面）时属正常；有桌面却为空则需排查
+  ✓ 全局快捷键后端：windows（0.0ms）
+  ✓ 全局快捷键注册：已成功注册并撤销 Ctrl+Alt+Shift+F24（0.6ms）
+```
+
+设置页的「关于」里也能直接看到同一份结论，不必开终端：
+
+![原生能力自检](docs/screenshots/settings-native.png)
+
+真机验证清单见 [docs/native-verification.md](docs/native-verification.md)；
+没有目标机器时可用 `python tools/native_check.py` 在真机上一键采集结论。
 
 ### 九、跨设备同步，不要中心服务器
 
@@ -397,7 +428,13 @@ linglong-clipboard --storage-migrate         # 把记录搬到另一种存储（
 linglong-clipboard --sync-status             # 同步模式、对端与游标进度
 linglong-clipboard --sync-cursor             # 各来源同步到哪个时间点
 linglong-clipboard --sync-cursor-reset       # 清空游标，下次全量重扫
+linglong-clipboard --selfcheck                # 自检原生能力是否真的可用
+linglong-clipboard --selfcheck --json         # 同上，JSON 输出便于回帖
 ```
+
+`--selfcheck` 退出码：`0` 全部正常、`1` 有降级、`2` 有失败，
+可以塞进脚本里判断。它在换机器部署或报障时第一个该跑的命令 ——
+「快捷键没反应」这类问题不必翻日志。
 
 ### 数据存放位置
 
@@ -513,8 +550,14 @@ pytest tests/ --cov=linglong_clip --cov-report=html # 带覆盖率
 QT_QPA_PLATFORM=offscreen pytest tests/test_ui.py   # 无头环境跑界面测试
 ```
 
-589 个用例，覆盖核心逻辑、平台适配、界面组件与端到端流程。
+824 个用例，覆盖核心逻辑、平台适配、界面组件与端到端流程。
 界面测试统一走 Qt 的 `offscreen` 平台，无需真实显示器，CI 里也能跑。
+
+**平台相关的测试用「仿真原生层」而不是打桩断言。** Windows 分支喂一个
+记录调用的假 `user32`、macOS 分支喂一个假 `Quartz`，然后跑真实的
+`register()` → 事件分发 → 回调整条链路。差别在于：打桩只能验「调用了某个
+方法」，仿真能验「事件真的走到了回调」。本轮修掉的两个缺陷都属于后者 ——
+注册成功但消息没人分发、后端可用但 `register()` 是空实现。
 
 重复项合并的语义由两个后端各自一组同名用例守着
 （`test_storage.py` / `test_repository.py`），覆盖次数折算、最新时间提升、
@@ -556,19 +599,26 @@ src/linglong_clip/
 │   ├── base.py              #   后端接口与能力矩阵
 │   ├── windows.py           #   Win32 ctypes（零第三方依赖）
 │   ├── linux.py             #   X11 / Wayland 双栈
-│   └── macos.py             #   osascript
+│   └── macos.py             #   pbpaste/pbcopy + osascript
 ├── ui/                      # Qt 界面层
-│   ├── application.py       #   装配与事件路由、线程调度
+│   ├── application.py       #   装配与事件路由、线程调度、Windows 事件接线
 │   ├── main_window.py       #   主窗口
 │   ├── quick_paste.py       #   快速粘贴浮层
 │   ├── item_card.py         #   列表卡片
 │   ├── settings_dialog.py   #   设置
 │   ├── transform_window.py  #   转换结果
 │   ├── clipboard_qt.py      #   Qt 剪贴板适配
-│   ├── hotkeys.py           #   全局快捷键
+│   ├── hotkeys.py           #   全局快捷键（三平台原生注册 + 事件分发）
 │   ├── tray.py              #   系统托盘
 │   └── theme.py             #   主题与样式表
 └── utils/                   # 配置、日志、路径
+    ├── config.py            #   配置读写与变更通知
+    ├── paths.py             #   各平台数据目录约定
+    ├── logger.py            #   日志
+    └── selfcheck.py         #   原生能力自检（--selfcheck 的实现）
+
+tools/
+└── native_check.py          # 真机自检脚本（Windows/macOS 上手工跑一次）
 ```
 
 分层约定：**`core/` 不导入任何 Qt**。这样核心逻辑能在无图形环境下测试，
@@ -597,6 +647,8 @@ src/linglong_clip/
 | **局域网用拉取而非推送** | 只需暴露只读接口，自己决定何时拉取；天然免去并发写与对端离线处理 | 推送模型（要处理对端离线队列、写入冲突） |
 | **合并判据走「归一」而不是原始字节** | 同一个页面被不同渠道分享出的链接、同一个文件的不同写法，字节不同但用户眼里是同一条。归一后才谈得上「相同内容只留一条」 | 只比原始字节（同一页面在列表里重复出现）；用内容相似度/模糊匹配（会误合并语义不同的内容，且无法解释） |
 | **合并重复项时折算复制次数** | 删掉重复行会顺手丢掉「这段内容反复在用」这个最有价值的排序信号；折算保留后，高频片段才能真正浮上来 | 直接删重复行（一行代码，但把频次清零）；引入独立的 `copies` 计数字段（与 `use_count` 两个口径，早晚不一致） |
+| **原生能力做成可查询的自检，而不是写在文档里** | 文档写「支持 Windows 事件驱动」，可实际没注册监听也照样是这句话。让程序按真实调用链验一遍并给出三级判定，才是可证伪的说法 | 只写文档（无法证伪，出问题只能翻日志猜）；把判定压成一句「不支持」（丢掉「降级但可用」这个最常用的中间态） |
+| **平台测试用仿真原生层而非打桩** | 打桩只能验「调用了某个方法」，仿真能验「事件真的走到了回调」。本轮两个缺陷（注册成功但消息没人分发、后端可用但 `register()` 是空实现）都只有仿真能抓到 | `monkeypatch` 断言调用次数（看起来覆盖了，实际只测了自己写的桩） |
 
 ---
 
@@ -605,7 +657,19 @@ src/linglong_clip/
 - **Wayland 全局快捷键**：Wayland 不允许应用抓取全局按键，需在桌面环境里自行绑定。
 - **Wayland 来源应用识别**：协议未暴露前台窗口信息，来源会显示为未知。
   这是 Wayland 的隐私设计，非本工具缺陷。
-- **macOS 全局快捷键**：需要 `pyobjc` 且需授予辅助功能权限，未满足时降级为应用内快捷键。
+- **macOS 全局快捷键需辅助功能权限**：首次注册会弹系统授权引导，
+  授权后**必须重启应用**（事件 tap 在进程启动时创建）。
+  未授权时降级为应用内快捷键，并在 `--selfcheck` 里明确报告。
+  没装 `pyobjc` 时同样降级，不会启动失败。
+- **macOS 临时剪贴板只是「缩小暴露窗口」**：`pbcopy` 到期后写空内容，
+  且只在「剪贴板内容仍是当初写入的那份」时才清（避免误删你后来的复制）。
+  进程退出后定时器即失效，过期清理不会发生。**不要把密钥指望在这条路径上** ——
+  处理密钥请用「敏感内容压根不落盘 + 复制出站时打码」。
+- **Windows / macOS 原生代码未经真机验证**：本轮补上了仿真原生层的自动化测试
+  （假的 `user32` / 假的 `Quartz`，跑的是真实业务链路，不是打桩断言），
+  并在仓库里放了真机自检脚本 `tools/native_check.py`。
+  但键码冲突、权限弹窗、系统消息投递时序这些只有真机能暴露。
+  验证清单见 [docs/native-verification.md](docs/native-verification.md)。
 - **复制后自动粘贴**：Linux 下依赖 `xdotool`，Wayland 不支持。
 - **图片不同步**：为避免同步目录膨胀，图片默认只在本地，不参与跨设备流转。
 - **OCR 依赖系统 tesseract**：未安装时截图照常记录，只是搜不到图中的文字。

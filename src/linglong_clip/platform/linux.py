@@ -89,6 +89,26 @@ class LinuxBackend(ClipboardBackend):
             "wayland": self._session == "wayland",
         }
 
+    # ---- 自检 ----
+
+    def sanity_check(self):
+        """自检用：确认本会话下至少有一条可用的读取路径。
+
+        只读探测，不改写剪贴板；Wayland 与 X11 分别验证各自的工具链。
+        """
+        if self._session == "wayland":
+            if self._has_wl:
+                return True, "wl-paste 可用（Wayland 读写走 wl-clipboard）"
+            if self._xlib:
+                return True, "XWayland + python-xlib 可用"
+            return False, "Wayland 会话下既无 wl-clipboard 也无 Xlib，读写将全部落在 Qt 层"
+        if self._xlib is True:
+            return True, "python-xlib 已连接 X 服务器"
+        for tool in ("xclip", "xsel"):
+            if _has(tool):
+                return True, f"{tool} 可用（X11 命令行读写）"
+        return False, "X11 会话下未找到 Xlib / xclip / xsel，读写将全部落在 Qt 层"
+
     # ---- 主选择区 ----
 
     def read_primary_text(self) -> str:

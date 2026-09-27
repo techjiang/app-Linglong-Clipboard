@@ -28,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  linglong-clipboard --search '上周的截图'\n"
             "  linglong-clipboard --get 12         输出第 12 条内容\n"
             "  linglong-clipboard --stats          查看统计与检索能力\n"
+            "  linglong-clipboard --selfcheck      自检原生能力是否真的可用\n"
             "  linglong-clipboard --sync-status    查看同步模式与对端状态\n"
             "  linglong-clipboard --sync-cursor    查看各同步来源的增量游标\n"
             "  linglong-clipboard --storage-status 查看历史文件的存放位置\n"
@@ -108,6 +109,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--where",
         action="store_true",
         help="只输出数据目录路径，便于脚本取用",
+    )
+
+    diagnose = parser.add_argument_group("诊断")
+    diagnose.add_argument(
+        "--selfcheck",
+        action="store_true",
+        help="自检原生能力（剪贴板读写、前台窗口、全局快捷键），换机器排查时先跑这个",
     )
 
     output = parser.add_argument_group("输出")
@@ -283,6 +291,9 @@ def _run_cli(args: argparse.Namespace) -> int:
     from .core.normalize import canonical_content
     from .core.semantic import SemanticEngine
     from .utils.config import Config
+
+    if args.selfcheck:
+        return _run_selfcheck(args)
 
     config = Config()
 
@@ -546,6 +557,27 @@ def _run_cli(args: argparse.Namespace) -> int:
     return -1  # 未命中任何 CLI 模式，交给 GUI
 
 
+def _run_selfcheck(args: argparse.Namespace) -> int:
+    """原生能力自检。
+
+    刻意不打开数据库：自检回答的是「这台机器上的原生能力能不能用」，
+    不该被历史文件损坏之类的问题挡住 —— 否则最需要它的时候就恰好用不了。
+    """
+    from .utils.selfcheck import format_report, run_self_check
+
+    report = run_self_check()
+    if args.json:
+        print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+    else:
+        print(format_report(report))
+    # 退出码：0 全部正常 / 1 有降级 / 2 有失败，便于脚本判断
+    if report.failures:
+        return 2
+    if report.degraded:
+        return 1
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
@@ -571,6 +603,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.storage is not None,
             args.storage_migrate,
             args.where,
+            args.selfcheck,
         ]
     ):
         return _run_cli(args)

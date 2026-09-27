@@ -29,6 +29,21 @@ sudo apt-get install -y libegl1 libglib2.0-0 libxkbcommon-x11-0 libdbus-1-3
 
 并在 README 的「三平台原生适配」表格里补上对应格子。
 
+**三条硬性要求**，都是踩过坑才写下来的：
+
+1. **能力矩阵必须与实现一致**。`capabilities()` 里写的 `True` 要有对应的
+   代码。macOS 后端曾经把 `transient_clipboard` 写死为 `True`，
+   而实际只实现了来源识别 —— 声明了安全粘贴却做不到，比不声明更糟。
+2. **实现 `sanity_check()`**。它返回 `(是否可用, 人类可读的原因)`，
+   会被 `--selfcheck` 调用。没有它，自检只能验「接口在不在」，
+   验不出「功能空不空」。
+3. **补仿真原生层测试，而不是打桩断言**。假的 `user32` / 假的 `Quartz`
+   要跑真实业务链路（`register()` → 事件分发 → 回调），
+   而不是断言「调用了某个方法」。打桩测不出「注册成功但消息没人分发」
+   这类缺陷 —— 这正是本轮修掉的两个问题之一。
+
+真机验证清单在 `docs/native-verification.md`，修改平台代码时请一并更新。
+
 ### 新增存储后端
 
 `core/storage.py`（SQLite）与 `core/repository.py`（JSON 单文件）是**并列**关系，
@@ -97,6 +112,8 @@ pytest tests/test_storage.py -k fts -v               # 单个模块
 - 界面测试走 Qt `offscreen` 平台，不要引入对真实显示器的依赖
 - 数据目录用 `tmp_path` / `LINGLONG_CLIPBOARD_HOME` 隔离，不要写到真实用户目录
 - 涉及平台的用例用 `pytest.importorskip`
+- **平台相关代码必须能用仿真原生层测**：假 `user32` / 假 `Quartz` 跑真实链路，
+  别用 `monkeypatch` 断言「调用过某方法」。参考 `tests/test_hotkeys.py`。
 
 ## 提交
 
@@ -132,3 +149,4 @@ Issue 里请包含：
 - 复现步骤
 - 期望行为与实际行为
 - 相关日志（`logs/linglong.log`，**注意先检查是否含敏感内容**）
+- **`linglong-clipboard --selfcheck --json` 的输出**（原生能力相关问题时）

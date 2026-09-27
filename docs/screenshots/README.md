@@ -10,6 +10,7 @@
 | `quick-paste.png` | Ctrl+Shift+V 快速粘贴浮层 |
 | `search-dark.png` | 自然语言检索结果 |
 | `settings-ocr.png` | 设置页（含 OCR 与局域网同步选项） |
+| `settings-native.png` | 设置页「关于」的原生能力自检面板 |
 
 重新生成：
 

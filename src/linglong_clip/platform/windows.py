@@ -75,21 +75,26 @@ class WindowsBackend(ClipboardBackend):
             return False
         try:
             ok = bool(user32.AddClipboardFormatListener(wintypes.HWND(hwnd)))
-            self._registered = ok
-            self._listener_hwnd = hwnd
-            return ok
         except Exception:  # noqa: BLE001
             return False
+        # 句柄只在注册成功后才记下来 —— 否则失败时 `unregister_listener`
+        # 会以为「注册过但没记住句柄」，白白多做一次多余的注销尝试。
+        if ok:
+            self._registered = True
+            self._listener_hwnd = hwnd
+        return ok
 
     def unregister_listener(self) -> None:
         if user32 is None or not self._registered or not self._listener_hwnd:
             return
+        handle = self._listener_hwnd
         try:
-            user32.RemoveClipboardFormatListener(wintypes.HWND(self._listener_hwnd))
+            user32.RemoveClipboardFormatListener(wintypes.HWND(handle))
         except Exception:  # noqa: BLE001
             pass
         finally:
             self._registered = False
+            self._listener_hwnd = 0
 
     # ---- 剪贴板打开/关闭 ----
 
@@ -100,7 +105,13 @@ class WindowsBackend(ClipboardBackend):
         for _ in range(retries):
             if user32.OpenClipboard(None):
                 return True
-            ctypes.windll.kernel32.Sleep(10)
+            # 用 kernel32 已加载的句柄，不再走 `ctypes.windll`——
+            # 后者只在 Windows 上存在，一旦缺失就会把「重试」变成抛异常。
+            if kernel32 is not None:
+                try:
+                    kernel32.Sleep(10)
+                except Exception:  # noqa: BLE001
+                    pass
         return False
 
     def close_clipboard(self) -> None:
@@ -183,6 +194,25 @@ class WindowsBackend(ClipboardBackend):
                 user32.SetClipboardData(fmt, None)
         except Exception:  # noqa: BLE001
             pass
+
+    # ---- 自检 ----
+
+    def sanity_check(self):
+        """自检用：确认 Win32 剪贴板 API 能真实调起。
+
+        只读探测：打开剪贴板、读一次序列号再关掉，不改写任何内容。
+        """
+        if user32 is None:
+            return False, "user32 未加载（非 Windows 或加载被拒）"
+        if not self.open_clipboard():
+            return False, "OpenClipboard 失败（剪贴板被其它进程长期占用？）"
+        try:
+            watched = user32.GetClipboardSequenceNumber()
+        finally:
+            self.close_clipboard()
+        if not watched:
+            return False, "GetClipboardSequenceNumber 返回 0"
+        return True, f"Win32 剪贴板可访问（序列号 {int(watched)}）"
 
     def is_history_supported(self) -> bool:
         """Win10 1809+ 起系统自带历史，此处仅探测可用性。"""

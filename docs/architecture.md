@@ -110,7 +110,47 @@ GUI 线程：刷新列表 + 状态提示
 - `XGrabKey` 注册时同时抓 NumLock/CapsLock 组合，
   否则用户开着这些锁键时快捷键会失效
 
-**macOS** 用 `osascript` 取前台应用，避免为一个小功能引入 pyobjc 强制依赖。
+**macOS** 只用系统自带命令，不强制依赖 pyobjc：
+
+- `pbpaste` / `pbcopy` 读写剪贴板（`-Prefer txt` 拿纯文本）
+- `osascript` + System Events 取前台应用与窗口标题
+- 临时剪贴板：`pbcopy` 到期后写空内容，**但只在内容仍是当初写入的那份时才清**
+  （否则用户在这期间复制的东西会被误删）。进程退出后定时器即失效，
+  所以这只是「缩小暴露窗口」，不是擦除痕迹 —— 处理密钥请走
+  「不落盘 + 复制出站打码」那条路
+
+### 能力自检
+
+平台代码有个特殊的验证难题：**接口对得上，功能可以是空的**。
+macOS 的全局快捷键曾只探测 pyobjc 能否导入，`register()` 从未覆写，
+继承基类的假实现永远返回 `False`；Windows 的事件通道装了 Qt 过滤器，
+却没注册 `AddClipboardFormatListener`，`WM_HOTKEY` 也没有分发函数 ——
+「注册成功、回调永不触发」，比注册失败更难发现。
+
+两者在 Linux 上都看不出问题（`backend_name` 显示正确、`is_available` 为真、
+`register()` 返回真）。所以需要一条**在真机上按真实调用链验一遍**的路径：
+
+```
+utils/selfcheck.py     # 产品内实现，装进 --selfcheck
+tools/native_check.py  # 真机手工跑一次的扩展脚本（含平台专有项）
+```
+
+三级判定不能压成一句「不支持」，因为最常用的中间态恰恰是「降级但可用」：
+
+| 判定 | 含义 | 需要动作 |
+| --- | --- | --- |
+| `ok` | 调通了 | 无 |
+| `degraded` | 调不通但已按设计降级 | 通常无 |
+| `fail` | 预期应能用却没有 | 需排查 |
+
+自检**只读**：不改写剪贴板，唯一副作用是注册并立即撤销一个
+`Ctrl+Alt+Shift+F24`（刻意选一个不会被占用的组合）。
+它刻意不打开数据库 —— 自检回答的是「这台机器上原生能力能不能用」，
+不该被历史文件损坏之类的问题挡住，否则最需要它时恰好用不了。
+
+后端实现 `sanity_check()` 提供只读探测，返回
+`(是否可用, 人类可读的原因)`。这是**新增原生能力的硬性要求**：
+没有它，自检只能验「接口在不在」，验不出「功能空不空」。
 
 ## 存储
 
@@ -443,10 +483,32 @@ A 设备                                        B 设备
 | 存储 | 内存/临时 SQLite，覆盖 FTS 降级与索引重建 |
 | JSON 存储 | 临时目录里的 JSON 文件，覆盖损坏恢复、原子写、内联图片与搬迁 |
 | 重复项合并 | 两个后端各一组同名用例：次数折算、最新时间提升、幂等、空 hash 跳过 |
-| 平台层 | 测接口契约与降级路径；原生实现用桩对象 |
+| 平台层（Linux） | 真实调用，覆盖 X11/Wayland 双栈与降级路径 |
+| 平台层（Windows/macOS） | **仿真原生层**：假的 `user32` / 假的 `Quartz`，跑真实业务链路 |
+| 原生能力自检 | 自检自身可测：探测抛异常时仍要能给出结论 |
 | 界面 | Qt `offscreen` 平台，无需显示器，CI 可跑 |
 | 端到端 | 真实 Qt 剪贴板 → 采集 → 落库 → 检索 → 变换 → 写回 |
 
-平台原生代码（Windows/macOS）在 Linux CI 上无法执行，
-因此把「能力探测」与「能力使用」分开：探测逻辑可测，
-使用逻辑通过桩对象验证契约。
+平台原生代码（Windows/macOS）在 Linux CI 上无法执行，最初的做法是
+「把能力探测与能力使用分开，使用逻辑用桩对象验契约」。这个做法有个盲区：
+**它只能验「调用了某个方法」，不能验「事件真的走到了回调」**。
+实测中它漏掉了两个缺陷：macOS 后端 `is_available` 返回真但 `register()`
+是空实现；Windows 侧 `RegisterHotKey` 成功但 `WM_HOTKEY` 没人分发。
+
+现在的做法是**仿真原生层**：
+
+```python
+# 喂一个假的 user32，然后走真实的 register() → 事件 → 回调
+win_backend.register(5, "Ctrl+Shift+V", lambda: fired.append("hit"))
+win_backend.handle_native_event(0, SimpleNamespace(message=WM_HOTKEY, wParam=5))
+assert fired == ["hit"]        # 打桩式测试永远发现不了这一条
+```
+
+`tests/test_hotkeys.py`（50 个用例）覆盖：Windows 修饰键位与虚拟键码映射、
+`WM_HOTKEY` 分发、未知 id 不误触发、回调异常不拖垮消息循环；
+macOS 权限未授予、tap 创建失败、事件标志位精确匹配（多按修饰键不触发、
+CapsLock 不影响）、系统超时停掉 tap 后自动重开。
+
+仿真的边界要说清：**真实的键码冲突、权限弹窗、系统消息投递时序仍然验不到**。
+这些只能靠 `tools/native_check.py` 在真机上跑一遍，
+清单见 `docs/native-verification.md`。

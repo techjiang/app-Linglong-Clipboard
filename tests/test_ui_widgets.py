@@ -454,3 +454,93 @@ def test_dialog_saves_canonical_options(dialog, config):
 
     assert config.get("history.canonical_dedupe.url") is False
     assert config.get("history.canonical_dedupe.path") is False
+
+
+# ---- 设置页：原生能力面板 ----
+
+
+def _fake_native_report(**kwargs):
+    from linglong_clip.utils.selfcheck import (
+        DEGRADED,
+        FAIL,
+        OK,
+        CheckResult,
+        SelfCheckReport,
+    )
+
+    report = SelfCheckReport(platform_label="Test", python_version="3.x", backend="fake")
+    report.results = [
+        CheckResult("被选中的后端", OK, "fake"),
+        CheckResult("剪贴板原生读取", DEGRADED, "调不通", "会回落到 Qt"),
+    ]
+    if kwargs.get("with_failure"):
+        report.results.append(CheckResult("全局快捷键注册", FAIL, "炸了", "去授权"))
+    report.notes = ["说明"]
+    return report
+
+
+def test_settings_native_panel_absent_without_report(qt_app, home):
+    """不传报告时应跳过整个面板，而不是显示一个空壳。"""
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    dialog = SettingsDialog(Config(home / "config.json"))
+    assert dialog._native_report is None
+
+
+def test_settings_accepts_native_report(qt_app, home):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    report = _fake_native_report()
+    dialog = SettingsDialog(Config(home / "config.json"), native_report=report)
+    assert dialog._native_report is report
+
+
+def test_settings_native_panel_renders_checks(qt_app, home):
+    """面板要把每项判定的名称与说明都摆出来。
+
+    用户不该为了知道「快捷键为什么没生效」去翻日志或开终端。
+    """
+    from PySide6.QtWidgets import QLabel
+
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    dialog = SettingsDialog(
+        Config(home / "config.json"), native_report=_fake_native_report()
+    )
+    texts = [label.text() for label in dialog.findChildren(QLabel)]
+    joined = "\n".join(texts)
+
+    assert "被选中的后端" in joined
+    assert "剪贴板原生读取" in joined
+    assert "调不通" in joined
+    assert "--selfcheck" in joined
+
+
+def test_settings_native_panel_shows_failure_hint(qt_app, home):
+    from PySide6.QtWidgets import QLabel
+
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    dialog = SettingsDialog(
+        Config(home / "config.json"),
+        native_report=_fake_native_report(with_failure=True),
+    )
+    joined = "\n".join(label.text() for label in dialog.findChildren(QLabel))
+    # 失败项要带上可执行的提示，不能只说「失败了」
+    assert "去授权" in joined
+
+
+def test_settings_native_panel_does_not_break_saving(qt_app, home):
+    """加了面板之后配置保存路径不能被带坏。"""
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    dialog = SettingsDialog(config, native_report=_fake_native_report())
+    dialog._capture_enabled.setChecked(False)
+    dialog._save()
+    assert config.get("capture.enabled") is False

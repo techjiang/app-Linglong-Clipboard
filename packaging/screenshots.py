@@ -68,7 +68,7 @@ def _render(widget, target: Path) -> None:
 
 
 def main() -> int:
-    from PySide6.QtWidgets import QApplication
+    from PySide6.QtWidgets import QApplication, QTabWidget
 
     from linglong_clip.core.automation import AutomationEngine
     from linglong_clip.core.semantic import SemanticEngine
@@ -117,6 +117,16 @@ def main() -> int:
     dialog = SettingsDialog(_config({}), automation)
     dialog.resize(760, 640)
     _render(dialog, OUT / "settings-ocr.png")
+
+    # 设置页「关于」：体现原生能力自检面板
+    from linglong_clip.utils.selfcheck import run_self_check
+
+    about = SettingsDialog(_config({}), automation, native_report=run_self_check())
+    about.resize(760, 640)
+    tabs = about.findChild(QTabWidget)
+    if tabs is not None:
+        tabs.setCurrentIndex(tabs.count() - 1)  # 「关于」是最后一页
+    _render(about, OUT / "settings-native.png")
 
     storage.close()
     app.quit()

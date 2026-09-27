@@ -14,7 +14,7 @@ import sys
 import threading
 from typing import Optional
 
-from PySide6.QtCore import QObject, QTimer, Qt, Signal
+from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QTimer, Qt, Signal
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from ..core.automation import AutomationEngine
@@ -36,6 +36,7 @@ from .clipboard_qt import QtClipboardAdapter
 from .hotkeys import HotkeyManager
 from .main_window import MainWindow
 from .quick_paste import QuickPasteOverlay
+from ..utils.selfcheck import run_self_check
 from .settings_dialog import SettingsDialog
 from .theme import palette_for
 from .transform_window import TransformWindow
@@ -45,6 +46,9 @@ _log = get_logger("app")
 
 #: 同步与清理的定时周期（毫秒）
 SYNC_INTERVAL_MS = 60_000
+
+#: Windows 事件驱动生效后的轮询兜底间隔（毫秒）
+EVENT_DRIVEN_FALLBACK_MS = 1_000
 SENSITIVE_SWEEP_MS = 30_000
 
 
@@ -170,6 +174,9 @@ class Application(QObject):
             gui_invoke=self._invoker.call,
         )
         self.focus = FocusTracker(self.backend)
+
+        #: 原生能力自检结果，首次访问设置页时惰性计算
+        self._native_report = None
 
         self._wire_signals()
         self._setup_native_event_filter()
@@ -307,35 +314,85 @@ class Application(QObject):
         self.tray.quit_requested.connect(self.quit)
 
     def _setup_native_event_filter(self) -> None:
-        """把 Windows 的 WM_CLIPBOARDUPDATE / WM_HOTKEY 接进来。"""
+        """把 Windows 的 WM_CLIPBOARDUPDATE / WM_HOTKEY 接进来。
+
+        这一段此前是「接了一半」：Qt 侧的事件过滤器装好了，
+        但 `AddClipboardFormatListener` 从未被调用 —— 没有注册监听，
+        Windows 根本不会投递 `WM_CLIPBOARDUPDATE`。事件驱动通道全程静默，
+        实际一直在跑 300ms 轮询；`monitor.set_event_driven(True)` 也没人调，
+        那个开关成了死代码，末尾那行 `require_event_driven = True`
+        更是个从未被读过的字段。
+
+        修正后的顺序：拿窗口句柄 → 注册监听 → 注册成功才切事件驱动。
+        注册失败就保持轮询，绝不假装自己在事件驱动。
+        """
         if not sys.platform.startswith("win"):
             return
 
+        from ..platform.windows import WM_CLIPBOARDUPDATE, WindowsBackend
+
         controller = self
 
-        class _Filter(QObject):
-            def eventFilter(self, obj, event):  # noqa: N802 - Qt 命名
+        class _Filter(QAbstractNativeEventFilter):
+            """`installNativeEventFilter` 要求的是 `QAbstractNativeEventFilter`。
+
+            不能拿 `QObject` 凑 —— PySide6 会在装的时候直接抛 TypeError。
+            这个分支只在 Windows 上会走到，Linux CI 永远跑不到，
+            等于藏了一个「一启动就崩」的隐患。
+            """
+
+            def nativeEventFilter(self, event_type, message):  # noqa: N802 - Qt 命名
                 try:
                     from ctypes import wintypes
 
-                    # nativeEvent 是 MSG* 指针，WM_CLIPBOARDUPDATE / WM_HOTKEY 都靠它识别
-                    msg = wintypes.MSG.from_address(int(event.nativeEvent))
+                    # message 在这里是 MSG*，需要按指针还原成 MSG 结构体
+                    address = int(message)
+                    if not address:
+                        return False, 0
+                    msg = wintypes.MSG.from_address(address)
                 except Exception:  # noqa: BLE001
-                    return False
-                if controller.hotkeys.handle_native_event(event.type(), msg):
-                    return True
-                if msg.message == 0x031D:  # WM_CLIPBOARDUPDATE
+                    return False, 0
+
+                if controller.hotkeys.handle_native_event(event_type, msg):
+                    return True, 0
+                if int(msg.message) == WM_CLIPBOARDUPDATE:
                     controller.monitor.on_native_event()
-                    return True
-                return False
+                    return True, 0
+                return False, 0
 
         self._native_filter = _Filter()
         self.qt_app.installNativeEventFilter(self._native_filter)
 
-        from ..platform.windows import WindowsBackend
+        if not isinstance(self.backend, WindowsBackend):
+            return
 
-        if isinstance(self.backend, WindowsBackend):
-            self.backend.require_event_driven = True
+        hwnd = self._native_window_handle()
+        if not hwnd:
+            _log.warning("未取到窗口句柄，剪贴板监听退回轮询")
+            return
+
+        if self.backend.register_listener(hwnd):
+            # 事件到达时 `on_native_event` 会立刻采一次，
+            # 把轮询放宽到 1s 作为「事件漏投」的兜底，而不是唯一手段。
+            self.monitor.set_event_driven(True)
+            self.monitor.set_interval(EVENT_DRIVEN_FALLBACK_MS)
+            _log.info("已启用 Windows 剪贴板原生事件监听（窗口句柄 %s）", hwnd)
+        else:
+            _log.warning("AddClipboardFormatListener 注册失败，继续使用轮询")
+
+    def _native_window_handle(self) -> int:
+        """取一个稳定的窗口句柄给 `AddClipboardFormatListener` 用。
+
+        用主窗口的 `winId()`：Qt 里它是懒创建的，`winId()` 会顺带触发创建，
+        即使窗口随后被隐藏。不依赖托盘图标那类看不见的内部实现。
+        """
+        try:
+            handle = int(self.window.winId())
+            if handle:
+                return handle
+        except Exception:  # noqa: BLE001
+            _log.debug("取 winId 失败", exc_info=True)
+        return 0
 
     def _setup_timers(self) -> None:
         self._sync_timer = QTimer(self)
@@ -345,6 +402,21 @@ class Application(QObject):
         self._sweep_timer = QTimer(self)
         self._sweep_timer.setInterval(SENSITIVE_SWEEP_MS)
         self._sweep_timer.timeout.connect(self._sweep_sensitive)
+
+    def native_report(self):
+        """原生能力自检结果（缓存）。
+
+        跑一次会真实注册并撤销一个全局快捷键，不该在界面操作里反复触发，
+        所以首次算完就留着；`--selfcheck` 命令行路径不受此缓存影响。
+        """
+        if self._native_report is None:
+            try:
+                self._native_report = run_self_check(
+                    backend=self.backend, hotkeys_factory=lambda: self.hotkeys
+                )
+            except Exception:  # noqa: BLE001 - 自检失败不能挡住设置页
+                _log.exception("原生能力自检失败")
+        return self._native_report
 
     def _install_hotkeys(self) -> None:
         sequence = str(self.config.get("ui.global_hotkey", "Ctrl+Shift+V") or "Ctrl+Shift+V")
@@ -396,6 +468,7 @@ class Application(QObject):
         _log.info("正在退出…")
         self._invoker.cancel()
         self.monitor.stop()
+        self._unregister_native_listener()
         self.hotkeys.unregister_all()
         self._sync_timer.stop()
         self._sweep_timer.stop()
@@ -403,6 +476,20 @@ class Application(QObject):
         self.storage.close()
         self.tray.hide()
         self.qt_app.quit()
+
+    def _unregister_native_listener(self) -> None:
+        """注销 Windows 剪贴板监听。
+
+        不注销的话，`AddClipboardFormatListener` 的残留注册会拖住进程，
+        表现是「关不掉，只能强杀」。
+        """
+        from ..platform.windows import WindowsBackend
+
+        if isinstance(self.backend, WindowsBackend):
+            try:
+                self.backend.unregister_listener()
+            except Exception:  # noqa: BLE001
+                _log.debug("注销剪贴板监听失败", exc_info=True)
 
     # ---- 采集管线 ----
 
@@ -577,6 +664,7 @@ class Application(QObject):
             self.automation,
             self.sync.status() if self.sync else {},
             self.window,
+            native_report=self.native_report(),
         )
         if dialog.exec() != SettingsDialog.DialogCode.Accepted:
             return

@@ -108,8 +108,19 @@ class ClipboardMonitor:
         self._interval = max(60, int(interval_ms)) / 1000.0
 
     def set_event_driven(self, enabled: bool) -> None:
-        """Windows 原生监听生效后置为 True，跳过轮询比对。"""
+        """Windows 原生监听生效后置为 True。
+
+        事件驱动下不需要靠密集轮询发现变化，但**不能完全停掉轮询**：
+        `AddClipboardFormatListener` 在会话切换、剪贴板持有者崩溃等情况下
+        可能漏投通知。所以这里只把间隔放宽（由调用方通过 `set_interval` 设定），
+        保留一条低频兜底路径。
+        """
         self._event_driven = enabled
+        _log.info("剪贴板监听切换为%s", "事件驱动（含低频兜底）" if enabled else "轮询")
+
+    @property
+    def is_event_driven(self) -> bool:
+        return self._event_driven
 
     # ---- 事件入口 ----
 

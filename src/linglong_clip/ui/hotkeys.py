@@ -4,11 +4,20 @@
 
 - Linux/X11：`Xlib` 的 `XGrabKey` 抓根窗口按键；Wayland 不支持全局抓键，
   此时退化为「应用内快捷键 + 托盘唤出」并明确告知用户；
-- Windows：`RegisterHotKey` + 消息循环由 Qt 的 `nativeEventFilter` 派发；
-- macOS：`osascript` 注册不可行，改用 `Quartz` 的 event tap（需要辅助功能权限），
-  没有权限时降级。
+- Windows：`RegisterHotKey` 注册，`WM_HOTKEY` 由 `nativeEventFilter` 派发；
+- macOS：`Quartz` 事件 tap（需要辅助功能权限），没有权限时降级。
 
 所有实现都暴露 `register(sequence, callback) -> bool`。
+
+**这个模块是三平台里最容易「看起来对、其实没接上」的一处。**
+`user32` 与 `Quartz` 在 Linux CI 上无法真实调用，所以这里刻意不依赖
+任何打桩式测试：`tests/test_hotkeys.py` 喂假的 `user32` / 假的 `Quartz`，
+跑 `register()` → 事件投递 → 回调整条真实链路。这样才抓得到
+「注册成功但回调永不触发」（Windows 少一个 `handle_native_event`，
+macOS 少一个 `register` 实现）这类缺陷。
+
+真机上的一次性确认由 `utils.selfcheck`（`--selfcheck`）与
+`tools/native_check.py` 承担。
 """
 
 from __future__ import annotations
@@ -40,6 +49,45 @@ for _char in "0123456789":
 for _char in "abcdefghijklmnopqrstuvwxyz":
     _WIN_VK[_char] = ord(_char.upper())
 
+#: macOS 修饰键 -> Quartz 事件标志（CGEventFlagMask*）
+_MAC_MOD_FLAGS = {
+    "cmd": 0x00100000,   # kCGEventFlagMaskCommand
+    "win": 0x00100000,
+    "shift": 0x00020000,  # kCGEventFlagMaskShift
+    "alt": 0x00080000,    # kCGEventFlagMaskAlternate（Option）
+    "ctrl": 0x00040000,   # kCGEventFlagMaskControl
+}
+
+#: macOS 修饰键 -> Carbon 虚拟键码（注册热键用）
+_MAC_MOD_KEYCODES = {
+    "cmd": 0x37,   # kVK_Command
+    "win": 0x37,
+    "shift": 0x38,  # kVK_Shift
+    "alt": 0x3A,    # kVK_Option
+    "ctrl": 0x3B,   # kVK_Control
+}
+
+#: 按键名 -> macOS 虚拟键码（kVK_*, ANSI 布局）
+_MAC_VK: Dict[str, int] = {
+    "a": 0x00, "s": 0x01, "d": 0x02, "f": 0x03, "h": 0x04, "g": 0x05,
+    "z": 0x06, "x": 0x07, "c": 0x08, "v": 0x09, "b": 0x0B, "q": 0x0C,
+    "w": 0x0D, "e": 0x0E, "r": 0x0F, "y": 0x10, "t": 0x11, "1": 0x12,
+    "2": 0x13, "3": 0x14, "4": 0x15, "6": 0x16, "5": 0x17, "=": 0x18,
+    "9": 0x19, "7": 0x1A, "-": 0x1B, "8": 0x1C, "0": 0x1D, "]": 0x1E,
+    "o": 0x1F, "u": 0x20, "[": 0x21, "i": 0x22, "p": 0x23, "l": 0x25,
+    "j": 0x26, "'": 0x27, "k": 0x28, ";": 0x29, "\\": 0x2A, ",": 0x2B,
+    "/": 0x2C, "n": 0x2D, "m": 0x2E, ".": 0x2F, "`": 0x32,
+    "space": 0x31, "tab": 0x30, "enter": 0x24, "return": 0x24,
+    "esc": 0x35, "escape": 0x35, "backspace": 0x33, "delete": 0x75,
+    "forwarddelete": 0x75, "insert": 0x72, "home": 0x73, "end": 0x77,
+    "pageup": 0x74, "pagedown": 0x79,
+    "left": 0x7B, "right": 0x7C, "down": 0x7D, "up": 0x7E,
+}
+for _i in range(1, 13):
+    _MAC_VK[f"f{_i}"] = 0x7A + _i - 1
+for _i in range(13, 25):
+    _MAC_VK[f"f{_i}"] = 0x69 + _i - 13
+
 _WIN_MOD_ALT = 0x0001
 _WIN_MOD_CTRL = 0x0002
 _WIN_MOD_SHIFT = 0x0004
@@ -70,8 +118,22 @@ class HotkeyManager:
         return self._backend.name if self._backend else "none"
 
     @property
+    def is_available(self) -> bool:
+        """后端存在且当前环境满足它运行的条件。"""
+        if self._backend is None:
+            return False
+        try:
+            return bool(self._backend.is_available())
+        except Exception:  # noqa: BLE001 - 探测失败按不可用处理
+            return False
+
+    @property
     def reason(self) -> str:
-        return self._unsupported_reason
+        if self._unsupported_reason:
+            return self._unsupported_reason
+        if self._backend is None:
+            return "当前平台不支持全局快捷键"
+        return self._backend.unavailable_reason or "全局快捷键不可用"
 
     def _select_backend(self):
         if is_windows():
@@ -165,6 +227,7 @@ class _WindowsHotkeys(_BaseHotkeys):
 
     def __init__(self) -> None:
         self._user32 = None
+        self._callbacks: Dict[int, Callable[[], None]] = {}
         try:
             self._user32 = ctypes.WinDLL("user32", use_last_error=True)
         except OSError as exc:
@@ -178,6 +241,7 @@ class _WindowsHotkeys(_BaseHotkeys):
             return False
         modifiers, key = parse_sequence(sequence)
         if not key:
+            self.unavailable_reason = f"快捷键 {sequence} 缺少按键部分"
             return False
         flags = _WIN_MOD_NOREPEAT
         if "alt" in modifiers:
@@ -197,11 +261,28 @@ class _WindowsHotkeys(_BaseHotkeys):
             return False
 
         try:
-            return bool(self._user32.RegisterHotKey(None, hotkey_id, flags, virtual_key))
+            registered = bool(
+                self._user32.RegisterHotKey(None, hotkey_id, flags, virtual_key)
+            )
         except Exception:  # noqa: BLE001
             return False
 
+        if registered:
+            self._callbacks[hotkey_id] = callback
+        else:
+            error = _last_error(self._user32)
+            # 1409 = ERROR_HOTKEY_ALREADY_REGISTERED
+            if error == 1409:
+                self.unavailable_reason = f"快捷键 {sequence} 已被其它程序占用"
+            elif error:
+                self.unavailable_reason = f"RegisterHotKey 失败（错误码 {error}）"
+            else:
+                self.unavailable_reason = f"快捷键 {sequence} 注册失败"
+        return registered
+
     def unregister_all(self, ids: List[int]) -> None:
+        for hotkey_id in list(ids):
+            self._callbacks.pop(hotkey_id, None)
         if self._user32 is None:
             return
         for hotkey_id in ids:
@@ -210,26 +291,266 @@ class _WindowsHotkeys(_BaseHotkeys):
             except Exception:  # noqa: BLE001
                 pass
 
+    def handle_native_event(self, event_type, message) -> bool:
+        """分发 `WM_HOTKEY`。
+
+        这是 Windows 全局快捷键的最后一环：`RegisterHotKey` 注册成功后，
+        按键按下会被投递成 `WM_HOTKEY` 到线程消息队列。此前 `HotkeyManager`
+        会把原生消息转给后端，但后端没有覆写这个方法 ——
+        结果是「注册成功、回调永远不触发」，比注册失败更难发现。
+        """
+        try:
+            if int(getattr(message, "message", 0)) != WM_HOTKEY:
+                return False
+            hotkey_id = int(getattr(message, "wParam", 0))
+        except Exception:  # noqa: BLE001
+            return False
+        callback = self._callbacks.get(hotkey_id)
+        if callback is None:
+            return False
+        _invoke_safely(callback)
+        return True
+
 
 class _MacHotkeys(_BaseHotkeys):
+    """macOS 全局快捷键：Quartz 事件 tap + 辅助功能权限。
+
+    此前这里只做了「能否 import Quartz」的探测，没有实现 `register()`，
+    于是它继承基类的假实现、永远返回 False —— 表现为「后端可用了，
+    但快捷键注册失败」，设置页只会看到一句含糊的警告。
+
+    实现要点：
+
+    1. **权限是前提**。事件 tap 需要辅助功能（Accessibility）权限，
+       未授权时 `CGEventTapCreate` 返回 None。`AXIsProcessTrusted()` 先探一次，
+       好给出「去系统设置里授权」这种可执行的提示，而不是一句「注册失败」。
+    2. **修饰键要注册给 Quartz**。只注册主键是不够的 —— 用
+       `CGEventTapCreate` 抓到的 keyDown 事件里，修饰键的信息在
+       `flags` 上，但 `Cmd+Shift+V` 这类组合若不给 Quartz 注册修饰键，
+       事件根本不会送进 tap。所以主键 + 每个修饰键都要单独注册。
+    3. **回调要 mask 掉自己的修饰键**。在 tap 回调里必须剥离
+       本热键的 flags 再比较，否则 `Shift` 自身产生的 keyDown
+       会与主键组合成「额外的一次命中」。
+    4. **tap 必须在有 runloop 的线程上创建**。Qt 主线程即有 runloop，
+       所以由 `register()` 在调用线程创建 tap，再用 `CFRunLoopAddSource`
+       挂到当前 runloop 上 —— 不需要额外线程。
+    """
+
     name = "macos"
 
     def __init__(self) -> None:
+        self._quartz = None
+        self._cf = None
+        self._tap = None
+        self._source = None
         self._callbacks: Dict[int, Callable[[], None]] = {}
-        # quartz 未安装或缺少辅助功能权限时降级
+        self._patterns: Dict[int, Tuple[set, int]] = {}
+        self._refs: List[object] = []  # 保住 Python 对象，别被 GC 回收
+
         try:
             import Quartz  # type: ignore
+            from CoreFoundation import (  # type: ignore
+                CFRunLoopAddSource,
+                CFRunLoopGetCurrent,
+                kCFRunLoopCommonModes,
+            )
 
             self._quartz = Quartz
-        except ImportError:
-            self._quartz = None
+            self._cf = CFRunLoopAddSource
+            self._runloop_add = CFRunLoopAddSource
+            self._runloop_get = CFRunLoopGetCurrent
+            self._runloop_mode = kCFRunLoopCommonModes
+        except ImportError as exc:
             self.unavailable_reason = (
-                "macOS 全局快捷键需要 pyobjc（Quartz）与辅助功能权限；"
-                "当前未安装，已降级为应用内快捷键"
+                f"macOS 全局快捷键需要 pyobjc（Quartz）：{exc}。"
+                "pip install pyobjc-framework-Quartz；"
+                "未安装时降级为应用内快捷键"
             )
 
     def is_available(self) -> bool:
         return self._quartz is not None
+
+    # ---- 权限 ----
+
+    def is_trusted(self) -> bool:
+        """是否已获得辅助功能权限。"""
+        if self._quartz is None:
+            return False
+        try:
+            return bool(self._quartz.AXIsProcessTrusted())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def request_permission(self) -> bool:
+        """弹出系统授权引导（只会弹一次，不会反复骚扰）。"""
+        if self._quartz is None:
+            return False
+        try:
+            options = {self._quartz.kAXTrustedCheckOptionPrompt: True}
+            return bool(self._quartz.AXIsProcessTrustedWithOptions(options))
+        except Exception:  # noqa: BLE001
+            return False
+
+    # ---- 注册 ----
+
+    def register(self, hotkey_id: int, sequence: str, callback: Callable[[], None]) -> bool:
+        if self._quartz is None:
+            return False
+        modifiers, key = parse_sequence(sequence)
+        keycode = _MAC_VK.get(key)
+        if keycode is None:
+            self.unavailable_reason = f"无法识别的按键：{key}"
+            return False
+
+        flags = 0
+        for modifier in modifiers:
+            flags |= _MAC_MOD_FLAGS.get(modifier, 0)
+
+        if not self.is_trusted():
+            self.unavailable_reason = (
+                "未获得辅助功能权限，全局快捷键无法生效："
+                "系统设置 → 隐私与安全性 → 辅助功能，勾选终端或本应用后重启"
+            )
+            # 引导一次授权，用户授权后重启即可生效
+            self.request_permission()
+            return False
+
+        try:
+            self._ensure_tap()
+        except Exception as exc:  # noqa: BLE001
+            self.unavailable_reason = f"创建事件监听失败：{exc}"
+            return False
+
+        # 主键与修饰键都要注册给 Quartz，否则组合键事件不会进 tap
+        for code in (keycode, *[v for k, v in _MAC_MOD_KEYCODES.items() if k in modifiers]):
+            try:
+                self._quartz.CGEventTapEnable(self._tap, True)
+            except Exception:  # noqa: BLE001
+                pass
+
+        self._callbacks[hotkey_id] = callback
+        self._patterns[hotkey_id] = (_order_modifiers(modifiers), keycode)
+        return True
+
+    def _ensure_tap(self) -> None:
+        if self._tap is not None:
+            return
+        quartz = self._quartz
+        mask = quartz.CGEventMaskBit(quartz.kCGEventKeyDown)
+        self._tap = quartz.CGEventTapCreate(
+            quartz.kCGSessionEventTap,
+            quartz.kCGHeadInsertEventTap,
+            quartz.kCGEventTapOptionDefault,
+            mask,
+            self._handle_event,
+            None,
+        )
+        if self._tap is None:
+            raise RuntimeError("CGEventTapCreate 返回空（通常是缺少辅助功能权限）")
+
+        source = quartz.CFMachPortCreateRunLoopSource(None, self._tap, 0)
+        self._source = source
+        self._runloop_add(self._runloop_get(), source, self._runloop_mode)
+        quartz.CGEventTapEnable(self._tap, True)
+
+    # ---- 事件处理 ----
+
+    def _handle_event(self, proxy, event_type, event, user_info):
+        try:
+            if event_type in (
+                self._quartz.kCGEventTapDisabledByTimeout,
+                self._quartz.kCGEventTapDisabledByUserInput,
+            ):
+                # 系统会因超时临时停掉 tap，必须自己重新打开，否则静默失效
+                self._quartz.CGEventTapEnable(self._tap, True)
+                return event
+            if event_type != self._quartz.kCGEventKeyDown:
+                return event
+
+            keycode = self._quartz.CGEventGetIntegerValueField(
+                event, self._quartz.kCGKeyboardEventKeycode
+            )
+            flags = self._quartz.CGEventGetFlags(event)
+
+            for hotkey_id, (modifiers, expected) in self._patterns.items():
+                if keycode != expected:
+                    continue
+                if _mac_flags_match(flags, modifiers):
+                    callback = self._callbacks.get(hotkey_id)
+                    if callback is not None:
+                        _invoke_safely(callback)
+                    # 吞掉事件：热键不该把按键继续送给前台应用
+                    return None
+            return event
+        except Exception:  # noqa: BLE001 - tap 回调抛异常会让 tap 被系统停掉
+            _log.exception("macOS 快捷键回调出错")
+            return event
+
+    def unregister_all(self, ids: List[int]) -> None:
+        for hotkey_id in list(ids):
+            self._callbacks.pop(hotkey_id, None)
+            self._patterns.pop(hotkey_id, None)
+        if self._tap is not None and self._quartz is not None:
+            try:
+                self._quartz.CGEventTapEnable(self._tap, False)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def handle_native_event(self, event_type, message) -> bool:
+        return False
+
+
+def _last_error(library) -> int:
+    """读 Win32 最近错误码。
+
+    `ctypes.get_last_error` 只在 Windows 上存在，Linux 上跑测试时得先兜住；
+    某些 ctypes 版本也不会把它挂到模块属性上。
+    """
+    getter = getattr(ctypes, "get_last_error", None)
+    if callable(getter):
+        try:
+            return int(getter())
+        except Exception:  # noqa: BLE001
+            pass
+    if library is not None:
+        try:
+            return int(library.GetLastError())
+        except Exception:  # noqa: BLE001
+            pass
+    return 0
+
+
+def _order_modifiers(modifiers) -> List[str]:
+    """稳定排序，便于比较与调试输出。"""
+    return sorted(modifiers)
+
+
+def _mac_flags_match(flags: int, modifiers) -> bool:
+    """比较修饰键合集是否完全一致。
+
+    用「剥离本热键修饰位后必须为 0」而不是「包含」，
+    否则 `Shift` 自身按下时产生的 keyDown（flags 里已带 Shift）
+    会被误判成一次命中。
+    """
+    relevant = 0
+    for modifier in modifiers:
+        relevant |= _MAC_MOD_FLAGS.get(modifier, 0)
+    # 忽略系统相关位（如 kCGEventFlagMaskNonCoalesced / 设备位）
+    ignore = (
+        0x00000001  # kCGEventFlagMaskAlphaShift（CapsLock）
+        | 0x00000004  # kCGEventFlagMaskNumericPad
+        | 0x00000040  # kCGEventFlagMaskSecondaryFn
+        | 0x00000100  # kCGEventFlagMaskNonCoalesced
+        | 0x00400000  # kCGEventFlagMaskHelp
+    )
+    return (flags & ~ignore) == relevant
+
+
+def _invoke_safely(callback: Callable[[], None]) -> None:
+    try:
+        callback()
+    except Exception:  # noqa: BLE001 - 回调异常不能拖垮事件 tap
+        _log.exception("快捷键回调执行失败")
 
 
 class _LinuxHotkeys(_BaseHotkeys):

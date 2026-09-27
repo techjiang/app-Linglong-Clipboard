@@ -305,7 +305,7 @@ def test_parser_has_all_modes():
     parser = build_parser()
     options = {action.dest for action in parser._actions}
     for expected in ("quick", "minimized", "list", "search", "get", "stats", "clear",
-                     "compact", "json", "plain", "sync_status"):
+                     "compact", "json", "plain", "sync_status", "selfcheck"):
         assert expected in options
 
 
@@ -483,3 +483,92 @@ def test_recanonicalize_then_merge_legacy(cli_env, capsys):
     assert main(["--list"]) == 0
     listing = capsys.readouterr().out
     assert "x2" in listing
+
+
+# ---- 原生能力自检 ----
+
+
+def _fake_report(failures=0, degraded=0):
+    """构造一份指定状态的假自检报告。"""
+    from linglong_clip.utils.selfcheck import (
+        DEGRADED,
+        FAIL,
+        OK,
+        CheckResult,
+        SelfCheckReport,
+    )
+
+    report = SelfCheckReport(platform_label="TestOS", python_version="3.x", backend="fake")
+    report.results.append(CheckResult("后端", OK, "fake"))
+    for index in range(degraded):
+        report.results.append(CheckResult(f"降级项{index}", DEGRADED, "原因", "提示"))
+    for index in range(failures):
+        report.results.append(CheckResult(f"失败项{index}", FAIL, "原因", "提示"))
+    report.notes = ["结论说明"]
+    return report
+
+
+def test_selfcheck_prints_report(cli_env, capsys, monkeypatch):
+    from linglong_clip.utils import selfcheck as sc_module
+
+    monkeypatch.setattr(sc_module, "run_self_check", lambda **kw: _fake_report())
+    assert main(["--selfcheck"]) == 0
+    out = capsys.readouterr().out
+    assert "原生能力自检" in out
+    assert "结论：" in out
+
+
+def test_selfcheck_json_output(cli_env, capsys, monkeypatch):
+    from linglong_clip.utils import selfcheck as sc_module
+
+    monkeypatch.setattr(sc_module, "run_self_check", lambda **kw: _fake_report())
+    assert main(["--selfcheck", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["backend"] == "fake"
+    assert payload["healthy"] is True
+
+
+def test_selfcheck_exit_code_1_when_degraded(cli_env, monkeypatch):
+    """降级给退出码 1，脚本能区分「能用但不完善」与「真的坏了」。"""
+    from linglong_clip.utils import selfcheck as sc_module
+
+    monkeypatch.setattr(
+        sc_module, "run_self_check", lambda **kw: _fake_report(degraded=1)
+    )
+    assert main(["--selfcheck"]) == 1
+
+
+def test_selfcheck_exit_code_2_when_failed(cli_env, monkeypatch):
+    from linglong_clip.utils import selfcheck as sc_module
+
+    monkeypatch.setattr(sc_module, "run_self_check", lambda **kw: _fake_report(failures=1))
+    assert main(["--selfcheck"]) == 2
+
+
+def test_selfcheck_does_not_need_database(cli_env, monkeypatch, capsys):
+    """自检不该被历史文件问题挡住 —— 最需要它的时候恰好用不了最糟。"""
+    from linglong_clip.core.storage import Storage
+    from linglong_clip.utils import selfcheck as sc_module
+
+    # 放一个损坏的历史文件
+    (cli_env / "history.db").write_bytes(b"this is not a sqlite database at all")
+    monkeypatch.setattr(sc_module, "run_self_check", lambda **kw: _fake_report())
+
+    assert main(["--selfcheck"]) == 0
+    assert "原生能力自检" in capsys.readouterr().out
+    # 没被打开过，所以也不会被改坏
+    Storage  # 保持导入，确保模块路径没错
+
+
+def test_selfcheck_skips_gui_dispatch(cli_env, monkeypatch):
+    """必须命中 CLI 分支，不能落到 GUI 分支把进程挂住。"""
+    from linglong_clip.ui import application as app_module
+
+    def boom(*args, **kwargs):
+        raise AssertionError("不该启动 GUI")
+
+    monkeypatch.setattr(app_module, "Application", boom)
+    from linglong_clip.utils import selfcheck as sc_module
+
+    monkeypatch.setattr(sc_module, "run_self_check", lambda **kw: _fake_report())
+    assert main(["--selfcheck"]) == 0
