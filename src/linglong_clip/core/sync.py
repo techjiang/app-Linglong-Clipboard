@@ -24,6 +24,7 @@ from ..utils.logger import get_logger
 from .models import ClipboardItem
 from .privacy import PrivacyGuard
 from .storage import Storage
+from .sync_cursor import SyncCursorStore
 
 _log = get_logger("sync")
 
@@ -143,12 +144,14 @@ class FolderSync:
         device_name: str = "device",
         cipher: Optional[SyncCipher] = None,
         guard: Optional[PrivacyGuard] = None,
+        cursors: Optional[SyncCursorStore] = None,
     ) -> None:
         self._storage = storage
         self.folder = Path(folder)
         self.device_name = device_name or socket.gethostname()
         self._cipher = cipher or SyncCipher(False)
         self._guard = guard
+        self.cursors = cursors if cursors is not None else SyncCursorStore()
         self._lock = threading.RLock()
 
     @property
@@ -222,31 +225,54 @@ class FolderSync:
 
     # ---- 导入 ----
 
+    def cursor_key(self, path: Path) -> str:
+        """每个对端日志文件对应一个游标键（文件名即对端设备标识）。"""
+        return SyncCursorStore.key_for("folder", path.name)
+
     def import_all(self) -> int:
-        """读取所有设备的日志，把本地没有的记录补进来。"""
+        """读取所有设备的日志，把本地没有的记录补进来。
+
+        每份对端日志各自维护增量游标：只解析晚于游标的记录。
+        游标未推进到位（例如首次同步）时退化为全量扫描，行为与旧版一致。
+        """
         if not self.is_ready():
             return 0
         imported = 0
         seen_local = {item.hash for item in self._storage.list(limit=MAX_SYNC_ENTRIES)}
         for path in sorted(self.folder.glob("*.llsync")):
-            if path.name == self.journal_path.name:
-                # 自己的日志也读，用于补齐「另一台机器先导入过」的场景
-                pass
-            for record in self._read_journal(path):
-                if record.hash in seen_local:
-                    continue
-                if record.device == self.device_name:
-                    continue
-                item = record.to_item()
-                if self._guard is not None:
-                    verdict = self._guard.inspect(item)
-                    if not verdict.allowed or (verdict.sensitive and not self._allow_sensitive()):
-                        continue
-                self._storage.add(item)
-                seen_local.add(record.hash)
-                imported += 1
+            # 自己的日志也读，用于补齐「另一台机器先导入过」的场景
+            imported += self._import_journal(path, seen_local)
         if imported:
             _log.info("从同步目录导入 %d 条记录", imported)
+        return imported
+
+    def _import_journal(self, path: Path, seen_local: set) -> int:
+        """导入单份对端日志，并推进其游标。返回导入条数。"""
+        key = self.cursor_key(path)
+        since = self.cursors.since_for(key)
+        imported = 0
+        newest = since
+        for record in self._read_journal(path):
+            created = float(getattr(record, "created_at", 0.0) or 0.0)
+            # 游标之后的新内容才值得检查；更旧的记录上轮已处理过
+            if created <= since:
+                continue
+            newest = max(newest, created)
+            if record.hash in seen_local:
+                continue
+            if record.device == self.device_name:
+                continue
+            item = record.to_item()
+            if self._guard is not None:
+                verdict = self._guard.inspect(item)
+                if not verdict.allowed or (verdict.sensitive and not self._allow_sensitive()):
+                    continue
+            self._storage.add(item)
+            seen_local.add(record.hash)
+            imported += 1
+        # 只有在完整读完后才推进游标：解析中途出错不该跳过剩余记录
+        if newest > since:
+            self.cursors.advance(key, newest)
         return imported
 
     def _read_journal(self, path: Path) -> Iterable[SyncRecord]:
@@ -307,10 +333,24 @@ class FolderSync:
 
     def status(self) -> Dict[str, object]:
         files = sorted(self.folder.glob("*.llsync")) if self.folder.exists() else []
+        cursors = self.cursors.snapshot()
+        devices = []
+        for path in files:
+            key = self.cursor_key(path)
+            devices.append(
+                {
+                    "device": path.stem,
+                    "journal": path.name,
+                    "since": cursors.get(key, 0.0),
+                    "synced": cursors.get(key, 0.0) > 0,
+                }
+            )
         return {
             "folder": str(self.folder),
             "ready": self.is_ready(),
             "devices": [path.stem for path in files],
+            "device_details": devices,
             "encrypted": self._cipher.enabled,
             "device": self.device_name,
+            "cursor_file": str(self.cursors.path),
         }

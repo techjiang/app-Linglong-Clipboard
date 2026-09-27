@@ -200,6 +200,32 @@ Windows 上走 `AddClipboardFormatListener` 事件驱动，避免轮询空转；
 开启「自动发现」后会用 UDP 广播互相通告，但部分 Wi-Fi 会拦截组播，
 所以默认关闭。加密仍复用 Fernet，两端口令一致才能解密。
 
+#### 增量同步：只拉新的，不重扫全部
+
+剪贴板历史天然会涨到上万条。如果每轮同步都从头拉一遍、靠内容指纹去重，
+那么「只是加了一条记录」的同步也要把全部历史重新序列化、加密、走一遍网络——
+记录越多，这步无效功越大。
+
+所以每个同步来源都有自己的**增量游标**，记住「已经拉到哪个时间点」，
+下一轮只请求晚于它的记录：
+
+- **按来源分别记**。共享文件夹下每个对端日志文件一个游标，局域网下每个
+  `host:port` 一个游标。多个对端各自推进，互不拖累。
+- **推进是单向的**。只增不减，避免某个对端返回旧时间戳把进度拉回去。
+- **失败不推进**。对端不可达或口令错误时保留旧游标，下轮重试这一段；
+  否则对端短暂离线就会永久跳过那段时间的记录。
+- **边界留安全窗口**。同一时刻写入的多条记录共享时间戳，游标会回退 1 秒再请求，
+  用少量重复换取不漏（重复本就会被指纹去重过滤掉）。
+
+游标存在数据目录下的 `sync_cursors.json`，是几十字节的可读文本，
+删掉它最坏的结果只是下一轮全量重扫，与升级前行为一致：
+
+```bash
+linglong-clipboard --sync-cursor          # 看每个来源同步到哪个时间点
+linglong-clipboard --sync-cursor-reset    # 清空游标，下次回到全量重扫
+linglong-clipboard --sync-status          # 同步状态里也带游标进度
+```
+
 ---
 
 ## 安装
@@ -288,6 +314,9 @@ linglong-clipboard --storage-status          # 历史存在哪（SQLite 还是 J
 linglong-clipboard --where                   # 只输出数据目录路径
 linglong-clipboard --storage json            # 切换存储方式
 linglong-clipboard --storage-migrate         # 把记录搬到另一种存储（原数据保留）
+linglong-clipboard --sync-status             # 同步模式、对端与游标进度
+linglong-clipboard --sync-cursor             # 各来源同步到哪个时间点
+linglong-clipboard --sync-cursor-reset       # 清空游标，下次全量重扫
 ```
 
 ### 数据存放位置
@@ -309,6 +338,9 @@ linglong-clipboard --storage-migrate         # 把记录搬到另一种存储（
 
 选 JSON 方式时，历史落在数据目录下的 `.clipboard/clipboard.json`；
 选 SQLite 时是数据目录下的 `history.db`。两者可以共存，互不覆盖。
+
+启用同步后，数据目录下还会有一个 `sync_cursors.json`，
+记录每个同步来源的增量位置（可读文本，删掉只是下次全量重扫一遍）。
 
 图片附件存在 `images/` 子目录，数据库只存相对路径，整体搬走目录也不会失联。
 JSON 方式下图片默认**内联进历史文件**（data URI），
@@ -433,7 +465,8 @@ src/linglong_clip/
 │   ├── automation.py        #   33 个转换器 + 规则引擎
 │   ├── ocr.py               #   截图文字识别（tesseract 后端 + 降级）
 │   ├── sync.py              #   共享文件夹同步与加密
-│   └── lan_sync.py          #   局域网直连同步（拉取模型 + 鉴权）
+│   ├── lan_sync.py          #   局域网直连同步（拉取模型 + 鉴权）
+│   └── sync_cursor.py       #   同步增量游标（每来源只拉新记录）
 ├── platform/                # 平台差异收敛在这里
 │   ├── base.py              #   后端接口与能力矩阵
 │   ├── windows.py           #   Win32 ctypes（零第三方依赖）
@@ -475,6 +508,7 @@ src/linglong_clip/
 | **同步走共享文件夹 + 局域网直连** | 用户已有同步盘时用文件夹；没有网盘时同网段直连。两者都不经过第三方服务器，省去账号体系与运维成本，也不引入数据留存方 | 自建中心服务器（运维成本 + 隐私责任）；只做文件夹模式（无网盘的用户用不了） |
 | **OCR 调 tesseract 命令行** | 剪贴板 OCR 是低频后台任务，精度够用即可；直接 `subprocess` 比 `pytesseract` 少一层依赖，更好控制超时与降级 | PaddleOCR/EasyOCR（数百 MB 模型 + 深度学习运行时）；云 OCR（隐私不可接受） |
 | **局域网用标准库 `http.server`** | 同步是几十毫秒级的小请求，标准库够用；少一个依赖就少一份打包体积与供应链风险 | aiohttp/requests（为一个功能引入整套 HTTP 栈） |
+| **同步用时间游标而非自增序号** | 对端的记录量与本地的淘汰策略无关，序号会在对端清理日志后错位；时间戳单调且跨设备语义一致 | 自增序号游标；每轮从 0 重扫靠指纹去重（记录多了纯做无用功） |
 | **局域网用拉取而非推送** | 只需暴露只读接口，自己决定何时拉取；天然免去并发写与对端离线处理 | 推送模型（要处理对端离线队列、写入冲突） |
 
 ---

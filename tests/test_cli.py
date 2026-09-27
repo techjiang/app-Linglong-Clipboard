@@ -146,6 +146,41 @@ def test_sync_status_folder_json(cli_env, capsys):
     main(["--sync-status", "--json"])
     payload = json.loads(capsys.readouterr().out)
     assert payload["mode"] == "folder"
+    # 顺带报出游标文件位置，方便排查"为什么没拉新记录"
+    assert "cursors" in payload
+    assert payload["cursors"]["path"].endswith("sync_cursors.json")
+
+
+def test_sync_cursor_empty(cli_env, capsys):
+    assert main(["--sync-cursor"]) == 0
+    out = capsys.readouterr().out
+    assert "游标文件" in out
+    assert "尚无同步记录" in out
+
+
+def test_sync_cursor_json(cli_env, capsys, home):
+    from linglong_clip.core.sync_cursor import build_cursor_store
+
+    build_cursor_store().set("lan:127.0.0.1:48620", 1700000000.0)
+
+    assert main(["--sync-cursor", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["cursors"][0]["key"] == "lan:127.0.0.1:48620"
+
+
+def test_sync_cursor_reset(cli_env, capsys):
+    from linglong_clip.core.sync_cursor import build_cursor_store
+
+    build_cursor_store().set("lan:a:1", 5.0)
+    assert main(["--sync-cursor-reset"]) == 0
+    assert "已清空 1 条同步游标" in capsys.readouterr().out
+    assert build_cursor_store().snapshot() == {}
+
+
+def test_sync_cursor_reset_without_existing(cli_env, capsys):
+    assert main(["--sync-cursor-reset"]) == 0
+    assert "已清空 0 条同步游标" in capsys.readouterr().out
 
 
 def test_sync_status_lan_mode(cli_env, capsys, config):

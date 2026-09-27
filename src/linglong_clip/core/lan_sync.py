@@ -40,6 +40,7 @@ from .models import ClipboardItem
 from .privacy import PrivacyGuard
 from .storage import Storage
 from .sync import MAX_SYNC_ENTRIES, FolderSync, SyncCipher, SyncRecord
+from .sync_cursor import SyncCursorStore
 
 _log = get_logger("lan_sync")
 
@@ -354,6 +355,7 @@ class LanSyncClient:
         cipher: Optional[SyncCipher] = None,
         guard: Optional[PrivacyGuard] = None,
         timeout: float = DEFAULT_HTTP_TIMEOUT,
+        cursors: Optional[SyncCursorStore] = None,
     ) -> None:
         self._storage = storage
         self.device_name = device_name or socket.gethostname()
@@ -361,6 +363,7 @@ class LanSyncClient:
         self._cipher = cipher or SyncCipher(False)
         self._guard = guard
         self._timeout = timeout
+        self.cursors = cursors if cursors is not None else SyncCursorStore()
 
     def fetch(self, peer: PeerInfo, *, since: float = 0.0, limit: int = DEFAULT_PAGE_SIZE) -> Optional[List[SyncRecord]]:
         """拉取一个对端的记录；不可达或鉴权失败时返回 `None`。"""
@@ -461,12 +464,31 @@ class LanSyncClient:
             imported += 1
         return imported
 
-    def sync_peer(self, peer: PeerInfo, *, since: float = 0.0) -> int:
-        """拉取并导入单个对端，返回导入条数（失败时 0）。"""
-        records = self.fetch(peer, since=since)
+    @staticmethod
+    def cursor_key(peer: PeerInfo) -> str:
+        """每个对端一个游标：`lan:<host>:<port>`。"""
+        return SyncCursorStore.key_for("lan", f"{peer.host}:{peer.port}")
+
+    def sync_peer(self, peer: PeerInfo, *, since: Optional[float] = None) -> int:
+        """拉取并导入单个对端，返回导入条数（失败时 0）。
+
+        `since` 显式传入时按传入值拉取（并同步推进游标），为 `None` 时
+        取自持久化游标——这是「每轮只拉新记录」的关键。
+        """
+        key = self.cursor_key(peer)
+        requested = self.cursors.since_for(key) if since is None else max(0.0, float(since))
+        records = self.fetch(peer, since=requested)
+        if records is None:
+            # 对端不可达或鉴权失败：不推进游标，下轮重试这一段
+            return 0
         if not records:
             return 0
-        return self.import_records(records)
+        imported = self.import_records(records)
+        # 只有成功拿到响应才推进；游标取本批记录的最大时间戳
+        newest = max((float(getattr(r, "created_at", 0.0) or 0.0) for r in records), default=0.0)
+        if newest > 0:
+            self.cursors.advance(key, newest)
+        return imported
 
 
 class DiscoveryService:
@@ -600,6 +622,7 @@ class LanSync:
     auto_discovery: bool = False
     cipher: Optional[SyncCipher] = None
     guard: Optional[PrivacyGuard] = None
+    cursors: Optional[SyncCursorStore] = None
     _server: Optional[LanSyncServer] = field(default=None, init=False)
     _client: Optional[LanSyncClient] = field(default=None, init=False)
     _discovery: Optional[DiscoveryService] = field(default=None, init=False)
@@ -616,12 +639,15 @@ class LanSync:
             cipher=cipher,
             guard=self.guard,
         )
+        cursors = self.cursors if self.cursors is not None else SyncCursorStore()
+        self.cursors = cursors
         self._client = LanSyncClient(
             self.storage,
             device_name=name,
             token=self.token,
             cipher=cipher,
             guard=self.guard,
+            cursors=cursors,
         )
         # 端口为 0 时先不固定，等 start() 拿到系统分配的端口再用于发现广播
         self._cipher = cipher
@@ -680,8 +706,12 @@ class LanSync:
                 found.append(peer)
         return found
 
-    def sync_all(self, *, since: float = 0.0) -> int:
-        """对所有已知对端拉取一轮，返回导入总条数。"""
+    def sync_all(self, *, since: Optional[float] = None) -> int:
+        """对所有已知对端拉取一轮，返回导入总条数。
+
+        `since` 为 `None`（默认）时逐对端使用各自的持久化游标，
+        即每轮只拉取上次同步之后的新记录；显式传入则对所有对端生效。
+        """
         assert self._client is not None
         imported = 0
         for peer in self.discover():
@@ -716,10 +746,16 @@ class LanSync:
             "auth_required": bool(self.token),
             "auto_discovery": self.auto_discovery,
             "peers": [peer.to_json() for peer in self.discover()],
+            "cursor_file": str(self.cursors.path) if self.cursors is not None else "",
         }
 
 
-def build_lan_sync(storage: Storage, config, guard: Optional[PrivacyGuard] = None) -> Optional[LanSync]:
+def build_lan_sync(
+    storage: Storage,
+    config,
+    guard: Optional[PrivacyGuard] = None,
+    cursors: Optional[SyncCursorStore] = None,
+) -> Optional[LanSync]:
     """按配置构造局域网同步；未启用时返回 `None`。"""
     if not config.get("sync.enabled", False):
         return None
@@ -744,4 +780,5 @@ def build_lan_sync(storage: Storage, config, guard: Optional[PrivacyGuard] = Non
         auto_discovery=bool(config.get("sync.lan_discovery", False)),
         cipher=cipher,
         guard=guard,
+        cursors=cursors,
     )

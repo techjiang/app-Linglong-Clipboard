@@ -29,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  linglong-clipboard --get 12         输出第 12 条内容\n"
             "  linglong-clipboard --stats          查看统计与检索能力\n"
             "  linglong-clipboard --sync-status    查看同步模式与对端状态\n"
+            "  linglong-clipboard --sync-cursor    查看各同步来源的增量游标\n"
             "  linglong-clipboard --storage-status 查看历史文件的存放位置\n"
         ),
     )
@@ -60,6 +61,16 @@ def build_parser() -> argparse.ArgumentParser:
     maintenance.add_argument("--import-sync", action="store_true", help="从同步来源导入")
     maintenance.add_argument("--export-sync", action="store_true", help="导出到同步来源")
     maintenance.add_argument("--sync-status", action="store_true", help="查看同步模式与对端状态")
+    maintenance.add_argument(
+        "--sync-cursor",
+        action="store_true",
+        help="查看各同步来源的增量游标（已同步到哪个时间点）",
+    )
+    maintenance.add_argument(
+        "--sync-cursor-reset",
+        action="store_true",
+        help="清空同步增量游标（下次同步回到全量重扫）",
+    )
 
     storage_group = parser.add_argument_group("历史存储")
     storage_group.add_argument(
@@ -319,12 +330,37 @@ def _run_cli(args: argparse.Namespace) -> int:
         storage.close()
         return 0
 
+    if args.sync_cursor or args.sync_cursor_reset:
+        from .core.sync_cursor import build_cursor_store
+
+        cursors = build_cursor_store()
+        if args.sync_cursor_reset:
+            count = len(cursors.snapshot())
+            cursors.reset()
+            print(f"已清空 {count} 条同步游标，下次同步将重新全量扫描")
+            if not args.sync_cursor:
+                storage.close()
+                return 0
+        status = cursors.status()
+        if args.json:
+            print(json.dumps(status, ensure_ascii=False, indent=2))
+        else:
+            print(f"游标文件：{status['path']}")
+            if not status["count"]:
+                print("尚无同步记录（或从未同步过）")
+            for row in status["cursors"]:
+                print(f"  {row['key']:<32} {row['since_text']}")
+        storage.close()
+        return 0
+
     if args.sync_status:
         from .core.lan_sync import build_lan_sync
+        from .core.sync_cursor import build_cursor_store
 
+        cursors = build_cursor_store()
         mode = str(config.get("sync.mode", "folder") or "folder").lower()
         if mode == "lan":
-            node = build_lan_sync(storage, config)
+            node = build_lan_sync(storage, config, cursors=cursors)
             if node is None:
                 print("局域网同步未启用（需要 sync.enabled = true 且 sync.mode = lan）")
                 storage.close()
@@ -344,6 +380,12 @@ def _run_cli(args: argparse.Namespace) -> int:
                         label = f"{peer['host']}:{peer['port']}"
                         if peer.get("device"):
                             label += f" ({peer['device']})"
+                        key = f"lan:{peer['host']}:{peer['port']}"
+                        since = cursors.snapshot().get(key, 0.0)
+                        if since > 0:
+                            import time as _time
+
+                            label += f" · 已同步至 {_time.strftime('%m-%d %H:%M', _time.localtime(since))}"
                         print(f"  {label}")
                 node.stop()
             else:
@@ -356,17 +398,22 @@ def _run_cli(args: argparse.Namespace) -> int:
                 "mode": "folder",
                 "folder": folder,
                 "configured": bool(folder),
+                "cursors": cursors.status(),
             }
             if args.json:
                 print(json.dumps(payload, ensure_ascii=False, indent=2))
             else:
                 print("模式：共享文件夹")
                 print(f"同步目录：{folder or '未配置'}")
+                print(f"游标文件：{cursors.path}")
         storage.close()
         return 0
 
     if args.import_sync or args.export_sync:
         from .core.sync import FolderSync, SyncCipher
+        from .core.sync_cursor import build_cursor_store
+
+        cursors = build_cursor_store()
 
         mode = str(config.get("sync.mode", "folder") or "folder").lower()
         import socket
@@ -376,7 +423,7 @@ def _run_cli(args: argparse.Namespace) -> int:
         if mode == "lan":
             from .core.lan_sync import build_lan_sync
 
-            node = build_lan_sync(storage, config)
+            node = build_lan_sync(storage, config, cursors=cursors)
             if node is None:
                 print("局域网同步未启用（需要 sync.enabled = true 且 sync.mode = lan）", file=sys.stderr)
                 storage.close()
@@ -404,6 +451,7 @@ def _run_cli(args: argparse.Namespace) -> int:
             Path(folder).expanduser(),
             device_name=device,
             cipher=SyncCipher(bool(config.get("sync.encrypt", True)), password=device),
+            cursors=cursors,
         )
         if args.export_sync:
             print(f"已导出 {sync.export(limit=args.limit)} 条记录")
@@ -432,6 +480,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.import_sync,
             args.export_sync,
             args.sync_status,
+            args.sync_cursor,
+            args.sync_cursor_reset,
             args.storage_status,
             args.storage is not None,
             args.storage_migrate,

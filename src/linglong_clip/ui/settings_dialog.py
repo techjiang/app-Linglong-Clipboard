@@ -278,6 +278,22 @@ class SettingsDialog(QDialog):
             info_form.addRow(
                 "加密", QLabel("已启用" if self._device_status.get("encrypted") else "未启用")
             )
+            details = self._device_status.get("device_details") or []
+            if details:
+                synced = [d for d in details if d.get("synced")]
+                info_form.addRow(
+                    "增量进度",
+                    QLabel(
+                        f"{len(synced)}/{len(details)} 个来源已同步过"
+                        if details
+                        else "暂无"
+                    ),
+                )
+            cursor_file = str(self._device_status.get("cursor_file", "") or "")
+            if cursor_file:
+                label = QLabel(cursor_file)
+                label.setToolTip("记录每个同步来源已拉到的时间点；删除它只会导致下次全量重扫")
+                info_form.addRow("游标文件", label)
             layout.addWidget(info)
 
         layout.addStretch(1)

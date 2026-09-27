@@ -27,6 +27,7 @@ from ..core.semantic import SemanticEngine
 from ..core.repository import open_repository
 from ..core.lan_sync import LanSync, build_lan_sync
 from ..core.sync import FolderSync, SyncCipher
+from ..core.sync_cursor import SyncCursorStore
 from ..platform import detect_backend
 from ..utils.config import Config
 from ..utils.logger import get_logger, setup_logging
@@ -134,6 +135,9 @@ class Application(QObject):
         self.automation.load_from_config(self.config.get("automation.workflows", []) or [])
         self.engine = SemanticEngine(self.storage)
         self.ocr = build_ocr_engine(self.config)
+        # 同步增量游标：两种同步模式共用一份，切换模式时进度不丢
+        self.sync_cursors = SyncCursorStore()
+        self.sync_cursors.load()
 
         self.collector = Collector(
             self.storage,
@@ -259,7 +263,9 @@ class Application(QObject):
 
         mode = str(self.config.get("sync.mode", "folder") or "folder").lower()
         if mode == "lan":
-            lan = build_lan_sync(self.storage, self.config, self.guard)
+            lan = build_lan_sync(
+                self.storage, self.config, self.guard, cursors=self.sync_cursors
+            )
             if lan is not None and lan.start():
                 _log.info("局域网同步已就绪：%s", lan.status())
             return lan
@@ -279,6 +285,7 @@ class Application(QObject):
             device_name=self._device_name(),
             cipher=cipher,
             guard=self.guard,
+            cursors=self.sync_cursors,
         )
 
     def _wire_signals(self) -> None:
