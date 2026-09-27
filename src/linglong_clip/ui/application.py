@@ -1,0 +1,544 @@
+"""应用控制器：把存储、采集、同步、界面装配到一起。
+
+职责边界：
+- 控制器持有所有长生命周期对象，界面只发信号，不直接碰存储；
+- 采集回调在后台线程触发，跨线程更新界面一律走 Qt 信号；
+- 任何可选能力（全局快捷键、原生后端、同步）失败都只降级、不抛出。
+"""
+
+from __future__ import annotations
+
+import os
+import signal
+import sys
+import threading
+from typing import Optional
+
+from PySide6.QtCore import QObject, QTimer, Qt, Signal
+from PySide6.QtWidgets import QApplication, QSystemTrayIcon
+
+from ..core.automation import AutomationEngine
+from ..core.collector import CAPTURED, MERGED, Collector
+from ..core.models import ClipboardItem
+from ..core.monitor import ClipboardMonitor, FocusTracker
+from ..core.privacy import PrivacyGuard
+from ..core.semantic import SemanticEngine
+from ..core.storage import Storage
+from ..core.sync import FolderSync, SyncCipher
+from ..platform import detect_backend
+from ..utils.config import Config
+from ..utils.logger import get_logger, setup_logging
+from ..utils.paths import data_dir, is_linux
+from .clipboard_qt import QtClipboardAdapter
+from .hotkeys import HotkeyManager
+from .main_window import MainWindow
+from .quick_paste import QuickPasteOverlay
+from .settings_dialog import SettingsDialog
+from .theme import palette_for
+from .transform_window import TransformWindow
+from .tray import TrayIcon
+
+_log = get_logger("app")
+
+#: 同步与清理的定时周期（毫秒）
+SYNC_INTERVAL_MS = 60_000
+SENSITIVE_SWEEP_MS = 30_000
+
+
+class GuiThreadInvoker(QObject):
+    """把可调用对象投递到 GUI 线程执行，并可同步取回结果。
+
+    存在的原因：`QClipboard` 只能在它所属的线程被安全访问，
+    采集线程直接读会得到空数据。这里用「信号 + 事件循环」把读取搬回主线程，
+    并在调用方等待，因此对采集线程而言仍是同步调用。
+
+    `LINGLONG_CLIPBOARD_HOME` 之外的场景不需要它，
+    但代价只有一次事件投递，换来的正确性值得。
+    """
+
+    _run_requested = Signal(object)
+
+    def __init__(self, owner: QObject) -> None:
+        super().__init__(owner)
+        self._owner = owner
+        self._cancelled = False
+        self._run_requested.connect(self._execute, Qt.ConnectionType.QueuedConnection)
+
+    def cancel(self) -> None:
+        """退出流程中调用：唤醒所有等待者，让采集线程能结束。"""
+        self._cancelled = True
+
+    def call(self, func, blocking: bool = True):
+        from PySide6.QtCore import QThread
+
+        if self._cancelled:
+            return None
+
+        app = QApplication.instance()
+        if app is not None and QThread.currentThread() is app.thread():
+            return func()
+
+        box: dict = {"done": threading.Event()}
+        self._run_requested.emit((func, box))
+        if not blocking:
+            return None
+
+        if not box["done"].wait(timeout=2.0):
+            _log.debug("等待 GUI 线程执行超时")
+            return None
+        if "error" in box:
+            raise box["error"]
+        return box.get("result")
+
+    def _execute(self, payload) -> None:
+        func, box = payload
+        try:
+            box["result"] = func()
+        except Exception as exc:  # noqa: BLE001 - 异常带回调用线程处理
+            box["error"] = exc
+        finally:
+            box["done"].set()
+
+
+class Application(QObject):
+    """应用装配与事件路由。"""
+
+    #: 采集线程 -> 主线程
+    item_captured = Signal(object, str)
+
+    def __init__(self, argv: list, *, start_minimized: bool = False) -> None:
+        super().__init__()
+        self._argv = argv
+        self._start_minimized = start_minimized
+        self._shutting_down = False
+
+        # 复用已存在的实例：Qt 全局只允许一个 QApplication，
+        # 嵌入到宿主进程中时（如 IDE 插件）不能重复创建。
+        self.qt_app = QApplication.instance() or QApplication(argv)
+        self._invoker = GuiThreadInvoker(self)
+        self.qt_app.setApplicationName("玲珑剪切板")
+        self.qt_app.setApplicationDisplayName("玲珑剪切板")
+        self.qt_app.setOrganizationName("Linglong")
+        self.qt_app.setQuitOnLastWindowClosed(False)
+
+        self.config = Config()
+        self._setup_logging()
+
+        self.storage = Storage()
+        self.backend = detect_backend()
+        self.guard = PrivacyGuard(self.config)
+        self.automation = AutomationEngine()
+        self.automation.load_from_config(self.config.get("automation.workflows", []) or [])
+        self.engine = SemanticEngine(self.storage)
+
+        self.collector = Collector(
+            self.storage,
+            self.config,
+            self.guard,
+            device_name=self._device_name(),
+            on_captured=self._on_collected_threadsafe,
+        )
+        self.sync = self._build_sync()
+
+        self.hotkeys = HotkeyManager()
+        self.window = MainWindow(self.storage, self.config, self.engine, self.automation)
+        self.preview = QuickPasteOverlay(self.storage, self.engine, self.config)
+        self.transformer = TransformWindow(self.config, self.automation)
+        self.tray = TrayIcon(palette_for(self.config.get("ui.theme", "system")))
+
+        self.clipboard = QtClipboardAdapter(
+            self.qt_app.clipboard(), data_dir() / "images", self.backend
+        )
+        self.monitor = ClipboardMonitor(
+            self.clipboard,
+            interval_ms=int(self.config.get("capture.poll_interval_ms", 300)),
+            on_capture=self._on_capture_threadsafe,
+            backend=self.backend,
+            gui_invoke=self._invoker.call,
+        )
+        self.focus = FocusTracker(self.backend)
+
+        self._wire_signals()
+        self._setup_native_event_filter()
+        self._setup_timers()
+        self._install_hotkeys()
+
+        self.config.on_change(self._on_config_change)
+
+    # ---- 初始化辅助 ----
+
+    def _setup_logging(self) -> None:
+        import logging
+
+        level = logging.DEBUG if os.environ.get("LINGLONG_DEBUG") else logging.INFO
+        setup_logging(level)
+
+    def _device_name(self) -> str:
+        import socket
+
+        configured = str(self.config.get("sync.device_name", "") or "").strip()
+        return configured or socket.gethostname()
+
+    def _build_sync(self) -> Optional[FolderSync]:
+        folder = str(self.config.get("sync.folder", "") or "").strip()
+        if not folder:
+            return None
+        from pathlib import Path
+
+        cipher = SyncCipher(
+            bool(self.config.get("sync.encrypt", True)),
+            password=self._device_name(),
+        )
+        return FolderSync(
+            self.storage,
+            Path(folder).expanduser(),
+            device_name=self._device_name(),
+            cipher=cipher,
+            guard=self.guard,
+        )
+
+    def _wire_signals(self) -> None:
+        self.item_captured.connect(self._on_captured_ui)
+
+        self.window.copy_requested.connect(self.copy_item)
+        self.window.paste_requested.connect(self.paste_item)
+        self.window.delete_requested.connect(self.delete_item)
+        self.window.transform_ready.connect(self._show_transform)
+        self.preview.item_chosen.connect(self._on_quick_chosen)
+        self.preview.closed.connect(self._on_preview_closed)
+        self.transformer.copy_result.connect(self.copy_text)
+
+        self.tray.show_window_requested.connect(self.show_window)
+        self.tray.quick_paste_requested.connect(self.show_quick_paste)
+        self.tray.toggle_capture_requested.connect(self.toggle_capture)
+        self.tray.settings_requested.connect(self.show_settings)
+        self.tray.sync_requested.connect(self.run_sync)
+        self.tray.quit_requested.connect(self.quit)
+
+    def _setup_native_event_filter(self) -> None:
+        """把 Windows 的 WM_CLIPBOARDUPDATE / WM_HOTKEY 接进来。"""
+        if not sys.platform.startswith("win"):
+            return
+
+        controller = self
+
+        class _Filter(QObject):
+            def eventFilter(self, obj, event):  # noqa: N802 - Qt 命名
+                try:
+                    from ctypes import wintypes
+
+                    # nativeEvent 是 MSG* 指针，WM_CLIPBOARDUPDATE / WM_HOTKEY 都靠它识别
+                    msg = wintypes.MSG.from_address(int(event.nativeEvent))
+                except Exception:  # noqa: BLE001
+                    return False
+                if controller.hotkeys.handle_native_event(event.type(), msg):
+                    return True
+                if msg.message == 0x031D:  # WM_CLIPBOARDUPDATE
+                    controller.monitor.on_native_event()
+                    return True
+                return False
+
+        self._native_filter = _Filter()
+        self.qt_app.installNativeEventFilter(self._native_filter)
+
+        from ..platform.windows import WindowsBackend
+
+        if isinstance(self.backend, WindowsBackend):
+            self.backend.require_event_driven = True
+
+    def _setup_timers(self) -> None:
+        self._sync_timer = QTimer(self)
+        self._sync_timer.setInterval(SYNC_INTERVAL_MS)
+        self._sync_timer.timeout.connect(self.run_sync)
+
+        self._sweep_timer = QTimer(self)
+        self._sweep_timer.setInterval(SENSITIVE_SWEEP_MS)
+        self._sweep_timer.timeout.connect(self._sweep_sensitive)
+
+    def _install_hotkeys(self) -> None:
+        sequence = str(self.config.get("ui.global_hotkey", "Ctrl+Shift+V") or "Ctrl+Shift+V")
+        if self.hotkeys.register(sequence, self.show_quick_paste):
+            self.tray.setToolTip(f"玲珑剪切板 · {sequence} 唤起快速粘贴")
+            return
+
+        # 注册失败不影响使用：应用内 Ctrl+Shift+V 与托盘菜单仍然可用
+        reason = self.hotkeys.reason or "全局快捷键不可用"
+        _log.warning("全局快捷键未启用：%s", reason)
+        self._hotkey_warning = reason
+        if is_linux():
+            self.tray.setToolTip(f"玲珑剪切板 · 全局快捷键不可用（{reason}）")
+
+    # ---- 启动与退出 ----
+
+    def run(self) -> int:
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray.show()
+            self.tray.set_paused(self.monitor.is_paused)
+        else:
+            _log.info("系统托盘不可用，主窗口将常驻显示")
+            self._start_minimized = False
+
+        self.monitor.start()
+        if self.config.get("sync.enabled", False) and self.sync is not None:
+            self._sync_timer.start()
+
+        if self._start_minimized and QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray.notify(
+                "玲珑剪切板已在后台运行",
+                f"按 {self.config.get('ui.global_hotkey', 'Ctrl+Shift+V')} 唤起快速粘贴",
+            )
+        else:
+            self.show_window()
+
+        signal.signal(signal.SIGINT, lambda *_: self.quit())
+        # 让 Python 有机会处理信号：Qt 事件循环会吞掉 SIGINT
+        self._signal_timer = QTimer(self)
+        self._signal_timer.start(400)
+        self._signal_timer.timeout.connect(lambda: None)
+
+        return self.qt_app.exec()
+
+    def quit(self) -> None:
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        _log.info("正在退出…")
+        self._invoker.cancel()
+        self.monitor.stop()
+        self.hotkeys.unregister_all()
+        self._sync_timer.stop()
+        self._sweep_timer.stop()
+        self.storage.close()
+        self.tray.hide()
+        self.qt_app.quit()
+
+    # ---- 采集管线 ----
+
+    def _on_capture_threadsafe(self, item: ClipboardItem) -> None:
+        """采集线程入口：识别 → 风控 → 落库，全在后台线程完成。
+
+        落库不碰 Qt 对象，可以安全地在采集线程里做；
+        只有「刷新界面」这一步需要切回 GUI 线程，
+        因此这里把结果打包成信号发出去，而不是反过来让主线程干重活。
+        """
+        if self._shutting_down:
+            return
+        try:
+            outcome, saved = self.collector.process(item, self.focus.current())
+        except Exception:  # noqa: BLE001 - 单条失败不能中断采集线程
+            _log.exception("采集处理失败")
+            return
+        if saved is None:
+            return
+        self.item_captured.emit(saved, outcome)
+
+    def _on_collected_threadsafe(self, item: ClipboardItem, outcome: str) -> None:
+        """`Collector` 内部的回调，与采集成败无关，仅用于日志。"""
+        _log.debug("采集结果 %s：%s", outcome, item.preview[:60])
+
+    def _on_captured_ui(self, item: ClipboardItem, outcome: str) -> None:
+        """GUI 线程：刷新列表与提示。"""
+        if self._shutting_down:
+            return
+        self.window.reload()
+        if outcome == CAPTURED:
+            self.window.notify(f"已记录：{item.kind_label} · {item.display_source}")
+        elif outcome == MERGED:
+            self.window.notify("内容已存在，已更新使用记录")
+
+        if item.sensitive:
+            self.tray.notify("已拦截敏感内容", "包含密码或密钥，未写入历史")
+
+    # ---- 剪贴板操作 ----
+
+    def copy_item(self, item_id: int, plain_text_only: bool = False) -> None:
+        item = self.storage.get(item_id)
+        if item is None:
+            return
+
+        text = item.content
+        if item.sensitive and self.config.get("privacy.redact_on_copy_out", False):
+            text = self.guard.redact(text)
+            patched = ClipboardItem(
+                kind=item.kind,
+                content=text,
+                html="",
+                files=item.files,
+                image_path=item.image_path,
+            )
+            self.clipboard.write_item(patched, plain_text_only=plain_text_only)
+        else:
+            self.clipboard.write_item(item, plain_text_only=plain_text_only)
+
+        # 记下指纹，避免自己的写入又被采集一遍
+        payload = item.hash if item.kind == "image" else text
+        self.monitor.mark_self_write(payload or text, item.kind)
+        self.storage.touch(item_id)
+        self.window.reload()
+        self.window.notify(f"已复制：{item.kind_label}")
+
+    def copy_text(self, text: str) -> None:
+        self.clipboard.set_text(text)
+        self.monitor.mark_self_write(text, "text")
+        self.window.notify("已复制转换结果")
+
+    def paste_item(self, item_id: int) -> None:
+        """复制后尝试直接粘贴到上一次的前台窗口。"""
+        self.copy_item(item_id)
+        if not self._paste_to_previous_window():
+            self.window.notify("已复制到剪贴板，请手动粘贴（Ctrl+V）")
+
+    def _paste_to_previous_window(self) -> bool:
+        from ..utils.paths import is_macos, is_windows
+
+        if is_windows():
+            return self._paste_windows()
+        if is_macos():
+            return self._paste_macos()
+        return self._paste_linux()
+
+    def _paste_windows(self) -> bool:
+        try:
+            import ctypes
+
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            VK_CONTROL, VK_V = 0x11, 0x56
+            KEYEVENTF_KEYUP = 0x0002
+            user32.keybd_event(VK_CONTROL, 0, 0, 0)
+            user32.keybd_event(VK_V, 0, 0, 0)
+            user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
+            user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _paste_macos(self) -> bool:
+        import subprocess
+
+        try:
+            subprocess.Popen(
+                ["osascript", "-e", 'tell application "System Events" to keystroke "v" using command down'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except OSError:
+            return False
+
+    def _paste_linux(self) -> bool:
+        """X11 下用 xdotool；Wayland 出于安全设计不允许模拟全局按键。"""
+        import shutil
+        import subprocess
+
+        if not shutil.which("xdotool"):
+            return False
+        try:
+            subprocess.Popen(
+                ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except OSError:
+            return False
+
+    def delete_item(self, item_id: int) -> None:
+        self.storage.delete(item_id)
+        self.window.reload()
+        self.window.notify("已删除")
+
+    # ---- 界面 ----
+
+    def show_window(self) -> None:
+        self.window.show()
+        self.window.raise_()
+        self.window.activateWindow()
+        self.window.focus_search()
+
+    def show_quick_paste(self) -> None:
+        self.preview.show_centered()
+
+    def _on_quick_chosen(self, item_id: int, plain_text_only: bool) -> None:
+        if plain_text_only:
+            self.copy_item(item_id, plain_text_only=True)
+        else:
+            self.paste_item(item_id)
+
+    def _on_preview_closed(self) -> None:
+        return None
+
+    def _show_transform(self, item: ClipboardItem, action_key: str, output: str) -> None:
+        self.transformer.show_result(item, action_key, output)
+
+    def toggle_capture(self) -> None:
+        if self.monitor.is_paused:
+            self.monitor.resume()
+            self.window.notify("已恢复采集")
+        else:
+            self.monitor.pause()
+            self.window.notify("已暂停采集")
+        self.tray.set_paused(self.monitor.is_paused)
+
+    def show_settings(self) -> None:
+        dialog = SettingsDialog(
+            self.config,
+            self.automation,
+            self.sync.status() if self.sync else {},
+            self.window,
+        )
+        if dialog.exec() != SettingsDialog.DialogCode.Accepted:
+            return
+
+        self.guard.reload_rules()
+        self.window.apply_theme(self.config.get("ui.theme", "system"))
+        self.monitor.set_interval(int(self.config.get("capture.poll_interval_ms", 300)))
+        if "sync.folder" in dialog.changes or "sync.encrypt" in dialog.changes:
+            self.sync = self._build_sync()
+        if self.config.get("sync.enabled", False) and self.sync is not None:
+            self._sync_timer.start()
+        else:
+            self._sync_timer.stop()
+
+        self.window.reload()
+        self.window.notify("设置已保存")
+
+    # ---- 定时任务 ----
+
+    def _sweep_sensitive(self) -> None:
+        try:
+            self.collector.purge_sensitive()
+        except Exception:  # noqa: BLE001
+            _log.exception("敏感记录清理失败")
+
+    def run_sync(self) -> None:
+        if self.sync is None or not self.config.get("sync.enabled", False):
+            self.window.notify("同步未启用（请在设置中配置同步目录）")
+            return
+
+        def work() -> None:
+            try:
+                exported = self.sync.export()
+                imported = self.sync.import_all()
+                self.sync.compact()
+                _log.info("同步完成：导出 %d 条，导入 %d 条", exported, imported)
+            except Exception:  # noqa: BLE001
+                _log.exception("同步执行失败")
+
+        threading.Thread(target=work, name="linglong-sync", daemon=True).start()
+
+    # ---- 配置变更 ----
+
+    def _on_config_change(self, key: str, value) -> None:
+        if key == "capture.poll_interval_ms":
+            self.monitor.set_interval(int(value))
+        elif key == "capture.enabled":
+            if value:
+                self.monitor.resume()
+            else:
+                self.monitor.pause()
+            self.tray.set_paused(self.monitor.is_paused)
+        elif key == "sync.enabled":
+            if value and self.sync is not None:
+                self._sync_timer.start()
+            else:
+                self._sync_timer.stop()
