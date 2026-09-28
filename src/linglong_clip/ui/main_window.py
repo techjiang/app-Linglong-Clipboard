@@ -37,7 +37,7 @@ from ..core.models import ClipboardItem
 from ..core.semantic import SemanticEngine
 from ..core.storage import Storage
 from ..utils.logger import get_logger
-from .item_card import ItemCard, humanize_size, humanize_time
+from .item_card import ItemCard, humanize_size, humanize_time, normalize_density
 from .theme import Palette, build_stylesheet, palette_for
 
 _log = get_logger("main-window")
@@ -196,6 +196,10 @@ class MainWindow(QWidget):
     delete_requested = Signal(int)
     #: 转换完成：(原记录, 动作 key, 产物)
     transform_ready = Signal(object, str, str)
+    #: 用户点了窗口关闭按钮。由 Application 决定「收进托盘」还是「退出」，
+    #: 窗口自己不判断 —— 判断需要知道托盘是否可用、退出前要释放哪些资源，
+    #: 那些只有 Application 有。
+    close_requested = Signal()
 
     def __init__(
         self,
@@ -218,6 +222,8 @@ class MainWindow(QWidget):
         self._kind_filter: Optional[str] = None
         # 先定主题再建控件：卡片的类型色条在构造时就要用到色板
         self._palette_theme = palette_for(self._config.get("ui.theme", "system"))
+        # 卡片密度：comfortable（三行）/ compact（两行、更矮）
+        self._density = normalize_density(self._config.get("ui.card_density", "comfortable"))
 
         self.setWindowTitle("玲珑剪切板")
         self.setMinimumSize(QSize(880, 560))
@@ -234,6 +240,21 @@ class MainWindow(QWidget):
         self.setStyleSheet(build_stylesheet(self._palette_theme))
         self.reload()
 
+    # ---- 关闭 ----
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        """关窗时把决定权交给 Application。
+
+        `ui.close_to_tray` 打开（默认）→ 收进托盘继续后台采集，符合
+        剪贴板工具的预期：关窗只是想让它别占着屏幕，不是想停掉采集。
+        关闭 → 真的退出，由 Application 走完整的资源释放路径。
+
+        无论哪种情况都不在这里 `event.accept()` 直接销毁窗口：
+        托盘重新唤起时要复用同一个窗口实例。
+        """
+        event.ignore()
+        self.close_requested.emit()
+
     # ---- 主题 ----
 
     def apply_theme(self, theme: str) -> None:
@@ -241,6 +262,14 @@ class MainWindow(QWidget):
         self._palette_theme = palette_for(theme)
         self._preview._palette_theme = self._palette_theme
         self.setStyleSheet(build_stylesheet(self._palette_theme))
+        self.reload()
+
+    def apply_density(self, density: str) -> None:
+        """切换卡片密度。密度在卡片构造时就定下，同样需要重建列表。"""
+        normalized = normalize_density(density)
+        if normalized == self._density:
+            return
+        self._density = normalized
         self.reload()
 
     # ---- 构建界面 ----
@@ -442,10 +471,18 @@ class MainWindow(QWidget):
         favorite = self._filter == "favorite"
 
         if query:
+            # `ui.fuzzy_search` 关闭时不做意图解析：查询串原样交给全文检索，
+            # 「上周的截图」这类自然语言不再被拆成时间/类型条件。
+            # 打开时（默认）才走语义解析并把理解结果显示出来。
+            fuzzy = bool(self._config.get("ui.fuzzy_search", True))
             items = self._engine.search(
-                query, kind=kind, pinned_only=pinned, favorite_only=favorite
+                query,
+                kind=kind,
+                pinned_only=pinned,
+                favorite_only=favorite,
+                use_intent=fuzzy,
             )
-            explanation = self._engine.explain(query)
+            explanation = self._engine.explain(query) if fuzzy else []
             self._intent_label.setText(
                 "已理解：" + " · ".join(explanation) if explanation else ""
             )
@@ -481,7 +518,7 @@ class MainWindow(QWidget):
         self._scroll.show()
 
         for item in self._items:
-            card = ItemCard(item, self._palette_theme)
+            card = ItemCard(item, self._palette_theme, density=self._density)
             card.double_clicked.connect(lambda item_id: self.copy_requested.emit(item_id, False))
             card.context_requested.connect(self._show_context_menu)
             self._list_layout.insertWidget(self._list_layout.count() - 1, card)

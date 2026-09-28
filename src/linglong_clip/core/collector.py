@@ -83,6 +83,10 @@ class Collector:
                 _log.info("敏感内容不入库：%s", verdict.summary)
                 return SKIPPED_PRIVACY, None
 
+        # 超长文本的截断放在隐私判定之后：判定读的是完整内容，
+        # 先截断再判定会让「被截掉的那一段才是密钥」这种情况被放行。
+        self._truncate_long_text(item)
+
         item.hash = item.hash or content_hash(
             item.kind, self._canonical_payload(item)
         )
@@ -132,6 +136,36 @@ class Collector:
             return
         item.source_app = item.source_app or focus.app_id or focus.app_name
         item.source_title = item.source_title or focus.window_title
+
+    def _truncate_long_text(self, item: ClipboardItem) -> None:
+        """按 `capture.max_text_length` 截断超长文本。
+
+        为什么不是「超长就整条丢弃」：剪贴板里复制一整份日志、一整个文件是
+        常见操作，直接丢掉等于用户复制了却什么都没记下，且没有任何提示。
+        截断保留开头，用户至少能在历史里认出「这是我刚才复制的那份日志」。
+
+        三处细节：
+
+        - **只作用于文本类载荷**。图片走 `image_path`、文件走 `files`，
+          它们没有 `content` 的长度问题；富文本的 `html` 同样不受限。
+        - **原文长度写进 `metadata`**。否则用户看到一段被截断的内容，
+          无从判断原文到底有多长、是不是被程序改过。
+        - **已经在记录里的长度不重复截断**。同步导入等路径带来的记录
+          可能已经截断过，`original_length` 以最先记下的为准。
+        """
+        limit = int(self._config.get("capture.max_text_length", 200_000) or 0)
+        if limit <= 0:
+            return
+        if not item.content or len(item.content) <= limit:
+            return
+        if item.kind in ("image", "file"):
+            return
+
+        original = len(item.content)
+        item.content = item.content[:limit]
+        item.metadata["truncated"] = True
+        item.metadata.setdefault("original_length", original)
+        _log.info("内容超过 %d 字符，已截断（原文 %d 字符）", limit, original)
 
     def _enrich(self, item: ClipboardItem) -> None:
         """补齐类型、摘要、标签等派生字段。"""
@@ -267,8 +301,11 @@ class Collector:
         max_days = int(self._config.get("history.max_days", 0) or 0)
         if max_items <= 0 and max_days <= 0:
             return
+        # 固定项豁免由配置决定：关掉后固定项也占限额（排序仍排前，
+        # 所以先被淘汰的是久未使用的普通记录）
+        pin_immune = bool(self._config.get("history.pin_immune", True))
         try:
-            removed = self._storage.enforce_limits(max_items, max_days)
+            removed = self._storage.enforce_limits(max_items, max_days, pin_immune)
             if removed:
                 _log.debug("淘汰 %d 条历史", removed)
         except Exception:  # noqa: BLE001

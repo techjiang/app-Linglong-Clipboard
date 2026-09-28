@@ -111,9 +111,14 @@ class SettingsDialog(QDialog):
         form.addRow("轮询间隔", self._poll_interval)
 
         self._max_length = QSpinBox()
-        self._max_length.setRange(1000, 5_000_000)
+        self._max_length.setRange(0, 5_000_000)
+        self._max_length.setSpecialValueText("不截断")
         self._max_length.setSingleStep(10_000)
         self._max_length.setValue(int(self._config.get("capture.max_text_length", 200_000)))
+        self._max_length.setToolTip(
+            "超过此长度的文本只保留开头，原文长度记在记录的「被截断」标记里；\n"
+            "0 表示不截断。截断发生在隐私判定之后，不会漏检藏在长文本里的敏感信息"
+        )
         form.addRow("单条最大字符数", self._max_length)
 
         layout.addWidget(group)
@@ -154,6 +159,10 @@ class SettingsDialog(QDialog):
 
         self._pin_immune = QCheckBox("固定项不受清理影响")
         self._pin_immune.setChecked(bool(self._config.get("history.pin_immune", True)))
+        self._pin_immune.setToolTip(
+            "勾选：固定项完全不占上面两个上限的额度；\n"
+            "取消：固定项也计入上限（排序仍排前，所以先被清理的是久未使用的普通记录）"
+        )
         history_form.addRow("", self._pin_immune)
 
         layout.addWidget(self._build_ocr_group())
@@ -517,7 +526,21 @@ class SettingsDialog(QDialog):
 
         self._fuzzy = QCheckBox("启用语义检索与建议")
         self._fuzzy.setChecked(bool(self._config.get("ui.fuzzy_search", True)))
+        self._fuzzy.setToolTip(
+            "开启后搜索框会解析「上周的截图」这类自然语言并回显理解结果；\n"
+            "关闭后查询串原样做全文检索"
+        )
         form.addRow("", self._fuzzy)
+
+        self._density = QComboBox()
+        # data 存配置值，显示的是人话
+        self._density.addItem("舒适（三行信息）", "comfortable")
+        self._density.addItem("紧凑（两行，一屏更多）", "compact")
+        current_density = str(self._config.get("ui.card_density", "comfortable") or "")
+        index = self._density.findData(current_density)
+        self._density.setCurrentIndex(index if index >= 0 else 0)
+        self._density.setToolTip("只影响列表显示密度，不影响采集与检索结果")
+        form.addRow("列表密度", self._density)
 
         self._hotkey = QLineEdit(str(self._config.get("ui.global_hotkey", "Ctrl+Shift+V")))
         form.addRow("唤起快捷键", self._hotkey)
@@ -525,16 +548,24 @@ class SettingsDialog(QDialog):
         self._quick_hotkey = QLineEdit(
             str(self._config.get("ui.quick_paste_hotkey", "Ctrl+Shift+1..9"))
         )
-        self._quick_hotkey.setEnabled(False)
-        self._quick_hotkey.setToolTip("快速粘贴序号段固定，仅作说明")
+        self._quick_hotkey.setToolTip(
+            "按序号直接粘贴第 N 条，如 Ctrl+Shift+1..9 会注册 9 个快捷键。\n"
+            "改前缀只需改这一处；有一个注册失败（被占用）时整组不启用，\n"
+            "不会出现「1、2 能用、3 不行」。留空表示不注册。"
+        )
         form.addRow("快速粘贴序号", self._quick_hotkey)
 
         self._start_minimized = QCheckBox("启动时最小化到托盘")
         self._start_minimized.setChecked(bool(self._config.get("ui.start_minimized", True)))
+        self._start_minimized.setToolTip("命令行 `--minimized` 可临时覆盖此项")
         form.addRow("", self._start_minimized)
 
         self._close_to_tray = QCheckBox("关闭窗口时保留后台运行")
         self._close_to_tray.setChecked(bool(self._config.get("ui.close_to_tray", True)))
+        self._close_to_tray.setToolTip(
+            "勾选：点关闭只收进托盘，采集继续；\n"
+            "取消：点关闭直接退出程序（系统托盘不可用时一律退出）"
+        )
         form.addRow("", self._close_to_tray)
 
         layout.addWidget(group)
@@ -774,7 +805,9 @@ class SettingsDialog(QDialog):
             "sync.lan_discovery": self._lan_discovery.isChecked(),
             "ui.theme": self._theme.currentText(),
             "ui.fuzzy_search": self._fuzzy.isChecked(),
+            "ui.card_density": self._density.currentData(),
             "ui.global_hotkey": self._hotkey.text().strip(),
+            "ui.quick_paste_hotkey": self._quick_hotkey.text().strip(),
             "ui.start_minimized": self._start_minimized.isChecked(),
             "ui.close_to_tray": self._close_to_tray.isChecked(),
         }

@@ -123,6 +123,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="自检原生能力（剪贴板读写、前台窗口、全局快捷键），换机器排查时先跑这个",
     )
+    diagnose.add_argument(
+        "--config-audit",
+        action="store_true",
+        help="审计配置项：找出「声明了但没有读取方」的空转配置（改了不生效的那些）",
+    )
 
     output = parser.add_argument_group("输出")
     output.add_argument("--json", action="store_true", help="以 JSON 输出，便于脚本处理")
@@ -402,6 +407,17 @@ def _run_cli(args: argparse.Namespace) -> int:
             print("重算后未发现新的重复项")
         storage.close()
         return 0
+
+    if args.config_audit:
+        from .utils.config_audit import audit_config_usage, format_audit
+
+        report = audit_config_usage()
+        if args.json:
+            print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+        else:
+            print(format_audit(report))
+        storage.close()
+        return 0 if report.healthy else 1
 
     if args.import_native_history:
         return _run_native_history_import(args, storage, config)
@@ -685,6 +701,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.storage_migrate,
             args.where,
             args.selfcheck,
+            args.config_audit,
         ]
     ):
         return _run_cli(args)

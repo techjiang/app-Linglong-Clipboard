@@ -1,5 +1,7 @@
 """采集管线：识别、去重、风控、淘汰。"""
 
+import time
+
 import pytest
 
 from linglong_clip.core.collector import (
@@ -294,3 +296,107 @@ def test_provided_hash_is_respected(collector, storage):
                          preview="x", hash="explicit-hash")
     collector.process(item)
     assert storage.find_by_hash("explicit-hash") is not None
+
+
+# ---- capture.max_text_length：超长文本按配置截断 ----
+
+
+def test_long_text_is_truncated_to_configured_limit(storage, config):
+    config.set("capture.max_text_length", 20)
+    instance = Collector(storage, config)
+    outcome, saved = instance.process(_item("x" * 100))
+    assert outcome == CAPTURED
+    assert len(saved.content) == 20
+    assert saved.metadata["truncated"] is True
+    assert saved.metadata["original_length"] == 100
+
+
+def test_short_text_is_not_touched(storage, config):
+    config.set("capture.max_text_length", 1000)
+    instance = Collector(storage, config)
+    _, saved = instance.process(_item("short"))
+    assert saved.content == "short"
+    assert "truncated" not in saved.metadata
+
+
+def test_zero_limit_means_no_truncation(storage, config):
+    """0 表示不截断：配置项允许用户彻底关掉这个行为。"""
+    config.set("capture.max_text_length", 0)
+    instance = Collector(storage, config)
+    _, saved = instance.process(_item("y" * 500))
+    assert len(saved.content) == 500
+    assert "truncated" not in saved.metadata
+
+
+def test_truncation_happens_after_privacy_check(storage, config):
+    """截断必须排在隐私判定之后。
+
+    否则「长文本里藏着一段 API Key，且恰好落在截断线之后」这种情况
+    会因为判定时看不到那段内容而被放行 —— 顺序反了就是漏检。
+    """
+    config.set("capture.max_text_length", 50)
+    instance = Collector(storage, config)
+    # 前 50 个字符是普通文本，密钥跟在其后
+    payload = "a" * 50 + " sk-abcdefghijklmnopqrstuvwxyz0123456789"
+    outcome, saved = instance.process(_item(payload))
+    # 若是先截断再判定，这段密钥会被截掉、判定看不到，于是入库
+    assert outcome != CAPTURED
+    assert storage.count() == 0
+
+
+def test_truncation_keeps_original_length_once(storage, config):
+    """多次经过截断路径时 original_length 以最先记下的原文长度为准。"""
+    config.set("capture.max_text_length", 10)
+    instance = Collector(storage, config)
+    item = ClipboardItem(kind="text", content="z" * 40, metadata={"original_length": 999})
+    _, saved = instance.process(item)
+    assert saved.content == "z" * 10
+    assert saved.metadata["original_length"] == 999
+
+
+def test_binary_kinds_are_not_truncated(storage, config):
+    """图片走 image_path、文件走 files，没有 content 长度问题。"""
+    config.set("capture.max_text_length", 5)
+    instance = Collector(storage, config)
+    item = ClipboardItem(kind="image", image_path="/nonexistent/a.png")
+    item.hash = "img-digest"
+    item.content = "i" * 50  # OCR 结果可能很长，但归属图片记录
+    _, saved = instance.process(item)
+    assert len(saved.content) == 50
+
+
+def test_truncated_text_still_searchable(storage, config):
+    """截断后保留的开头仍要能搜到 —— 否则用户复制了却查不到。"""
+    config.set("capture.max_text_length", 30)
+    instance = Collector(storage, config)
+    instance.process(_item("UNIQUE_PREFIX_" + "pad" * 50))
+    assert storage.search("UNIQUE_PREFIX_")
+
+
+# ---- history.pin_immune：固定项是否占限额 ----
+
+
+def test_pin_immune_true_keeps_pinned_beyond_limit(storage, config):
+    now = time.time()
+    config.update({"capture.max_text_length": 0, "history.max_items": 2,
+                   "history.pin_immune": True})
+    instance = Collector(storage, config)
+    for index in range(4):
+        instance.process(_item(f"plain{index}", created_at=now + index))
+    instance.process(_item("PINNED", pinned=True, created_at=now - 1000))
+    remaining = {item.content for item in storage.list(limit=100)}
+    assert "PINNED" in remaining
+    assert remaining == {"PINNED", "plain3", "plain2"}
+
+
+def test_pin_immune_false_evicts_pinned_when_over_limit(storage, config):
+    now = time.time()
+    config.update({"capture.max_text_length": 0, "history.max_items": 2,
+                   "history.pin_immune": False})
+    instance = Collector(storage, config)
+    for index in range(4):
+        instance.process(_item(f"plain{index}", created_at=now + index))
+    instance.process(_item("PINNED", pinned=True, created_at=now - 1000))
+    remaining = {item.content for item in storage.list(limit=100)}
+    # 排序把固定项排前，所以仍留着它，淘汰的是最旧的普通记录
+    assert remaining == {"PINNED", "plain3"}

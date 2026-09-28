@@ -186,7 +186,8 @@ class QuickPasteOverlay(QWidget):
         if query.isdigit() and len(query) == 1:
             self._items = self._storage.list(limit=MAX_ROWS)
         else:
-            self._items = self._engine.search(query, limit=MAX_ROWS)
+            fuzzy = bool(self._config.get("ui.fuzzy_search", True))
+            self._items = self._engine.search(query, limit=MAX_ROWS, use_intent=fuzzy)
         self._render()
 
     def _render(self) -> None:
@@ -267,6 +268,18 @@ class QuickPasteOverlay(QWidget):
             return
         self._active = (self._active + delta) % len(self._rows)
         self._sync_active()
+
+    def paste_nth(self, index: int) -> None:
+        """直接粘贴第 N 条（1 起），供全局快速粘贴快捷键调用。
+
+        与 `_choose` 的区别：`_choose` 假定浮层已经渲染好了当前的
+        `self._items`，而快捷键可能在任何时刻按下 —— 浮层刚 `show_centered`
+        时列表是最新的，但为避免「按了没反应」，这里在序号越界时
+        重新按当前查询渲染一次再试。
+        """
+        if not (1 <= index <= len(self._items)):
+            self._render()
+        self._choose(index)
 
     def _choose(self, index: int, plain_text_only: bool = False) -> None:
         position = index - 1

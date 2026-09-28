@@ -765,3 +765,292 @@ def test_native_history_import_handles_storage_failure(qt_app, home, monkeypatch
     dialog = SettingsDialog(Config(home / "config.json"))
     dialog._run_native_history_import()
     assert "磁盘满了" in dialog._native_import_status.text()
+
+
+# ---- 界面上那些「勾了但不起作用」的开关：逐个验证真的生效 ----
+
+def test_dialog_has_card_density_control(dialog, config):
+    """列表密度此前根本没有控件，配置项也没人读。"""
+    dialog._density.setCurrentIndex(dialog._density.findData("compact"))
+    dialog._save()
+    assert config.get("ui.card_density") == "compact"
+    assert "ui.card_density" in dialog.changes
+
+
+def test_card_density_compact_shrinks_card(storage, config, qt_app):
+    """compact 模式下卡片少一行元信息、外边距更小，高度应真的更矮。"""
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.ui.item_card import ItemCard, normalize_density
+    from linglong_clip.ui.theme import palette_for
+
+    palette = palette_for("light")
+    item = ClipboardItem(id=1, kind="text", content="一条很普通的记录", source_app="chrome")
+    comfortable = ItemCard(item, palette, density="comfortable")
+    compact = ItemCard(item, palette, density="compact")
+    assert compact.is_compact is True
+    assert comfortable.is_compact is False
+    # 紧凑版没有元信息行
+    assert comfortable.findChildren(type(compact._body)) is not None
+    assert normalize_density("COMPACT") == "compact"
+    assert normalize_density("乱填") == "comfortable"
+
+
+def test_main_window_applies_density_on_change(storage, config, qt_app):
+    from linglong_clip.core.automation import AutomationEngine
+    from linglong_clip.core.semantic import SemanticEngine
+    from linglong_clip.ui.main_window import MainWindow
+
+    window = MainWindow(storage, config, SemanticEngine(storage), AutomationEngine())
+    assert window._density == "comfortable"
+    window.apply_density("compact")
+    assert window._density == "compact"
+    # 相同值不触发重建
+    window.apply_density("compact")
+    assert window._density == "compact"
+
+
+def test_search_uses_fuzzy_flag(storage, config, qt_app):
+    """`ui.fuzzy_search` 关闭时不做意图解析，查询串原样检索。"""
+    from linglong_clip.core.automation import AutomationEngine
+    from linglong_clip.core.semantic import SemanticEngine
+    from linglong_clip.ui.main_window import MainWindow
+
+    window = MainWindow(storage, config, SemanticEngine(storage), AutomationEngine())
+    captured = {}
+
+    def fake_search(query, **kwargs):
+        captured.update(kwargs)
+        captured["query"] = query
+        return []
+
+    window._engine.search = fake_search
+    window._search.setText("上周的截图")
+    config.set("ui.fuzzy_search", False)
+    window.reload()
+    assert captured["use_intent"] is False
+    assert window._intent_label.text() == ""
+
+    config.set("ui.fuzzy_search", True)
+    window.reload()
+    assert captured["use_intent"] is True
+
+
+def test_close_to_tray_hides_window(config, qt_app, home, monkeypatch):
+    """`ui.close_to_tray` 打开时点关闭只收进托盘，不退出。"""
+    from linglong_clip.ui import application as app_module
+
+    monkeypatch.setattr(app_module.QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+    app = app_module.Application(["test"])
+    hidden, quits = [], []
+    app.window.hide = lambda: hidden.append(True)
+    app.quit = lambda: quits.append(True)
+
+    app.config.set("ui.close_to_tray", True)
+    app._on_window_close_requested()
+    assert hidden == [True] and quits == []
+
+
+def test_close_to_tray_false_quits(config, qt_app, home, monkeypatch):
+    from linglong_clip.ui import application as app_module
+
+    monkeypatch.setattr(app_module.QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+    app = app_module.Application(["test"])
+    hidden, quits = [], []
+    app.window.hide = lambda: hidden.append(True)
+    app.quit = lambda: quits.append(True)
+
+    app.config.set("ui.close_to_tray", False)
+    app._on_window_close_requested()
+    assert hidden == [] and quits == [True]
+
+
+def test_close_without_tray_quits(config, qt_app, home, monkeypatch):
+    """托盘不可用时收进托盘等于叫不回来，只能退出。"""
+    from linglong_clip.ui import application as app_module
+
+    monkeypatch.setattr(app_module.QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: False))
+    app = app_module.Application(["test"])
+    hidden, quits = [], []
+    app.window.hide = lambda: hidden.append(True)
+    app.quit = lambda: quits.append(True)
+
+    app.config.set("ui.close_to_tray", True)
+    app._on_window_close_requested()
+    assert hidden == [] and quits == [True]
+
+
+def test_main_window_close_event_defers_to_application(storage, config, qt_app):
+    """窗口自己不销毁，只发信号 —— 托盘唤起时要复用同一个实例。"""
+    from PySide6.QtGui import QCloseEvent
+
+    from linglong_clip.core.automation import AutomationEngine
+    from linglong_clip.core.semantic import SemanticEngine
+    from linglong_clip.ui.main_window import MainWindow
+
+    window = MainWindow(storage, config, SemanticEngine(storage), AutomationEngine())
+    fired = []
+    window.close_requested.connect(lambda: fired.append(True))
+    event = QCloseEvent()
+    window.closeEvent(event)
+    assert fired == [True]
+    assert not event.isAccepted()
+
+
+def test_start_minimized_reads_config(config, qt_app, home, monkeypatch):
+    """`ui.start_minimized` 此前是死配置，只有 CLI 参数生效。"""
+    from linglong_clip.ui import application as app_module
+
+    monkeypatch.setattr(app_module.QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+    app = app_module.Application(["test"])
+
+    app.config.set("ui.start_minimized", False)
+    assert app._resolve_start_minimized() is False
+    app.config.set("ui.start_minimized", True)
+    assert app._resolve_start_minimized() is True
+
+    # CLI 显式给了 --minimized 就以它为准
+    app2 = app_module.Application(["test"], start_minimized=True)
+    app2.config.set("ui.start_minimized", False)
+    assert app2._resolve_start_minimized() is True
+
+
+# ---- 快速粘贴快捷键：配置项此前只被显示、从没注册 ----
+
+
+def test_expand_hotkey_range_basic():
+    from linglong_clip.ui.hotkeys import expand_hotkey_range
+
+    assert expand_hotkey_range("Ctrl+Shift+1..9") == [f"Ctrl+Shift+{i}" for i in range(1, 10)]
+    assert expand_hotkey_range("Ctrl+Alt+1..3") == ["Ctrl+Alt+1", "Ctrl+Alt+2", "Ctrl+Alt+3"]
+
+
+def test_expand_hotkey_range_single_sequence():
+    from linglong_clip.ui.hotkeys import expand_hotkey_range
+
+    assert expand_hotkey_range("Ctrl+Shift+V") == ["Ctrl+Shift+V"]
+    assert expand_hotkey_range("  Ctrl+Shift+V  ") == ["Ctrl+Shift+V"]
+
+
+def test_expand_hotkey_range_rejects_bad_specs():
+    """非法范围返回空列表，调用方据此给出可排查的日志，而不是静默注册半个。"""
+    from linglong_clip.ui.hotkeys import expand_hotkey_range
+
+    assert expand_hotkey_range("") == []
+    assert expand_hotkey_range("Ctrl+Shift+9..1") == []
+    assert expand_hotkey_range("Ctrl+Shift+1..12") == []
+    assert expand_hotkey_range("Ctrl+Shift+a..c") == []
+
+
+def test_expand_hotkey_range_without_modifier_is_not_split():
+    """`1..9` 没有修饰键，当完整快捷键交给后端判断，不拆成 9 个裸数字键。"""
+    from linglong_clip.ui.hotkeys import expand_hotkey_range
+
+    assert expand_hotkey_range("1..9") == ["1..9"]
+
+
+def test_quick_paste_hotkeys_are_registered(config, qt_app, home, monkeypatch):
+    """`ui.quick_paste_hotkey` 声明的 9 个快捷键必须真的注册。"""
+    from linglong_clip.ui import application as app_module
+
+    monkeypatch.setattr(app_module.QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+    app = app_module.Application(["test"])
+    registered = []
+
+    def fake_register(sequence, callback):
+        registered.append(sequence)
+        return True
+
+    app.hotkeys.register = fake_register
+    app.config.set("ui.quick_paste_hotkey", "Ctrl+Shift+1..9")
+    count = app._install_quick_paste_hotkeys()
+    assert count == 9
+    # `__init__` 已注册过主快捷键，这里只看这一批新增的
+    assert registered[-9:] == [f"Ctrl+Shift+{i}" for i in range(1, 10)]
+    assert app._quick_hotkey_sequences == registered[-9:]
+
+
+def test_quick_paste_hotkeys_roll_back_on_partial_failure(config, qt_app, home, monkeypatch):
+    """9 个里有一个注册不上时整组撤掉，不留「1、2 能用、3 不行」的半残状态。"""
+    from linglong_clip.ui import application as app_module
+
+    monkeypatch.setattr(app_module.QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+    app = app_module.Application(["test"])
+    attempts, revoked = [], []
+
+    def flaky_register(sequence, callback):
+        attempts.append(sequence)
+        return sequence != "Ctrl+Shift+3"
+
+    def fake_unregister(sequences):
+        revoked.extend(sequences)
+        return len(sequences)
+
+    app.hotkeys.register = flaky_register
+    app.hotkeys.unregister = fake_unregister
+    app.config.set("ui.quick_paste_hotkey", "Ctrl+Shift+1..9")
+    # `set()` 已经触发过一次注册（并回滚），这里单独再看一次显式调用的行为
+    attempts.clear()
+    revoked.clear()
+    assert app._install_quick_paste_hotkeys() == 0
+    # 失败发生在第 3 个，循环就此中断（不再试后面的），并把前两个撤掉
+    assert attempts == ["Ctrl+Shift+1", "Ctrl+Shift+2", "Ctrl+Shift+3"]
+    assert revoked == ["Ctrl+Shift+1", "Ctrl+Shift+2"]
+    assert app._quick_hotkey_sequences == []
+
+
+def test_changing_quick_paste_hotkey_reregisters(config, qt_app, home, monkeypatch):
+    """改配置后要重注册，不能把旧绑定留在系统里。"""
+    from linglong_clip.ui import application as app_module
+
+    monkeypatch.setattr(app_module.QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+    app = app_module.Application(["test"])
+    registered, cleared = [], []
+    app.hotkeys.register = lambda sequence, callback: registered.append(sequence) or True
+    app.hotkeys.unregister_all = lambda: cleared.append(True)
+
+    # `set()` 会触发变更通知（注册一次）；再显式调一次模拟逐键触发
+    app.config.set("ui.quick_paste_hotkey", "Ctrl+Alt+1..3")
+    assert len(cleared) == 1
+
+    app._on_config_change("ui.quick_paste_hotkey", "Ctrl+Alt+1..3")
+    assert len(cleared) == 2
+    # 每次变更都重建一次，所以出现两批
+    assert [s for s in registered if s.startswith("Ctrl+Alt")] == [
+        "Ctrl+Alt+1", "Ctrl+Alt+2", "Ctrl+Alt+3",
+        "Ctrl+Alt+1", "Ctrl+Alt+2", "Ctrl+Alt+3",
+    ]
+    assert app._quick_hotkey_sequences == ["Ctrl+Alt+1", "Ctrl+Alt+2", "Ctrl+Alt+3"]
+
+
+def test_main_hotkey_failure_skips_quick_paste(config, qt_app, home, monkeypatch):
+    """主快捷键都注册不上时不必再试快速粘贴那一组。"""
+    from linglong_clip.ui import application as app_module
+
+    monkeypatch.setattr(app_module.QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+    app = app_module.Application(["test"])
+    calls = []
+    app.hotkeys.register = lambda sequence, callback: calls.append(sequence) or False
+    app._install_hotkeys()
+    assert calls == [app.config.get("ui.global_hotkey")]
+    assert app._quick_hotkey_sequences == []
+
+
+def test_quick_paste_overlay_paste_nth(storage, config, qt_app):
+    """`paste_nth` 按序号取第 N 条并发出选择信号。"""
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.semantic import SemanticEngine
+    from linglong_clip.ui.quick_paste import QuickPasteOverlay
+
+    for index in range(3):
+        storage.add(ClipboardItem(kind="text", content=f"item{index}", hash=f"h{index}"))
+    overlay = QuickPasteOverlay(storage, SemanticEngine(storage), config)
+    chosen = []
+    overlay.item_chosen.connect(lambda item_id, plain: chosen.append(item_id))
+    overlay.show_centered()
+    overlay.paste_nth(2)
+    assert len(chosen) == 1
+    assert chosen[0] is not None
+    # 越界序号不应发出信号
+    chosen.clear()
+    overlay.paste_nth(99)
+    assert chosen == []

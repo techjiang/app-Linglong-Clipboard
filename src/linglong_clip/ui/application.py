@@ -12,7 +12,7 @@ import os
 import signal
 import sys
 import threading
-from typing import Optional
+from typing import List, Optional
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QTimer, Qt, Signal
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
@@ -33,7 +33,7 @@ from ..utils.config import Config
 from ..utils.logger import get_logger, setup_logging
 from ..utils.paths import is_linux
 from .clipboard_qt import QtClipboardAdapter
-from .hotkeys import HotkeyManager
+from .hotkeys import HotkeyManager, expand_hotkey_range
 from .main_window import MainWindow
 from .quick_paste import QuickPasteOverlay
 from ..utils.selfcheck import run_self_check
@@ -116,7 +116,12 @@ class Application(QObject):
     def __init__(self, argv: list, *, start_minimized: bool = False) -> None:
         super().__init__()
         self._argv = argv
+        #: CLI 的 `--minimized` 是显式指令；没给时由 `ui.start_minimized` 决定，
+        #: 在 `run()` 里解析（那时配置已加载）。
         self._start_minimized = start_minimized
+        self._start_minimized_explicit = start_minimized
+        #: 实际注册成功的快速粘贴快捷键（注册失败时为空）
+        self._quick_hotkey_sequences: List[str] = []
         self._shutting_down = False
         self._sync_signature_cache: Optional[tuple] = None
 
@@ -298,6 +303,7 @@ class Application(QObject):
     def _wire_signals(self) -> None:
         self.item_captured.connect(self._on_captured_ui)
 
+        self.window.close_requested.connect(self._on_window_close_requested)
         self.window.copy_requested.connect(self.copy_item)
         self.window.paste_requested.connect(self.paste_item)
         self.window.delete_requested.connect(self.delete_item)
@@ -420,20 +426,89 @@ class Application(QObject):
 
     def _install_hotkeys(self) -> None:
         sequence = str(self.config.get("ui.global_hotkey", "Ctrl+Shift+V") or "Ctrl+Shift+V")
-        if self.hotkeys.register(sequence, self.show_quick_paste):
-            self.tray.setToolTip(f"玲珑剪切板 · {sequence} 唤起快速粘贴")
+        if not self.hotkeys.register(sequence, self.show_quick_paste):
+            # 注册失败不影响使用：应用内 Ctrl+Shift+V 与托盘菜单仍然可用
+            reason = self.hotkeys.reason or "全局快捷键不可用"
+            _log.warning("全局快捷键未启用：%s", reason)
+            self._hotkey_warning = reason
+            if is_linux():
+                self.tray.setToolTip(f"玲珑剪切板 · 全局快捷键不可用（{reason}）")
             return
 
-        # 注册失败不影响使用：应用内 Ctrl+Shift+V 与托盘菜单仍然可用
-        reason = self.hotkeys.reason or "全局快捷键不可用"
-        _log.warning("全局快捷键未启用：%s", reason)
-        self._hotkey_warning = reason
-        if is_linux():
-            self.tray.setToolTip(f"玲珑剪切板 · 全局快捷键不可用（{reason}）")
+        self.tray.setToolTip(f"玲珑剪切板 · {sequence} 唤起快速粘贴")
+        self._install_quick_paste_hotkeys()
+
+    def _install_quick_paste_hotkeys(self) -> int:
+        """按 `ui.quick_paste_hotkey` 注册「直接粘贴第 N 条」的全局快捷键。
+
+        这个配置项此前只被设置页显示、没有任何读取方 —— 界面上写着
+        「Ctrl+Shift+1..9」，实际上一个都没注册，用户按下去什么也不会发生。
+        现在按声明真的注册。
+
+        两处刻意的行为：
+
+        - **整体成功才留下**。若 9 个里有被占用的，把已注册的撤掉，
+          避免「1、2 能用、3 不行」这种半残状态 —— 半残比完全没有更难排查。
+        - **失败不报错，只记日志**。快速粘贴的快捷键是便利功能，
+          注册不到不该影响主快捷键与托盘菜单。
+        """
+        spec = str(self.config.get("ui.quick_paste_hotkey", "") or "")
+        sequences = expand_hotkey_range(spec)
+        if not sequences:
+            if spec.strip():
+                _log.warning("快速粘贴快捷键写法无法解析，已跳过：%r", spec)
+            return 0
+
+        succeeded: List[str] = []
+        for index, sequence in enumerate(sequences, start=1):
+            if self.hotkeys.register(sequence, lambda i=index: self._paste_nth_quick(i)):
+                succeeded.append(sequence)
+                continue
+            # 有一个没注册上就把这一批全撤掉，不留半残状态
+            _log.warning(
+                "快速粘贴快捷键 %s 注册失败（%s），该组快捷键整体不启用",
+                sequence,
+                self.hotkeys.reason or "可能被占用",
+            )
+            self.hotkeys.unregister(succeeded)
+            return 0
+
+        _log.info("已注册 %d 个快速粘贴快捷键（%s）", len(succeeded), spec)
+        self._quick_hotkey_sequences = list(sequences)
+        return len(succeeded)
+
+    def _paste_nth_quick(self, index: int) -> None:
+        """快速粘贴第 index 条：先唤起浮层，再按序号粘贴。"""
+        self.show_quick_paste()
+        self.preview.paste_nth(index)
 
     # ---- 启动与退出 ----
 
+    def _resolve_start_minimized(self) -> bool:
+        """决定启动时是否直接进托盘。
+
+        CLI 显式传了 `--minimized` 就以它为准；否则读 `ui.start_minimized`。
+        配置里默认 `True`，符合剪贴板工具的直觉 —— 它是后台常驻程序，
+        每次开机都弹一个窗口出来是打扰。
+        """
+        if self._start_minimized_explicit:
+            return True
+        return bool(self.config.get("ui.start_minimized", True))
+
+    def _on_window_close_requested(self) -> None:
+        """主窗口关闭按钮的落点。
+
+        `ui.close_to_tray` 为真时收进托盘（默认），为假时执行真正的退出。
+        托盘不可用时只能退出 —— 收进托盘等于让用户没办法再把它叫回来。
+        """
+        if not self.config.get("ui.close_to_tray", True) or not QSystemTrayIcon.isSystemTrayAvailable():
+            self.quit()
+            return
+        self.window.hide()
+        _log.info("主窗口已收进托盘，采集继续在后台运行")
+
     def run(self) -> int:
+        self._start_minimized = self._resolve_start_minimized()
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray.show()
             self.tray.set_paused(self.monitor.is_paused)
@@ -671,6 +746,9 @@ class Application(QObject):
 
         self.guard.reload_rules()
         self.window.apply_theme(self.config.get("ui.theme", "system"))
+        self.window.apply_density(
+            self.config.get("ui.card_density", "comfortable")
+        )
         self.monitor.set_interval(int(self.config.get("capture.poll_interval_ms", 300)))
         if "sync.folder" in dialog.changes or "sync.encrypt" in dialog.changes:
             self.sync = self._build_sync()
@@ -738,3 +816,9 @@ class Application(QObject):
                 self._sync_timer.stop()
         elif key.startswith("ocr.") or key == "ui.language":
             self.refresh_ocr()
+        elif key in ("ui.global_hotkey", "ui.quick_paste_hotkey"):
+            # 快捷键改了要重注册：只把主快捷键撤掉重来，快速粘贴那一组
+            # 由 `_install_hotkeys` 一并重建，避免旧绑定残留在系统里。
+            self.hotkeys.unregister_all()
+            self._quick_hotkey_sequences = []
+            self._install_hotkeys()

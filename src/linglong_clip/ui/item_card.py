@@ -27,6 +27,20 @@ from .theme import KIND_COLORS, Palette
 #: 卡片里预览文本显示的最大行数
 PREVIEW_LINES = 2
 
+#: 卡片密度：
+#: - comfortable（默认）三行完整信息：类型徽标 + 摘要 + 来源/时间/标签
+#: - compact 只保留类型徽标与摘要，把每行高度压到最小，一屏能多看几条
+#:
+#: 密度只影响**展示**，不影响任何采集/检索行为 —— 切换后历史一条不少，
+#: 只是列表看起来更密。
+DENSITY_COMFORTABLE = "comfortable"
+DENSITY_COMPACT = "compact"
+
+
+def normalize_density(value: object) -> str:
+    """把配置值收敛到两个合法值，非法值退回默认。"""
+    return DENSITY_COMPACT if str(value or "").strip().lower() == DENSITY_COMPACT else DENSITY_COMFORTABLE
+
 
 def humanize_time(timestamp: float, *, now: Optional[float] = None) -> str:
     """把时间戳转成「刚刚 / 5 分钟前 / 昨天 14:30」这类口语表达。"""
@@ -66,10 +80,18 @@ class ItemCard(QFrame):
     double_clicked = Signal(int)
     context_requested = Signal(int, object)
 
-    def __init__(self, item: ClipboardItem, palette: Palette, parent: QWidget = None) -> None:
+    def __init__(
+        self,
+        item: ClipboardItem,
+        palette: Palette,
+        parent: QWidget = None,
+        *,
+        density: str = DENSITY_COMFORTABLE,
+    ) -> None:
         super().__init__(parent)
         self._item = item
         self._palette_theme = palette
+        self._density = normalize_density(density)
         self.setObjectName("Card")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -85,10 +107,19 @@ class ItemCard(QFrame):
     def item_id(self) -> Optional[int]:
         return self._item.id
 
+    @property
+    def is_compact(self) -> bool:
+        return self._density == DENSITY_COMPACT
+
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(11, 8, 11, 8)
-        outer.setSpacing(4)
+        if self.is_compact:
+            # 竖向留白是卡片高度的主要来源，压缩它比缩小字号更有效
+            outer.setContentsMargins(9, 4, 9, 4)
+            outer.setSpacing(1)
+        else:
+            outer.setContentsMargins(11, 8, 11, 8)
+            outer.setSpacing(4)
 
         # 第一行：类型徽标 + 标记 + 来源
         head = QHBoxLayout()
@@ -132,6 +163,12 @@ class ItemCard(QFrame):
         self._body.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
         self._body.setText(self._preview_text())
         outer.addWidget(self._body)
+
+        if self.is_compact:
+            # 紧凑模式只保留前两行：来源/时间/标签这些信息在悬停提示里仍有，
+            # 不为了「一屏多看几条」把它们删掉，只是不在行内占高度。
+            self._apply_elide()
+            return
 
         # 第三行：元信息
         meta = QHBoxLayout()

@@ -118,6 +118,31 @@ def main() -> int:
     dialog.resize(760, 640)
     _render(dialog, OUT / "settings-ocr.png")
 
+    # 设置页「界面」页：列表密度、关闭行为这些开关都在这里
+    ui_dialog = SettingsDialog(_config({}), automation)
+    ui_dialog.resize(760, 640)
+    ui_tabs = ui_dialog.findChild(QTabWidget)
+    if ui_tabs is not None:
+        for index in range(ui_tabs.count()):
+            if "外观" in ui_tabs.tabText(index):
+                ui_tabs.setCurrentIndex(index)
+                break
+    _render(ui_dialog, OUT / "settings-interface.png")
+
+    # 列表密度对比：同一批记录在两种密度下的行高差异
+    from linglong_clip.ui.main_window import MainWindow as _Window
+
+    for density, name in (("comfortable", "density-comfortable.png"),
+                          ("compact", "density-compact.png")):
+        window = _Window(
+            storage,
+            _config({"ui.theme": "dark", "ui.card_density": density}),
+            engine,
+            automation,
+        )
+        window.resize(1180, 720)
+        _render(window, OUT / name)
+
     # 设置页「关于」：体现原生能力自检面板
     from linglong_clip.utils.selfcheck import run_self_check
 

@@ -305,7 +305,8 @@ def test_parser_has_all_modes():
     parser = build_parser()
     options = {action.dest for action in parser._actions}
     for expected in ("quick", "minimized", "list", "search", "get", "stats", "clear",
-                     "compact", "json", "plain", "sync_status", "selfcheck"):
+                     "compact", "json", "plain", "sync_status", "selfcheck",
+                     "config_audit"):
         assert expected in options
 
 
@@ -772,3 +773,48 @@ def test_stats_json_usable_flag_reflects_language_data(cli_env, capsys, monkeypa
     main(["--stats", "--json"])
     payload = json.loads(capsys.readouterr().out)
     assert payload["ocr"]["usable"] is False
+
+
+# ---- 配置项审计（--config-audit）----
+
+
+def test_config_audit_reports_healthy(cli_env, capsys):
+    """当前代码库没有空转配置，退出码 0。"""
+    assert main(["--config-audit"]) == 0
+    out = capsys.readouterr().out
+    assert "配置项审计" in out
+    assert "✓" in out
+
+
+def test_config_audit_json_output(cli_env, capsys):
+    assert main(["--config-audit", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["unread"] == []
+    assert payload["total"] == payload["read_count"]
+
+
+def test_config_audit_exit_code_1_when_dead_keys(cli_env, capsys, monkeypatch):
+    from linglong_clip.utils import config_audit as module
+
+    monkeypatch.setattr(
+        module, "audit_config_usage",
+        lambda *a, **kw: module.AuditReport(unread=["ui.fake"], read_count=3),
+    )
+    assert main(["--config-audit"]) == 1
+    out = capsys.readouterr().out
+    assert "ui.fake" in out
+
+
+def test_config_audit_skips_gui_dispatch(cli_env, monkeypatch):
+    """必须命中 CLI 分支，不能落到 GUI 分支把进程挂住。
+
+    上一轮就有过一个标志没登记到分发表、于是静默挂起（卡 10 分钟超时）
+    的例子，所以新标志都要有这条用例守着。
+    """
+    from linglong_clip.ui import application as app_module
+
+    def boom(*args, **kwargs):
+        raise AssertionError("不该启动 GUI")
+
+    monkeypatch.setattr(app_module, "Application", boom)
+    assert main(["--config-audit"]) == 0

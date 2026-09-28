@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import ctypes
 import threading
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Sequence, Tuple
 
 from ..utils.logger import get_logger
 from ..utils.paths import is_linux, is_macos, is_windows
@@ -97,6 +97,41 @@ WM_HOTKEY = 0x0312
 
 class HotkeyError(Exception):
     pass
+
+
+def expand_hotkey_range(spec: str, *, minimum: int = 1, maximum: int = 9) -> List[str]:
+    """把 `Ctrl+Shift+1..9` 这类带范围的写法摊成具体快捷键列表。
+
+    为什么要支持范围写法：快速粘贴要占 9 个快捷键，让用户在配置里手写 9 行
+    既啰嗦又容易写错序号。声明成一个范围既表达了意图，也让「改前缀」只需改一处。
+
+    只认末尾的 `N..M`（N <= M，且都在 [minimum, maximum] 内）：
+    - 不是范围写法 → 原样返回单元素列表，交给后端按普通快捷键处理
+    - 范围非法（M < N、越界、非数字）→ 返回空列表，调用方据此给出可排查的提示
+
+    空白一律忽略，`Ctrl+Shift+1..9` 与 `ctrl+shift+1..9` 等价。
+    """
+    text = (spec or "").strip()
+    if not text:
+        return []
+    if ".." not in text:
+        return [text]
+
+    prefix, _, tail = text.rpartition("..")
+    if not prefix:
+        return []
+    head, _, start_text = prefix.rpartition("+")
+    if not head:
+        # 「1..9」这种没有修饰键的写法：把它当完整快捷键，不拆
+        return [text]
+    try:
+        start = int(start_text.strip())
+        end = int(tail.strip())
+    except ValueError:
+        return []
+    if start > end or start < minimum or end > maximum:
+        return []
+    return [f"{head.strip()}+{index}" for index in range(start, end + 1)]
 
 
 class HotkeyManager:
@@ -173,6 +208,30 @@ class HotkeyManager:
             callback()
         except Exception:  # noqa: BLE001 - 快捷键回调异常不能拖垮消息循环
             _log.exception("快捷键回调执行失败")
+
+    def unregister(self, sequences: Sequence[str]) -> int:
+        """按快捷键串撤销注册，返回撤销的条数。
+
+        为什么需要「按串撤销」而不只是全撤：快速粘贴是一组快捷键，
+        其中一个注册失败时要把这一组整体回滚 —— 半残状态（1、2 能用、
+        3 不行）比完全没有更难排查。全撤会把主快捷键一起带走。
+        """
+        wanted = {str(sequence).strip() for sequence in sequences if str(sequence).strip()}
+        if not wanted:
+            return 0
+        with self._lock:
+            doomed = [
+                hotkey_id
+                for hotkey_id, (sequence, _) in self._bindings.items()
+                if sequence in wanted
+            ]
+            if not doomed:
+                return 0
+            if self._backend is not None:
+                self._backend.unregister_all(doomed)
+            for hotkey_id in doomed:
+                self._bindings.pop(hotkey_id, None)
+            return len(doomed)
 
     def unregister_all(self) -> None:
         with self._lock:

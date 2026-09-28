@@ -560,3 +560,34 @@ def test_json_path_follows_env_override(home, monkeypatch):
     custom = home / "custom"
     monkeypatch.setenv("LINGLONG_CLIPBOARD_JSON_HOME", str(custom))
     assert paths.json_dir() == custom
+
+
+def test_enforce_limits_pin_immune_false_counts_pinned(repo):
+    """JSON 后端与 SQLite 语义对齐：关闭豁免后固定项也占限额。"""
+    now = time.time()
+    for index in range(10):
+        _add(repo, content=f"c{index}", hash=f"h{index}", created_at=now + index)
+    _add(repo, content="pinned", hash="p", pinned=True, created_at=0)
+
+    assert repo.enforce_limits(max_items=3, pin_immune=False) == 8
+    remaining = {item.content for item in repo.list(limit=100)}
+    assert remaining == {"pinned", "c9", "c8"}
+
+
+def test_enforce_limits_pin_immune_false_by_days(repo):
+    now = time.time()
+    _add(repo, content="old-pinned", hash="op", pinned=True, created_at=now - 40 * 86400)
+    _add(repo, content="new", hash="new", created_at=now)
+
+    assert repo.enforce_limits(max_items=0, max_days=30, pin_immune=False) == 1
+    assert [item.content for item in repo.list(limit=100)] == ["new"]
+
+
+def test_enforce_limits_default_is_pin_immune(repo):
+    now = time.time()
+    _add(repo, content="pinned", hash="p", pinned=True, created_at=0)
+    for index in range(5):
+        _add(repo, content=f"c{index}", hash=f"h{index}", created_at=now + index)
+
+    repo.enforce_limits(max_items=1)
+    assert {item.content for item in repo.list(limit=100)} == {"pinned", "c4"}

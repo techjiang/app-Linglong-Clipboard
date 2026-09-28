@@ -480,24 +480,48 @@ class Storage:
             self._conn.commit()
             return removed
 
-    def enforce_limits(self, max_items: int, max_days: int = 0) -> int:
-        """按条数与天数淘汰历史，固定项不受影响。"""
+    def enforce_limits(
+        self, max_items: int, max_days: int = 0, pin_immune: bool = True
+    ) -> int:
+        """按条数与天数淘汰历史。
+
+        `pin_immune` 控制固定项是否豁免：为真时固定项完全不占限额
+        （淘汰 SQL 一律带 `pinned = 0`），这是老行为。关闭后固定项与普通
+        记录一视同仁，但**排序仍把固定项排前**，所以先被淘汰的仍是久未使用的
+        普通记录 —— 只有历史远超上限时才会轮到固定项。
+
+        为什么保这个开关：上限是「历史别无限涨」的硬约束。若固定项永久豁免，
+        把上万条都标为固定就等于上限失效，而用户未必意识到自己绕过了它。
+        """
         removed = 0
         with self._lock:
             if max_days > 0:
                 cutoff = time.time() - max_days * 86400
-                cursor = self._conn.execute(
-                    "DELETE FROM items WHERE pinned = 0 AND created_at < ?", (cutoff,)
-                )
+                if pin_immune:
+                    sql = "DELETE FROM items WHERE pinned = 0 AND created_at < ?"
+                else:
+                    sql = "DELETE FROM items WHERE created_at < ?"
+                cursor = self._conn.execute(sql, (cutoff,))
                 removed += cursor.rowcount
             if max_items > 0:
-                cursor = self._conn.execute(
-                    "DELETE FROM items WHERE pinned = 0 AND id NOT IN ("
-                    "  SELECT id FROM items WHERE pinned = 0 "
-                    "  ORDER BY COALESCE(NULLIF(used_at,0), created_at) DESC LIMIT ?"
-                    ")",
-                    (max_items,),
-                )
+                # 排序统一把固定项排前，所以关闭豁免时也是普通记录先被淘汰
+                if pin_immune:
+                    sql = (
+                        "DELETE FROM items WHERE pinned = 0 AND id NOT IN ("
+                        "  SELECT id FROM items WHERE pinned = 0 "
+                        "  ORDER BY pinned DESC, "
+                        "    COALESCE(NULLIF(used_at,0), created_at) DESC LIMIT ?"
+                        ")"
+                    )
+                else:
+                    sql = (
+                        "DELETE FROM items WHERE id NOT IN ("
+                        "  SELECT id FROM items "
+                        "  ORDER BY pinned DESC, "
+                        "    COALESCE(NULLIF(used_at,0), created_at) DESC LIMIT ?"
+                        ")"
+                    )
+                cursor = self._conn.execute(sql, (max_items,))
                 removed += cursor.rowcount
             if removed:
                 self._conn.commit()

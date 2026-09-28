@@ -311,3 +311,57 @@ def test_fts_index_rebuilt_for_existing_rows(tmp_path):
     assert second.fts_enabled
     assert len(second.search("历史数据")) == 1
     second.close()
+
+
+def test_enforce_limits_pin_immune_false_counts_pinned(storage):
+    """关闭固定项豁免后，固定项也计入上限。
+
+    排序仍把固定项排前，所以先被淘汰的仍是久未使用的普通记录 ——
+    只有当历史远超上限时才会轮到固定项。
+    """
+    now = time.time()
+    for index in range(10):
+        _add(storage, content=f"c{index}", hash=f"h{index}", created_at=now + index)
+    _add(storage, content="pinned", hash="p", pinned=True, created_at=0)
+
+    removed = storage.enforce_limits(max_items=3, pin_immune=False)
+    remaining = [item.content for item in storage.list(limit=100)]
+    assert removed == 8
+    assert len(remaining) == 3
+    # 固定项排前，最旧的普通记录先被淘汰
+    assert {"pinned", "c9", "c8"} == set(remaining)
+
+
+def test_enforce_limits_pin_immune_false_still_keeps_newest(storage):
+    """关闭豁免时不因固定项存在而少淘汰，保留的仍是排序最前的那几条。"""
+    now = time.time()
+    _add(storage, content="pinned", hash="p", pinned=True, created_at=now - 1000)
+    for index in range(4):
+        _add(storage, content=f"n{index}", hash=f"hn{index}", created_at=now + index)
+
+    storage.enforce_limits(max_items=2, pin_immune=False)
+    remaining = {item.content for item in storage.list(limit=100)}
+    assert remaining == {"pinned", "n3"}
+
+
+def test_enforce_limits_pin_immune_false_by_days(storage):
+    """按天数淘汰时，关闭豁免会让超期的固定项也被清掉。"""
+    now = time.time()
+    _add(storage, content="old-pinned", hash="op", pinned=True, created_at=now - 40 * 86400)
+    _add(storage, content="new", hash="new", created_at=now)
+
+    assert storage.enforce_limits(max_items=0, max_days=30, pin_immune=False) == 1
+    remaining = [item.content for item in storage.list(limit=100)]
+    assert remaining == ["new"]
+
+
+def test_enforce_limits_default_is_pin_immune(storage):
+    """不传 pin_immune 时保持老行为：固定项豁免。"""
+    now = time.time()
+    _add(storage, content="pinned", hash="p", pinned=True, created_at=0)
+    for index in range(5):
+        _add(storage, content=f"c{index}", hash=f"h{index}", created_at=now + index)
+
+    storage.enforce_limits(max_items=1)
+    remaining = {item.content for item in storage.list(limit=100)}
+    assert remaining == {"pinned", "c4"}

@@ -98,6 +98,41 @@ def _my_transform(text: str, option: str = "default") -> Optional[str]:
 跟踪参数名单只在 `core/normalize.py` 里定义一份，
 `automation.py` 的 `url.strip_tracking` 转换器要复用它而不是另抄一份。
 
+### 新增配置项
+
+**加了配置项就一定要有读取方。** 这一点踩过 7 次坑：设置页有勾选框、
+`DEFAULTS` 有默认值、代码里没人读 —— 用户勾了没反应，还以为是自己用错了。
+
+流程：
+
+1. 在 `utils/config.py` 的 `DEFAULTS` 里加键（**只改配置结构时才动
+   `SCHEMA_VERSION`**，新增键不需要，`_deep_merge` 会自动补默认值）
+2. 在 `ui/settings_dialog.py` 里加控件 —— **注意这只算「写回」，不算读取方**
+3. 在真正的业务代码里读它，并在 `Application._on_config_change` 里接上
+   热生效（如果不需要重启的话）
+4. 跑一遍 `python -m linglong_clip --config-audit`，应当无输出且退出码 0
+
+如果配置结构真的变了（键位改名、语义变更），才需要加一档迁移：
+
+```python
+SCHEMA_VERSION = 2
+
+_MIGRATIONS = {
+    2: lambda raw: _rename_key(raw, "ui.old_name", "ui.new_name"),
+}
+```
+
+迁移函数要求：**幂等**、**失败时不破坏数据**、**只读不改传入对象**
+（返回新的 dict）。文件的版本比程序新（用户装回旧版）时不会被改动。
+
+### 修改配置淘汰/截断逻辑
+
+- `history.pin_immune` 要同时改 `core/storage.py`（SQLite）和
+  `core/repository.py`（JSON），两个后端语义必须逐条对齐
+- `capture.max_text_length` 的截断位置**必须在隐私判定之后**：
+  判定读的是完整内容，先截断再判定会让「落在截断线之后的密钥」被放行
+- 淘汰排序一律把固定项排前，这样关闭豁免时先被淘汰的仍是久用的普通记录
+
 ## 测试
 
 ```bash
@@ -114,6 +149,12 @@ pytest tests/test_storage.py -k fts -v               # 单个模块
 - 涉及平台的用例用 `pytest.importorskip`
 - **平台相关代码必须能用仿真原生层测**：假 `user32` / 假 `Quartz` 跑真实链路，
   别用 `monkeypatch` 断言「调用过某方法」。参考 `tests/test_hotkeys.py`。
+- **测不到的行为要换一种验法**：配置项如果没有读取方，就没有可断言的行为。
+  这类守卫用静态审计 + 「在假源码树上验证判据」的方式补，
+  参考 `tests/test_config_audit.py`。
+- **新加 CLI 标志必须有用例守着它不会落到 GUI 分支** ——
+  曾经有个标志没登记到分发表，表现是静默挂起（卡到 10 分钟超时才发现），
+  而不是报错。参考 `tests/test_cli.py::test_selfcheck_skips_gui_dispatch`。
 
 ## 提交
 

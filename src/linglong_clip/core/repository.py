@@ -529,7 +529,10 @@ class JsonRepository:
                 self._maybe_save()
             return removed
 
-    def enforce_limits(self, max_items: int, max_days: int = 0) -> int:
+    def enforce_limits(
+        self, max_items: int, max_days: int = 0, pin_immune: bool = True
+    ) -> int:
+        """与 SQLite 版语义逐条对齐（含 `pin_immune`）。"""
         removed = 0
         with self._lock:
             if max_days > 0:
@@ -537,20 +540,19 @@ class JsonRepository:
                 doomed = [
                     item_id
                     for item_id, item in self._items.items()
-                    if not item.pinned and item.created_at < cutoff
+                    if item.created_at < cutoff and not (pin_immune and item.pinned)
                 ]
                 removed += len(doomed)
                 for item_id in doomed:
                     self._items.pop(item_id, None)
 
             if max_items > 0:
-                # 与 SQLite 版语义一致：上限只约束未固定项，按最近使用排序裁剪
-                unpinned = sorted(
-                    (item for item in self._items.values() if not item.pinned),
-                    key=_sort_key,
-                    reverse=True,
-                )
-                doomed = [item.id for item in unpinned[max_items:]]
+                # 排序把固定项排前，所以只有历史远超上限时固定项才会被裁掉
+                candidates = [item for item in self._items.values()
+                              if not (pin_immune and item.pinned)]
+                survivors = sorted(candidates, key=_sort_key, reverse=True)[:max_items]
+                keep = {item.id for item in survivors}
+                doomed = [item.id for item in candidates if item.id not in keep]
                 removed += len(doomed)
                 for item_id in doomed:
                     self._items.pop(item_id, None)

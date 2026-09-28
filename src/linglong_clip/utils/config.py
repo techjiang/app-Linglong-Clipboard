@@ -11,6 +11,20 @@ from typing import Any, Callable, Dict, List, Optional
 from .logger import get_logger
 from .paths import config_path
 
+#: 当前配置结构版本。**改配置结构时递增它，并在 `_MIGRATIONS` 里补一档转换。**
+#:
+#: 这个键此前只是个摆设：写在 DEFAULTS 里，但没有任何读取方，
+#: 于是「旧版配置需要转换」这件事没有任何地方在做。用户升级后
+#: 老配置文件里的旧键位会被原样保留、新键位拿默认值，两边都对不上。
+SCHEMA_VERSION = 1
+
+#: 版本号 -> 把「上一版的配置」转成「该版的配置」的函数。
+#:
+#: 只在格式真的不兼容时才需要加一档。新增配置项不需要 ——
+#: `_deep_merge` 会用 DEFAULTS 自动补上缺失的键。
+_MIGRATIONS: Dict[int, Callable[[Dict[str, Any]], Dict[str, Any]]] = {}
+
+
 DEFAULTS: Dict[str, Any] = {
     "capture": {
         "enabled": True,
@@ -85,8 +99,10 @@ DEFAULTS: Dict[str, Any] = {
     "automation": {
         "workflows": [],
     },
+    # 注意：schema_version 的实际用途见 `_migrate()`，不要手工改这里的值 ——
+    # 它由 `SCHEMA_VERSION` 单一来源生成，避免两处各写一个数字然后分叉。
     "meta": {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
     },
 }
 
@@ -125,6 +141,48 @@ def _expand_flat_keys(raw: Dict[str, Any]) -> Dict[str, Any]:
     return nested
 
 
+def _migrate(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """把旧版配置逐档升级到当前 `SCHEMA_VERSION`。
+
+    两个刻意的行为：
+
+    - **只升不降**。文件的版本比当前高（用户装回了旧版程序）时不动它，
+      也不报错 —— 降级转换无从写起，硬改只会丢数据。此时保留原版本号，
+      下次升回新版程序仍能继续转换。
+    - **转换函数抛异常时保留原文**。迁移失败不该让用户打不开程序，
+      退回原配置 + 默认值至少还能用，且日志里能看到原因。
+    """
+    meta = raw.get("meta")
+    version = 0
+    if isinstance(meta, dict):
+        try:
+            version = int(meta.get("schema_version") or 0)
+        except (TypeError, ValueError):
+            version = 0
+
+    if version >= SCHEMA_VERSION:
+        return raw
+
+    data = copy.deepcopy(raw)
+    for target in range(version + 1, SCHEMA_VERSION + 1):
+        migrate = _MIGRATIONS.get(target)
+        if migrate is None:
+            continue
+        try:
+            data = migrate(data)
+        except Exception as exc:  # noqa: BLE001 - 迁移失败不能让程序起不来
+            get_logger("config").warning("配置迁移到 v%d 失败，保留原配置: %s", target, exc)
+            return raw
+
+    data.setdefault("meta", {})
+    if not isinstance(data["meta"], dict):
+        data["meta"] = {}
+    data["meta"]["schema_version"] = SCHEMA_VERSION
+    if version:
+        get_logger("config").info("配置已从 v%d 迁移到 v%d", version, SCHEMA_VERSION)
+    return data
+
+
 class Config:
     """线程安全的配置对象，支持 `config.get("ui.theme")` 形式的点号路径。"""
 
@@ -152,7 +210,14 @@ class Config:
                 raw = {}
             if not isinstance(raw, dict):
                 raw = {}
-            self._data = _deep_merge(DEFAULTS, _expand_flat_keys(raw))
+            # 先展开平铺键、再迁移版本、最后与默认值合并：
+            # 顺序反了迁移函数看到的就不是最终形状的配置。
+            expanded = _expand_flat_keys(raw)
+            migrated = _migrate(expanded)
+            self._data = _deep_merge(DEFAULTS, migrated)
+            # 迁移过或补过默认值都要落盘，否则下次启动重复做同一件事
+            if migrated is not raw:
+                self.save()
 
     def save(self) -> None:
         with self._lock:
