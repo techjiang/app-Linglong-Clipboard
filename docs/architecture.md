@@ -104,13 +104,23 @@ JSON 后端的 `_sort_key`），所以先被淘汰的仍是久未使用的普通
 
 | 方法 | 用途 | 缺失时的表现 |
 | --- | --- | --- |
-| `read_primary_text()` | X11/Wayland 主选择区 | 返回空串，该功能不出现 |
+| `read_primary_text()` | X11/Wayland 主选择区 | 返回空串，该功能不出现（开关也会被禁用） |
 | `read_windows()` | 系统剪贴板历史 | 返回空列表，导入入口提示不支持 |
 | `current_focus()` | 来源应用识别 | 来源显示「未知来源」 |
 | `set_transient_text()` | 安全粘贴（限时清除） | 返回 False，改由定时器清空 |
 | `history_exclusion_formats()` | 写入级「不进系统剪贴板历史」的格式名 | 返回空列表，仅依赖限时清空 |
 
 `capabilities()` 返回能力矩阵，供设置页展示与功能降级。
+
+**能力矩阵不是摆设。** 它必须真的参与功能开关：`primary_selection` 为假时，
+设置页里「同时记录主选择区」应被禁用并写明缺什么；`transient_clipboard`
+为真时，写入侧就真的要有对应实现。曾经这两处都写死过 `True` ——
+声明了能力、实现是空的，看任何一处都显示正常。
+
+主选择区的采集在 `ClipboardMonitor` 里走**独立通道**：独立的开关
+（`monitor_primary`）、独立的指纹、独立的节流（`primary_interval_ms`）。
+不共用剪贴板那套的理由是行为差异：剪贴板「变了就是复制了」，
+而主选择区跟着拖选走，读取本身就得充当防抖。
 
 **出站防护**（`core/copy_guard.py`）收在一处：`plan_outbound()` 决定
 「这条内容复制出去要不要挂排除标记、要不要限时清空」，`ClipboardReleaser`

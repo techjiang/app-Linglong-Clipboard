@@ -132,6 +132,7 @@ class NativeSelfCheck:
             lambda: self._check_clipboard_probe(backend),
             lambda: self._check_focus(backend),
             lambda: self._check_outbound_guard(backend),
+            lambda: self._check_primary_selection(backend),
             self._check_hotkey_backend,
             self._check_hotkey_probe,
             self._check_ocr,
@@ -271,6 +272,43 @@ class NativeSelfCheck:
                 "在设置 → 隐私 里设定「剪贴板自动清空」可减少暴露窗口",
             )
         return CheckResult("出站防护（复制敏感内容）", OK, "；".join(parts))
+
+    @staticmethod
+    def _check_primary_selection(backend) -> CheckResult:
+        """主选择区（Linux PRIMARY）是否真的读得到。
+
+        与能力矩阵的区别：能力矩阵回答「按声明算能不能用」，
+        这里回答「现在这一秒读一次能不能读到」。两者会不一致 ——
+        X11 下声明可用、但 X 服务器刚断掉时读就是空。
+        读取本身是只读的，不改写任何选择区内容。
+        """
+        try:
+            caps = backend.capabilities()
+        except Exception as exc:  # noqa: BLE001
+            return CheckResult("主选择区读取", FAIL, f"能力探测失败：{exc!r}")
+
+        if not caps.get("primary_selection", False):
+            return CheckResult(
+                "主选择区读取",
+                DEGRADED,
+                "本机无可用通道（X11 需 python-xlib 或 xclip/xsel；Wayland 需 wl-clipboard）",
+                "「选中即记录」不可用；仅影响该可选功能，采集与检索不受影响",
+            )
+
+        reader = getattr(backend, "read_primary_text", None)
+        if reader is None:
+            return CheckResult("主选择区读取", FAIL, "后端未提供 read_primary_text()")
+        try:
+            text = reader()
+        except Exception as exc:  # noqa: BLE001
+            return CheckResult("主选择区读取", FAIL, f"读取失败：{exc!r}")
+        if text:
+            return CheckResult("主选择区读取", OK, f"读到 {len(text)} 字符")
+        return CheckResult(
+            "主选择区读取",
+            OK,
+            "通道可用，当前选择区为空（没有未复制的选中内容）",
+        )
 
     def _check_hotkey_backend(self) -> CheckResult:
         manager = self._make_hotkeys()

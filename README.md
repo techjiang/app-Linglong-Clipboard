@@ -296,7 +296,7 @@ linglong-clipboard --merge-duplicates  # 重算 + 合并（含历史里的存量
 | 剪贴板采集 | ✅ 事件驱动（1s 兜底轮询） | ✅ 轮询 | ✅ 轮询 | ✅ 轮询 |
 | 原生剪贴板读写 | ✅ Win32 | ✅ Xlib/xclip | ✅ wl-paste | ✅ pbpaste/pbcopy |
 | 来源应用识别 | ✅ Win32 | ✅ Xlib/xdotool | ⚠️ 受限 | ✅ osascript |
-| 主选择区（PRIMARY） | — | ✅ | ✅ wl-paste | — |
+| 主选择区（PRIMARY） | — | ✅ 可选 | ✅ 可选 | — |
 | 系统剪贴板历史导入 | ✅ Win10 1809+ 文本 | — | — | — |
 | 安全粘贴标记 | ✅ 系统级 | — | — | ⚠️ 定时清空（有条件） |
 | 不进系统剪贴板历史 | ✅ 写入时声明 | — | — | — |
@@ -313,6 +313,8 @@ linglong-clipboard --merge-duplicates  # 重算 + 合并（含历史里的存量
   未授权时降级并给出可执行的授权路径
 - **Linux/Wayland**：协议不允许抓全局按键，需在桌面环境自行绑定
   `linglong-clipboard --quick`
+- **Linux 主选择区**：X11 / Wayland 上「选中文字」与「复制」是两条互不相干的
+  通道。开启后选中即记入历史，不必再按 `Ctrl+C`（默认关闭，见下）
 
 #### 系统剪贴板历史导入（Windows）
 
@@ -564,6 +566,14 @@ linglong-clipboard --config-audit --json   # 机器可读，退出码 0/1
   不会出现「1、2 能用、3 不行」这种半残状态
 - **列表密度**：`舒适` 三行信息（含来源/时间/标签），`紧凑` 两行、
   一屏多看几条。只影响显示，采集与检索结果一条不少
+- **同时记录主选择区**：Linux 上「选中文字」与「复制」是两条独立通道。
+  开启后选中即入历史；**默认关闭**，因为并非所有用户都想让工具记录
+  每一次拖选。不支持主选择区的平台（Windows/macOS、
+  无 `xclip`/`xsel`/`wl-clipboard` 的 X11）上开关会被禁用并写明原因，
+  而不是给一个勾了没反应的复选框
+- **主选择区间隔**：主选择区有独立的读取节流（默认 1s，比剪贴板慢）。
+  拖选一段长文本时每一帧内容都在变，按剪贴板那个间隔读会把中间状态
+  全存下来；调慢之后，读取本身就充当防抖，用户停手那一版才会入库
 
 配置结构本身也有版本号了（`meta.schema_version`）。此前它只是个摆设：
 写在默认值里但没人读，于是「旧版配置需要转换」这件事没有任何地方在做。
@@ -657,6 +667,7 @@ linglong-clipboard --recanonicalize          # 按归一规则重算历史指纹
 linglong-clipboard --normalize '<文本>'      # 预览归一结果（排查为何没合并）
 linglong-clipboard --quick                   # 唤起快速粘贴浮层
 linglong-clipboard --minimized               # 启动后最小化到托盘
+linglong-clipboard --monitor-primary         # 选中文字即记录（Linux 主选择区）
 linglong-clipboard --storage-status          # 历史存在哪（SQLite 还是 JSON）
 linglong-clipboard --where                   # 只输出数据目录路径
 linglong-clipboard --storage json            # 切换存储方式
@@ -679,8 +690,11 @@ linglong-clipboard --outbound --json          # 同上，JSON 输出便于回帖
 可以塞进脚本里判断。它在换机器部署或报障时第一个该跑的命令 ——
 「快捷键没反应」「截图搜不到字」这类问题不必翻日志。
 
-自检覆盖后端探测、能力矩阵、剪贴板读写、前台窗口、**出站防护**、
+自检覆盖后端探测、能力矩阵、剪贴板读写、**主选择区**、前台窗口、**出站防护**、
 全局快捷键注册与**截图 OCR**。
+主选择区一项查的是「**这一秒真的读得到吗**」，而不只是看能力矩阵的声明 ——
+两者会不一致：X11 下声明可用、但 X 服务器刚断掉时读就是空。
+
 OCR 一项查的是「真的能识别吗」，而不是「tesseract 在不在 PATH 里」：
 
 ```

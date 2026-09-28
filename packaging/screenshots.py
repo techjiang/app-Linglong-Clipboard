@@ -176,6 +176,20 @@ def main() -> int:
         window.resize(1180, 720)
         _render(window, OUT / name)
 
+    # 设置页「采集」：主选择区开关与系统历史导入都在这一页
+    capture_dialog = SettingsDialog(
+        _config({"capture.monitor_primary": True}), automation
+    )
+    capture_dialog.resize(760, 700)
+    # 截图里并到「支持」的那一档，否则 Linux 无头环境下永远显示禁用。
+    # 注意顺序：先禁用门控、再勾选，否则 setChecked 会被探测结果抹掉。
+    capture_dialog._monitor_primary.setEnabled(True)
+    capture_dialog._monitor_primary.setChecked(True)
+    capture_dialog._primary_status.setText(
+        "可用 · 选中文字即进历史，与剪贴板记录走同一套隐私判定"
+    )
+    _render(capture_dialog, OUT / "settings-capture-primary.png")
+
     # 设置页「关于」：体现原生能力自检面板
     from linglong_clip.utils.selfcheck import run_self_check
 

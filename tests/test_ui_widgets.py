@@ -1254,3 +1254,78 @@ def test_settings_saves_auto_clear_seconds(qt_app, home):
     dialog._auto_clear.setValue(90)
     dialog._save()
     assert config.get("privacy.sensitive_auto_clear_seconds") == 90
+
+
+# ------------------------------------------------- 主选择区设置项
+
+def test_settings_primary_disabled_when_unsupported(qt_app, home, monkeypatch):
+    """本机读不到主选择区时，开关要被禁用并说清原因。
+
+    留一个能勾但勾了没反应的复选框，比不给这个选项更糟：
+    用户会以为功能坏了，而不是「这台机器没有这条通道」。
+    """
+    import linglong_clip.platform as platform_module
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    class _NoPrimary:
+        name = "linux"
+
+        def capabilities(self):
+            return {"primary_selection": False}
+
+    monkeypatch.setattr(platform_module, "detect_backend", lambda: _NoPrimary())
+
+    config = Config(home / "config.json")
+    config.set("capture.monitor_primary", True)  # 配置里开着，但本机不支持
+    dialog = SettingsDialog(config)
+
+    assert dialog._monitor_primary.isEnabled() is False
+    # 不支持时必须把勾去掉，否则界面显示「已开启」而实际永远不会生效
+    assert dialog._monitor_primary.isChecked() is False
+    assert "不可用" in dialog._primary_status.text()
+    assert "wl-clipboard" in dialog._primary_status.text()
+
+
+def test_settings_primary_enabled_when_supported(qt_app, home, monkeypatch):
+    import linglong_clip.platform as platform_module
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    class _WithPrimary:
+        name = "linux"
+
+        def capabilities(self):
+            return {"primary_selection": True}
+
+    monkeypatch.setattr(platform_module, "detect_backend", lambda: _WithPrimary())
+
+    config = Config(home / "config.json")
+    dialog = SettingsDialog(config)
+    assert dialog._monitor_primary.isEnabled() is True
+    assert "可用" in dialog._primary_status.text()
+
+    dialog._monitor_primary.setChecked(True)
+    dialog._primary_interval.setValue(1500)
+    dialog._save()
+
+    assert config.get("capture.monitor_primary") is True
+    assert config.get("capture.primary_interval_ms") == 1500
+
+
+def test_settings_survives_probe_failure(qt_app, home, monkeypatch):
+    """探测抛异常不能让设置页打不开。"""
+    import linglong_clip.platform as platform_module
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    class _Exploding:
+        name = "linux"
+
+        def capabilities(self):
+            raise RuntimeError("X 服务器断了")
+
+    monkeypatch.setattr(platform_module, "detect_backend", lambda: _Exploding())
+
+    dialog = SettingsDialog(Config(home / "config.json"))
+    assert dialog._monitor_primary.isEnabled() is False

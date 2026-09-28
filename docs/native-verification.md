@@ -18,6 +18,51 @@
 
 ---
 
+## 零、Linux 主选择区（可在本机验证）
+
+主选择区（PRIMARY）是 Linux 独有的第二条内容通道：**选中即生效**，
+不需要按 `Ctrl+C`。它和剪贴板互不相干，所以有独立的开关与独立节流。
+
+这一段与前两处的区别是：**它能在 Linux 上真跑**，不必等真机。
+方法是在一个真实 X 会话里起持有者，再看程序读到了什么。
+
+```bash
+# 1. 起一个 X 会话（有桌面则跳过，直接用 DISPLAY）
+Xvfb :99 -screen 0 1280x800x24 &
+export DISPLAY=:99
+
+# 2. 让某个客户端持有主选择区
+printf '选中即记录：真实 X11 会话验证' | xclip -selection primary -i &
+
+# 3. 看自检怎么说
+linglong-clipboard --selfcheck          # 应有「主选择区读取：读到 N 字符」
+linglong-clipboard --stats              # 应有「主选择区：已启用/未启用（可用 · 后端 linux）」
+```
+
+要验的是**真的被记下来**，而不是「读得到」：
+
+```bash
+linglong-clipboard --monitor-primary &   # 开启后选中文字即入历史
+printf '随手选中的一段话' | xclip -selection primary -i
+linglong-clipboard --list -n 3           # 应看到这条
+```
+
+必须手验的几条：
+
+| 检查 | 预期 |
+| --- | --- |
+| 拖选一段长文本（按住鼠标划过去再松手） | **只记下松手那一版**，中间的半截不该入库 |
+| 选中一段私钥（`-----BEGIN RSA PRIVATE KEY-----…`） | **不进历史**；`--stats` 里记录数不变 |
+| 关掉设置页的「同时记录主选择区」后选中文字 | 不再新增记录；重新打开后，关闭期间选中的内容**不会补采** |
+| 无 `xclip`/`xsel`/`python-xlib` 的 X11 会话 | 设置页开关**禁用**并写明缺什么，而不是给个勾了没反应的框 |
+| Windows / macOS | 设置页开关禁用（这两平台没有主选择区） |
+| Wayland（装了 `wl-clipboard`） | 开关可用；选中文字能被记录 |
+
+Wayland 上还有一条平台自身的限制：不装 `wl-clipboard` 时读不到主选择区，
+此时自检会报**降级**而不是失败 —— 这是设计内的，不是故障。
+
+---
+
 ## 一、先跑自检（任何平台）
 
 ```bash
@@ -39,6 +84,8 @@ Python：3.11.2
   ✓ 后端能力矩阵：primary_selection=否、native_history=否、focus_detection=否（0.1ms）
   ~ 剪贴板原生读取：X11 会话下未找到 Xlib / xclip / xsel（0.0ms）
       提示：读取失败会回落到 Qt 剪贴板，功能仍可用
+  ~ 主选择区读取：本机无可用通道（X11 需 python-xlib 或 xclip/xsel；Wayland 需 wl-clipboard）（0.1ms）
+      提示：「选中即记录」不可用；仅影响该可选功能，采集与检索不受影响
   ~ 前台窗口识别：未取到前台窗口（0.0ms）
       提示：无图形会话（SSH / 无桌面）时属正常；有桌面却为空则需排查
   ~ 全局快捷键后端：linux-x11 当前不可用（3.7ms）

@@ -115,13 +115,23 @@ class Application(QObject):
     #: 采集线程 -> 主线程
     item_captured = Signal(object, str)
 
-    def __init__(self, argv: list, *, start_minimized: bool = False) -> None:
+    def __init__(
+        self,
+        argv: list,
+        *,
+        start_minimized: bool = False,
+        monitor_primary: bool = False,
+    ) -> None:
         super().__init__()
         self._argv = argv
         #: CLI 的 `--minimized` 是显式指令；没给时由 `ui.start_minimized` 决定，
         #: 在 `run()` 里解析（那时配置已加载）。
         self._start_minimized = start_minimized
         self._start_minimized_explicit = start_minimized
+        #: CLI 的 `--monitor-primary` 同样是显式指令，优先级高于配置。
+        #: 与 `--minimized` 一样只在构造时生效，不写回配置文件 ——
+        #: 一次性的命令行参数不该悄悄改掉用户的持久设置。
+        self._monitor_primary_explicit = monitor_primary
         #: 实际注册成功的快速粘贴快捷键（注册失败时为空）
         self._quick_hotkey_sequences: List[str] = []
         self._shutting_down = False
@@ -180,6 +190,11 @@ class Application(QObject):
             interval_ms=int(self.config.get("capture.poll_interval_ms", 300)),
             on_capture=self._on_capture_threadsafe,
             backend=self.backend,
+            monitor_primary=self._monitor_primary_explicit
+            or self._resolve_monitor_primary(),
+            primary_interval_ms=int(
+                self.config.get("capture.primary_interval_ms", 1000)
+            ),
             gui_invoke=self._invoker.call,
         )
         #: 复制出站后的收尾（标记不进系统历史、限时清空）
@@ -196,6 +211,11 @@ class Application(QObject):
         self._setup_native_event_filter()
         self._setup_timers()
         self._install_hotkeys()
+
+        if monitor_primary:
+            # 让设置页显示的状态与实际行为一致：开关是「生效中」的，
+            # 否则用户会看到界面说关、程序却在采集主选择区。
+            self.config.set("capture.monitor_primary", True)
 
         self.config.on_change(self._on_config_change)
 
@@ -226,6 +246,25 @@ class Application(QObject):
         self.storage.set_image_data(
             relative, f"data:image/png;base64,{base64.b64encode(data).decode('ascii')}"
         )
+
+    def _resolve_monitor_primary(self) -> bool:
+        """是否采集主选择区（Linux PRIMARY）。
+
+        两个条件都要满足：用户在设置里开了 `capture.monitor_primary`，
+        **且**当前后端真的读得到主选择区。只看配置会在 Windows/macOS 上
+        留下一个永远无效的开关 —— 同前几轮的 `transient_clipboard` 写死 True。
+        后端探测失败一律算「不支持」，而不是让开关悬在那里。
+        """
+        if not bool(self.config.get("capture.monitor_primary", False)):
+            return False
+        reader = getattr(self.backend, "read_primary_text", None)
+        if reader is None:
+            return False
+        try:
+            caps = self.backend.capabilities()
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(caps.get("primary_selection", False))
 
     def _device_name(self) -> str:
         import socket
@@ -824,6 +863,7 @@ class Application(QObject):
             self.config.get("ui.card_density", "comfortable")
         )
         self.monitor.set_interval(int(self.config.get("capture.poll_interval_ms", 300)))
+        self.monitor.set_monitor_primary(self._resolve_monitor_primary())
         if "sync.folder" in dialog.changes or "sync.encrypt" in dialog.changes:
             self.sync = self._build_sync()
         if self.config.get("sync.enabled", False) and self.sync is not None:
@@ -869,6 +909,11 @@ class Application(QObject):
     def _on_config_change(self, key: str, value) -> None:
         if key == "capture.poll_interval_ms":
             self.monitor.set_interval(int(value))
+        elif key in ("capture.monitor_primary", "capture.primary_interval_ms"):
+            self.monitor._primary_interval = max(
+                100, int(self.config.get("capture.primary_interval_ms", 1000))
+            ) / 1000.0
+            self.monitor.set_monitor_primary(self._resolve_monitor_primary())
         elif key == "capture.enabled":
             if value:
                 self.monitor.resume()

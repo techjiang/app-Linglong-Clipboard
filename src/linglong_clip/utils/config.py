@@ -31,6 +31,12 @@ DEFAULTS: Dict[str, Any] = {
         "types": ["text", "rich", "image", "file", "link", "color"],
         "max_text_length": 200_000,
         "poll_interval_ms": 300,
+        # 主选择区（X11/Wayland PRIMARY，选中即生效）是否也采集。
+        # 只监听剪贴板时，不应该因为「我选了一段文字」就被记下来。
+        "monitor_primary": False,
+        # 主选择区的独立节流，比剪贴板慢：拖选过程中每一帧都在变，
+        # 按剪贴板那个间隔读会把中间态全存下来。
+        "primary_interval_ms": 1_000,
     },
     "history": {
         "max_items": 2_000,

@@ -5,6 +5,10 @@ X11/Wayland/macOS 都需要轮询或原生扩展。默认 300ms 一次，
 每次只做「序列号/内容指纹比对」，实测 CPU 占用可忽略。
 Windows 上若注册了 `AddClipboardFormatListener`，Qt 层会把事件喂给 `on_native_event`，
 此时自动跳过本轮轮询比对。
+
+除剪贴板（CLIPBOARD）外，Linux 还有一个独立的**主选择区**（PRIMARY，选中即生效）。
+它和剪贴板是两条互不相干的通道，所以有独立的指纹与独立的开关
+（`monitor_primary`）：只要求监听剪贴板时，不该因为选了一段文字就被记下来。
 """
 
 from __future__ import annotations
@@ -41,6 +45,8 @@ class ClipboardMonitor:
         interval_ms: int = 300,
         on_capture: Optional[Callable[[ClipboardItem], None]] = None,
         backend=None,
+        monitor_primary: bool = False,
+        primary_interval_ms: int = 1000,
         clock: Callable[[], float] = time.time,
         gui_invoke: Optional[Callable[[Callable[[], object], bool], object]] = None,
     ) -> None:
@@ -61,6 +67,12 @@ class ClipboardMonitor:
         self._paused = False
         self._event_driven = False
         self._capture_count = 0
+
+        #: 主选择区（Linux）采集开关与独立节流
+        self._monitor_primary = bool(monitor_primary)
+        self._primary_interval = max(100, int(primary_interval_ms)) / 1000.0
+        self._primary_last_hash = ""
+        self._primary_last_at = 0.0
 
     # ---- 生命周期 ----
 
@@ -103,9 +115,21 @@ class ClipboardMonitor:
         self._paused = False
         # 恢复时重置基线，避免把暂停期间的剪贴板内容当成新内容
         self._last_hash = ""
+        self._primary_last_hash = ""
 
     def set_interval(self, interval_ms: int) -> None:
         self._interval = max(60, int(interval_ms)) / 1000.0
+
+    @property
+    def monitors_primary(self) -> bool:
+        return self._monitor_primary
+
+    def set_monitor_primary(self, enabled: bool) -> None:
+        """开关主选择区采集，供设置页热切换。"""
+        self._monitor_primary = bool(enabled)
+        # 关掉再打开时重置基线：这期间选中的内容不该被当成新的
+        self._primary_last_hash = ""
+        _log.info("主选择区采集已%s", "启用" if self._monitor_primary else "停用")
 
     def set_event_driven(self, enabled: bool) -> None:
         """Windows 原生监听生效后置为 True。
@@ -146,6 +170,10 @@ class ClipboardMonitor:
                     self._poll_once()
                 except Exception:  # noqa: BLE001 - 采集线程必须活下去
                     _log.exception("采集循环出错")
+                try:
+                    self._poll_primary_once()
+                except Exception:  # noqa: BLE001
+                    _log.exception("主选择区采集出错")
             self._stop_event.wait(self._interval)
 
     def _prime(self) -> None:
@@ -168,6 +196,41 @@ class ClipboardMonitor:
                 return
             self._last_hash = fingerprint
             self._last_change_at = self._clock()
+
+        self._capture_count += 1
+        if self._on_capture:
+            try:
+                self._on_capture(item)
+            except Exception:  # noqa: BLE001
+                _log.exception("采集回调执行失败")
+
+    def _poll_primary_once(self) -> None:
+        """采集主选择区（Linux PRIMARY）。
+
+        为什么不复用剪贴板那套「每次轮询都读」：主选择区跟着鼠标选中走，
+        用户拖选一段长文本的过程中每一帧都是「变化」，按 300ms 读会
+        把中间态全存下来，也会让 X 选择请求持续被打断。
+        所以这里独立节流（默认 1s）——**读取本身就充当防抖**：
+        拖选过程中的内容几乎不会被读到，用户停下来之后那一版才会被采到。
+        """
+        # `_paused` 是「暂停采集」的总开关，两条通道都得认。
+        # 只在 `_run` 里判外层不够：`on_native_event` 与测试都是直接调本方法的。
+        if self._paused or not self._monitor_primary or self._backend is None:
+            return
+        now = self._clock()
+        if now - self._primary_last_at < self._primary_interval:
+            return
+        self._primary_last_at = now
+
+        item = self.read_primary()
+        if item is None or item.is_empty:
+            return
+        fingerprint = self._fingerprint(item)
+        with self._lock:
+            if fingerprint == self._primary_last_hash:
+                return
+            self._primary_last_hash = fingerprint
+            self._last_change_at = now
 
         self._capture_count += 1
         if self._on_capture:
@@ -208,6 +271,9 @@ class ClipboardMonitor:
         if not text or len(text) > 100_000:
             return None
         item = ClipboardItem(kind="text", content=text, hash=content_hash("text", text))
+        # 标记来源通道，便于界面区分「复制来的」还是「选中就记下的」，
+        # 也让这条记录在隐私判定里被正常对待（判定读的是内容，与此无关）。
+        item.metadata["clipboard_channel"] = "primary"
         return item
 
 

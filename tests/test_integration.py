@@ -305,3 +305,120 @@ def test_legacy_records_repaired_by_cli_flow(storage, config):
     assert storage.count() == 1
     # 原始文本未被改写
     assert storage.list()[0].content in urls
+
+
+# ------------------------------------------------- 主选择区（选中即记录）
+
+class _PrimaryOnlyBackend:
+    """只提供主选择区读取的后端，模拟「选中一段文字，没按 Ctrl+C」。"""
+
+    name = "linux"
+
+    def __init__(self, text: str = ""):
+        self.text = text
+
+    def read_primary_text(self):
+        return self.text
+
+    def capabilities(self):
+        return {"primary_selection": True}
+
+    def current_focus(self):
+        return FocusInfo()
+
+
+def test_primary_selection_reaches_storage_and_search(storage, config, home):
+    """端到端：选中即被记下，并且能被检索到。
+
+    这是整条链路的重点 —— 之前 `read_primary()` 只被测试调用过，
+    monitor 从来不读主选择区，所以「选中即记录」从来没有真正发生过。
+    """
+    from linglong_clip.core.monitor import ClipboardMonitor
+
+    backend = _PrimaryOnlyBackend("随手选中的一段配置说明")
+    collector = Collector(storage, config, PrivacyGuard(config), device_name="itest")
+    captured = []
+    clock = [1000.0]
+
+    monitor = ClipboardMonitor(
+        type("C", (), {"read_clipboard": lambda self: None})(),
+        interval_ms=60,
+        backend=backend,
+        monitor_primary=True,
+        primary_interval_ms=500,
+        on_capture=lambda item: captured.append(
+            collector.process(item, FocusInfo(app_id="gedit"))
+        ),
+        clock=lambda: clock[0],
+    )
+
+    monitor._poll_primary_once()
+    assert len(captured) == 1
+    outcome, saved = captured[0]
+    assert outcome == CAPTURED
+    assert saved.source_app == "gedit"
+
+    engine = SemanticEngine(storage)
+    assert len(engine.search("随手选中")) == 1
+
+
+def test_primary_selection_goes_through_privacy_guard(storage, config, home):
+    """主选择区不是绕过隐私判定的后门。
+
+    选中一段私钥时，行为和「复制一段私钥」必须完全一致 ——
+    两条通道最终都走 `Collector.process()`，这才是有保证的。
+    """
+    from linglong_clip.core.monitor import ClipboardMonitor
+
+    pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"
+    backend = _PrimaryOnlyBackend(pem)
+    collector = Collector(storage, config, PrivacyGuard(config), device_name="itest")
+    results = []
+    clock = [1000.0]
+
+    monitor = ClipboardMonitor(
+        type("C", (), {"read_clipboard": lambda self: None})(),
+        interval_ms=60,
+        backend=backend,
+        monitor_primary=True,
+        primary_interval_ms=500,
+        on_capture=lambda item: results.append(
+            collector.process(item, FocusInfo(app_id="vim"))
+        ),
+        clock=lambda: clock[0],
+    )
+    monitor._poll_primary_once()
+
+    assert len(results) == 1
+    assert results[0][0] == SKIPPED_PRIVACY
+    assert storage.count() == 0
+
+
+def test_primary_selection_dedupes_against_clipboard(storage, config, home):
+    """同一段内容先被选中、再被复制，应合并成一条而不是两条。"""
+    from linglong_clip.core.monitor import ClipboardMonitor
+    from linglong_clip.core.models import content_hash
+
+    collector = Collector(storage, config, PrivacyGuard(config), device_name="itest")
+    text = "同一段内容"
+    clock = [1000.0]
+
+    backend = _PrimaryOnlyBackend(text)
+    monitor = ClipboardMonitor(
+        type("C", (), {"read_clipboard": lambda self: None})(),
+        interval_ms=60,
+        backend=backend,
+        monitor_primary=True,
+        primary_interval_ms=500,
+        on_capture=lambda item: collector.process(item),
+        clock=lambda: clock[0],
+    )
+    monitor._poll_primary_once()
+
+    # 随后用户按了 Ctrl+C，走的还是同一套指纹
+    from linglong_clip.core.models import ClipboardItem
+
+    copied = ClipboardItem(kind="text", content=text, hash=content_hash("text", text))
+    outcome, _ = collector.process(copied)
+    assert outcome == "merged"
+    assert storage.count() == 1

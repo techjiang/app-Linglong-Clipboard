@@ -24,6 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
             "示例：\n"
             "  linglong-clipboard                  启动图形界面\n"
             "  linglong-clipboard --quick          唤起快速粘贴浮层\n"
+            "  linglong-clipboard --monitor-primary  选中文字即记录（Linux）\n"
             "  linglong-clipboard --list -n 20     列出最近 20 条\n"
             "  linglong-clipboard --search '上周的截图'\n"
             "  linglong-clipboard --get 12         输出第 12 条内容\n"
@@ -44,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
     mode = parser.add_argument_group("运行模式")
     mode.add_argument("--quick", action="store_true", help="启动后直接唤起快速粘贴浮层")
     mode.add_argument("--minimized", action="store_true", help="启动后最小化到系统托盘")
+    mode.add_argument(
+        "--monitor-primary",
+        action="store_true",
+        help="启动时开启主选择区采集（选中即记录，Linux X11/Wayland）",
+    )
 
     query = parser.add_argument_group("查询")
     query.add_argument("--list", action="store_true", help="列出历史记录")
@@ -346,6 +352,42 @@ def _print_items(items, *, as_json: bool, plain: bool, limit: int) -> None:
         )
 
 
+def _primary_status(config) -> dict:
+    """主选择区（Linux PRIMARY）当前状态，供 `--stats` 与 JSON 输出使用。"""
+    enabled = bool(config.get("capture.monitor_primary", False))
+    from .platform import detect_backend
+
+    try:
+        backend = detect_backend()
+        caps = backend.capabilities()
+        supported = bool(caps.get("primary_selection", False))
+        backend_name = getattr(backend, "name", "unknown")
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "enabled": enabled,
+            "supported": False,
+            "backend": "unknown",
+            "detail": f"探测失败：{exc!r}",
+            "warning": "无法确认本机是否支持主选择区" if enabled else "",
+        }
+
+    if supported:
+        detail = f"可用 · 后端 {backend_name}"
+    else:
+        detail = "本机无可用通道（X11 需 python-xlib 或 xclip/xsel；Wayland 需 wl-clipboard）"
+
+    warning = ""
+    if enabled and not supported:
+        warning = "已开启但本机读不到，选中文字不会进历史"
+    return {
+        "enabled": enabled,
+        "supported": supported,
+        "backend": backend_name,
+        "detail": detail,
+        "warning": warning,
+    }
+
+
 def _run_outbound(args: argparse.Namespace, config) -> int:
     """报出「复制敏感内容出去」时实际生效的防护。
 
@@ -436,6 +478,8 @@ def _run_cli(args: argparse.Namespace) -> int:
         stats = storage.stats()
         ocr_status = build_engine(config).status()
         stats["ocr"] = ocr_status
+        primary_status = _primary_status(config)
+        stats["primary_selection"] = primary_status
         if args.json:
             print(json.dumps(stats, ensure_ascii=False, indent=2))
         else:
@@ -466,6 +510,13 @@ def _run_cli(args: argparse.Namespace) -> int:
                 print(f"截图 OCR：不可用（{ocr_status['detail']}，截图将无法被文字搜索）")
             else:
                 print("截图 OCR：不可用（未找到 tesseract，截图将无法被文字搜索）")
+            # 主选择区：开关开着但本机读不到时必须说出来，
+            # 否则用户只会看到「我勾了，但选中文字没进历史」
+            line = f"主选择区：{'已启用' if primary_status['enabled'] else '未启用'}"
+            line += f"（{primary_status['detail']}）"
+            if primary_status["warning"]:
+                line += f"\n          注意：{primary_status['warning']}"
+            print(line)
         storage.close()
         return 0
 
@@ -899,7 +950,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         return 2
 
-    app = Application([sys.argv[0]], start_minimized=args.minimized)
+    app = Application(
+        [sys.argv[0]],
+        start_minimized=args.minimized,
+        monitor_primary=args.monitor_primary,
+    )
     if args.quick:
         app.show_quick_paste()
     return app.run()

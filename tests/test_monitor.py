@@ -226,3 +226,153 @@ def test_read_primary_returns_item():
 def test_read_primary_skips_empty():
     monitor = ClipboardMonitor(FakeClipboard(), interval_ms=60, backend=FakeBackend())
     assert monitor.read_primary() is None
+
+
+# ------------------------------------------------- 主选择区（Linux PRIMARY）
+
+class FakePrimaryBackend:
+    """能动态改主选择区内容的后端，用来跑「选中 -> 变化」的真实链路。"""
+
+    def __init__(self, text: str = ""):
+        self.text = text
+        self.reads = 0
+
+    def read_primary_text(self):
+        self.reads += 1
+        return self.text
+
+    def current_focus(self):
+        return FocusInfo()
+
+
+def _primary_monitor(backend, captured, clock, **kwargs):
+    return ClipboardMonitor(
+        FakeClipboard(),
+        interval_ms=60,
+        backend=backend,
+        monitor_primary=True,
+        primary_interval_ms=kwargs.pop("primary_interval_ms", 1000),
+        on_capture=captured.append,
+        clock=clock,
+        **kwargs,
+    )
+
+
+def test_primary_disabled_by_default():
+    """没有显式开启时，主选择区不该被采集 —— 否则选中即入库会让人措手不及。"""
+    backend = FakePrimaryBackend("选中的一段话")
+    captured = []
+    monitor = ClipboardMonitor(
+        FakeClipboard(), interval_ms=60, backend=backend, on_capture=captured.append
+    )
+    monitor._poll_primary_once()
+    assert captured == []
+    assert backend.reads == 0
+    assert monitor.monitors_primary is False
+
+
+def test_primary_captures_selection():
+    clock = [1000.0]
+    backend = FakePrimaryBackend("选中的一段话")
+    captured = []
+    monitor = _primary_monitor(backend, captured, lambda: clock[0])
+
+    monitor._poll_primary_once()
+    assert len(captured) == 1
+    assert captured[0].content == "选中的一段话"
+    # 来源通道被标记出来，界面才能区分「复制来的」和「选中的」
+    assert captured[0].metadata["clipboard_channel"] == "primary"
+    # 且它必须带上 hash —— 没有 hash 的记录无法参与去重，会每次重选都新增一条
+    assert captured[0].hash
+
+    # 内容没变，再轮询不该重复采集
+    clock[0] += 2.0
+    monitor._poll_primary_once()
+    assert len(captured) == 1
+
+
+def test_primary_throttles_between_reads():
+    """间隔内不读，避免拖选过程中每一帧都被采下来。"""
+    clock = [1000.0]
+    backend = FakePrimaryBackend("第一版")
+    captured = []
+    monitor = _primary_monitor(backend, captured, lambda: clock[0], primary_interval_ms=1000)
+
+    monitor._poll_primary_once()
+    assert backend.reads == 1
+
+    clock[0] += 0.3  # 还没到 1s
+    backend.text = "第二版"
+    monitor._poll_primary_once()
+    assert backend.reads == 1, "间隔内不该发起读取"
+    assert len(captured) == 1
+
+    clock[0] += 0.8  # 累计 1.1s
+    monitor._poll_primary_once()
+    assert backend.reads == 2
+    assert [item.content for item in captured] == ["第一版", "第二版"]
+
+
+def test_primary_ignores_empty_and_backend_error():
+    clock = [1000.0]
+
+    class Broken:
+        def read_primary_text(self):
+            raise RuntimeError("X 服务器断了")
+
+    monitor = ClipboardMonitor(
+        FakeClipboard(),
+        interval_ms=60,
+        backend=Broken(),
+        monitor_primary=True,
+        primary_interval_ms=100,
+        clock=lambda: clock[0],
+    )
+    # 后端抛异常不能把采集线程带走
+    monitor._poll_primary_once()
+
+    monitor2 = _primary_monitor(FakePrimaryBackend(""), [], lambda: clock[0])
+    monitor2._poll_primary_once()
+    assert monitor2.read_primary() is None
+
+
+def test_primary_toggle_resets_baseline():
+    """关了再开，这期间选中的内容不该被当成新的采下来。"""
+    clock = [1000.0]
+    backend = FakePrimaryBackend("旧的选中内容")
+    captured = []
+    monitor = _primary_monitor(backend, captured, lambda: clock[0])
+    monitor._poll_primary_once()
+    assert len(captured) == 1
+
+    monitor.set_monitor_primary(False)
+    backend.text = "关闭期间选中的"
+    clock[0] += 5.0
+    monitor._poll_primary_once()
+    assert len(captured) == 1, "关掉后不该再采"
+
+    monitor.set_monitor_primary(True)
+    clock[0] += 5.0
+    monitor._poll_primary_once()
+    assert [item.content for item in captured] == ["旧的选中内容", "关闭期间选中的"]
+
+
+def test_primary_pause_does_not_capture():
+    clock = [1000.0]
+    backend = FakePrimaryBackend("暂停前")
+    captured = []
+    monitor = _primary_monitor(backend, captured, lambda: clock[0])
+    monitor.pause()
+    monitor._poll_primary_once()
+    assert captured == []
+
+    monitor.resume()
+    monitor._poll_primary_once()
+    assert [item.content for item in captured] == ["暂停前"]
+
+
+def test_primary_skipped_without_backend():
+    monitor = ClipboardMonitor(
+        FakeClipboard(), interval_ms=60, backend=None, monitor_primary=True
+    )
+    monitor._poll_primary_once()  # 不该抛

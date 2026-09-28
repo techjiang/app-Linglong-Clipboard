@@ -522,3 +522,70 @@ def test_run_self_check_accepts_config():
         backend=HealthBackend(), hotkeys_factory=lambda: FakeHotkeys(), config=_Cfg()
     )
     assert _ocr_result(report) is not None
+
+
+# ------------------------------------------------- 主选择区自检
+
+class _PrimaryBackend:
+    name = "linux"
+
+    def __init__(self, caps=True, text="选中内容", explode=False):
+        self._caps = caps
+        self._text = text
+        self._explode = explode
+        self.reads = 0
+
+    def capabilities(self):
+        return {"primary_selection": self._caps}
+
+    def read_primary_text(self):
+        self.reads += 1
+        if self._explode:
+            raise RuntimeError("X 连接断了")
+        return self._text
+
+
+def _primary_result(backend):
+    report = NativeSelfCheck(backend=backend).run()
+    return next(r for r in report.results if r.name == "主选择区读取")
+
+
+def test_primary_check_ok_when_readable():
+    backend = _PrimaryBackend(text="选中的一段文字")
+    result = _primary_result(backend)
+    assert result.status == OK
+    assert "字符" in result.detail
+
+
+def test_primary_check_ok_when_selection_empty():
+    """通道可用但当前没有选中内容 —— 这是正常状态，不是故障。"""
+    result = _primary_result(_PrimaryBackend(text=""))
+    assert result.status == OK
+    assert "为空" in result.detail
+
+
+def test_primary_check_degraded_when_unsupported():
+    result = _primary_result(_PrimaryBackend(caps=False))
+    assert result.status == DEGRADED
+    assert "wl-clipboard" in result.detail
+    # 必须说清「这只是一个可选功能」，否则用户会以为采集坏了
+    assert "不受影响" in result.hint
+
+
+def test_primary_check_fail_when_read_raises():
+    """能力声明为可用、真读却失败 —— 这正是能力矩阵看不出来的那类问题。"""
+    result = _primary_result(_PrimaryBackend(explode=True))
+    assert result.status == FAIL
+    assert "读取失败" in result.detail
+
+
+def test_primary_check_fail_when_capabilities_raises():
+    class _Broken:
+        name = "linux"
+
+        def capabilities(self):
+            raise RuntimeError("没救了")
+
+    result = _primary_result(_Broken())
+    assert result.status == FAIL
+    assert "能力探测失败" in result.detail

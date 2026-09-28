@@ -934,3 +934,105 @@ def test_outbound_reports_system_mechanism_when_present(cli_env, monkeypatch, ca
     out = capsys.readouterr().out
     assert "ExcludeClipboardContentFromMonitorProcessing" in out
     assert "不进系统剪贴板历史" in out
+
+
+# ------------------------------------------------- 主选择区（--stats / 自检）
+
+def test_stats_reports_primary_selection_unsupported(cli_env, capsys, monkeypatch):
+    """本机读不到主选择区时要说清楚，而不是只报「未启用」。"""
+    import linglong_clip.platform as platform_module
+
+    class _NoPrimary:
+        name = "linux"
+
+        def capabilities(self):
+            return {"primary_selection": False}
+
+        def read_primary_text(self):
+            return ""
+
+    monkeypatch.setattr(platform_module, "detect_backend", lambda: _NoPrimary())
+
+    assert main(["--stats"]) == 0
+    out = capsys.readouterr().out
+    assert "主选择区" in out
+    assert "未启用" in out
+    assert "无可用通道" in out
+
+
+def test_stats_warns_when_primary_enabled_but_unreadable(cli_env, capsys, monkeypatch):
+    """开关开着但本机读不到 —— 必须直说，否则用户只会以为功能坏了。"""
+    import linglong_clip.platform as platform_module
+
+    class _NoPrimary:
+        name = "linux"
+
+        def capabilities(self):
+            return {"primary_selection": False}
+
+        def read_primary_text(self):
+            return ""
+
+    monkeypatch.setattr(platform_module, "detect_backend", lambda: _NoPrimary())
+
+    from linglong_clip.utils.config import Config
+    from linglong_clip.utils.paths import data_dir
+
+    config = Config(data_dir() / "config.json")
+    config.set("capture.monitor_primary", True)
+
+    assert main(["--stats"]) == 0
+    out = capsys.readouterr().out
+    assert "已启用" in out
+    assert "注意" in out
+    assert "不会进历史" in out
+
+
+def test_stats_json_includes_primary_selection(cli_env, capsys, monkeypatch):
+    import linglong_clip.platform as platform_module
+
+    class _WithPrimary:
+        name = "linux"
+
+        def capabilities(self):
+            return {"primary_selection": True}
+
+        def read_primary_text(self):
+            return "选中内容"
+
+    monkeypatch.setattr(platform_module, "detect_backend", lambda: _WithPrimary())
+
+    assert main(["--stats", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["primary_selection"]["supported"] is True
+    assert payload["primary_selection"]["backend"] == "linux"
+
+
+def test_stats_survives_backend_probe_failure(cli_env, capsys, monkeypatch):
+    """平台探测抛异常时统计仍要出得来 —— 这正是最需要它的时候。"""
+    import linglong_clip.platform as platform_module
+
+    class _Exploding:
+        name = "linux"
+
+        def capabilities(self):
+            raise RuntimeError("X 服务器断了")
+
+    monkeypatch.setattr(platform_module, "detect_backend", lambda: _Exploding())
+
+    assert main(["--stats"]) == 0
+    out = capsys.readouterr().out
+    assert "记录总数" in out
+    assert "探测失败" in out or "无可用通道" in out
+
+
+def test_monitor_primary_flag_reaches_cli_branch():
+    """新标志必须命中 CLI/启动分支。
+
+    `--merge-duplicates` 当初就是漏了这步，静默落到 GUI 分支挂住，
+    表现不是报错而是卡死 —— 加标志时最容易漏的一步。
+    """
+    from linglong_clip.__main__ import build_parser
+
+    args = build_parser().parse_args(["--monitor-primary"])
+    assert args.monitor_primary is True

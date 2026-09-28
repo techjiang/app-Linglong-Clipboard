@@ -121,6 +121,37 @@ class SettingsDialog(QDialog):
         )
         form.addRow("单条最大字符数", self._max_length)
 
+        self._monitor_primary = QCheckBox("同时记录主选择区（选中即记录）")
+        self._monitor_primary.setChecked(
+            bool(self._config.get("capture.monitor_primary", False))
+        )
+        self._monitor_primary.setToolTip(
+            "Linux（X11 / Wayland）上「选中文字」和「复制」是两条互不相干的通道。\n"
+            "开启后，选中一段文字就会进历史，不必再按 Ctrl+C。\n"
+            "拖选过程中的中间状态不会被记下（读取本身即防抖）。"
+        )
+        form.addRow("", self._monitor_primary)
+
+        self._primary_status = QLabel()
+        self._primary_status.setWordWrap(True)
+        form.addRow("主选择区", self._primary_status)
+        self._refresh_primary_state()
+        # 勾选状态直接跟随可用性：不支持时禁用，而不是留一个按了没反应的开关
+        self._monitor_primary.toggled.connect(self._refresh_primary_state)
+
+        self._primary_interval = QSpinBox()
+        self._primary_interval.setRange(100, 10_000)
+        self._primary_interval.setSingleStep(100)
+        self._primary_interval.setSuffix(" ms")
+        self._primary_interval.setValue(
+            int(self._config.get("capture.primary_interval_ms", 1000))
+        )
+        self._primary_interval.setToolTip(
+            "主选择区的读取间隔，默认比剪贴板慢。\n"
+            "拖选一段长文本时每一帧内容都不同，间隔太短会把中间状态也记下来。"
+        )
+        form.addRow("主选择区间隔", self._primary_interval)
+
         layout.addWidget(group)
 
         history_group = QGroupBox("历史保留")
@@ -252,6 +283,35 @@ class SettingsDialog(QDialog):
                 )
         except Exception:  # noqa: BLE001 - 状态展示失败不该挡住设置页
             self._ocr_status.setText("无法探测（不影响其它功能）")
+
+    def _refresh_primary_state(self) -> None:
+        """探测主选择区到底读不读得到，并据此决定开关是否可动。
+
+        只说「支持/不支持」是不够的：X11 会话下没有 Xlib 也没有
+        xclip/xsel 时，能力矩阵就是 False，此时唯一诚实的说法是
+        「本机读不到」+ 怎么办，而不是给一个勾上也没用的复选框。
+        """
+        try:
+            from ..platform import detect_backend
+
+            backend = detect_backend()
+            caps = backend.capabilities()
+            supported = bool(caps.get("primary_selection", False))
+        except Exception:  # noqa: BLE001 - 探测失败不该挡住设置页
+            supported = False
+
+        self._monitor_primary.setEnabled(supported)
+        if supported:
+            self._primary_status.setText(
+                "可用 · 选中文字即进历史，与剪贴板记录走同一套隐私判定"
+            )
+            return
+
+        self._monitor_primary.setChecked(False)
+        self._primary_status.setText(
+            "不可用 · 本机没有可读主选择区的通道（X11 需要 python-xlib "
+            "或 xclip / xsel；Wayland 需要 wl-clipboard）"
+        )
 
     def _build_native_history_group(self) -> QGroupBox:
         """系统剪贴板历史导入：补齐本工具启动之前复制的记录。
@@ -941,6 +1001,8 @@ class SettingsDialog(QDialog):
             "capture.types": [kind for kind, box in self._type_boxes.items() if box.isChecked()],
             "capture.poll_interval_ms": self._poll_interval.value(),
             "capture.max_text_length": self._max_length.value(),
+            "capture.monitor_primary": self._monitor_primary.isChecked(),
+            "capture.primary_interval_ms": self._primary_interval.value(),
             "history.max_items": self._max_items.value(),
             "history.max_days": self._max_days.value(),
             "history.merge_duplicates": self._merge_dup.isChecked(),
