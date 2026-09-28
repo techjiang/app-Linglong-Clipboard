@@ -818,3 +818,119 @@ def test_config_audit_skips_gui_dispatch(cli_env, monkeypatch):
 
     monkeypatch.setattr(app_module, "Application", boom)
     assert main(["--config-audit"]) == 0
+
+
+# ------------------------------------------- 出站防护（复制敏感内容）
+
+
+def test_outbound_skips_gui_dispatch(cli_env, monkeypatch):
+    """必须命中 CLI 分支，不能落到 GUI 分支把进程挂住。
+
+    这一条的代价曾经真实发生过：`--merge-duplicates` 漏登记分发表，
+    表现是静默挂住（卡到超时才发现），而不是报错。
+    """
+    from linglong_clip.ui import application as app_module
+
+    def boom(*args, **kwargs):
+        raise AssertionError("不该启动 GUI")
+
+    monkeypatch.setattr(app_module, "Application", boom)
+    assert main(["--outbound"]) == 0
+
+
+def test_outbound_works_with_corrupted_history(cli_env, capsys):
+    """历史文件损坏时仍要能跑。
+
+    这条命令回答的是「原生能力能不能用」，不该被历史文件挡住 ——
+    那恰恰是最需要它的时候。与 `--selfcheck` 同样的理由。
+    """
+    (cli_env / "history.db").write_bytes(b"this is not a sqlite database at all")
+    assert main(["--outbound"]) == 0
+    assert "写入级系统排除" in capsys.readouterr().out
+
+
+def test_outbound_reports_platform_and_means(cli_env, capsys):
+    assert main(["--outbound"]) == 0
+    out = capsys.readouterr().out
+    assert "写入级系统排除" in out
+    assert "限时清空" in out
+    assert "出站脱敏" in out
+
+
+def test_outbound_states_limits_honestly(cli_env, capsys):
+    """必须写明「不是擦除痕迹」—— 用户不能把密钥托付给这条路。"""
+    main(["--outbound"])
+    out = capsys.readouterr().out
+    assert "缩小暴露窗口" in out
+    assert "不落盘" in out
+
+
+def test_outbound_json_shape(cli_env, capsys):
+    assert main(["--outbound", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload) >= {
+        "platform",
+        "backend",
+        "history_exclusion_formats",
+        "auto_clear_seconds",
+        "redact_on_copy_out",
+    }
+    assert isinstance(payload["history_exclusion_formats"], list)
+
+
+def test_outbound_reports_auto_clear_off(cli_env, capsys):
+    """关掉自动清空后必须说出来，不能让用户以为还在防。"""
+    from linglong_clip.utils.config import Config
+
+    Config().set("privacy.sensitive_auto_clear_seconds", 0)
+    main(["--outbound"])
+    out = capsys.readouterr().out
+    assert "限时清空：关闭" in out
+
+
+def test_outbound_reports_redact_enabled(cli_env, capsys):
+    from linglong_clip.utils.config import Config
+
+    Config().set("privacy.redact_on_copy_out", True)
+    main(["--outbound"])
+    assert "出站脱敏：已开启" in capsys.readouterr().out
+
+
+def test_outbound_survives_exclusion_probe_failure(cli_env, monkeypatch, capsys):
+    """探测排除格式失败也要给出其余结论，不能整体报错。"""
+    import linglong_clip.platform as platform_module
+
+    class _Exploding:
+        name = "exploding"
+
+        def platform_label(self):
+            return "测试平台"
+
+        def history_exclusion_formats(self):
+            raise RuntimeError("探测炸了")
+
+    monkeypatch.setattr(platform_module, "detect_backend", lambda: _Exploding())
+    assert main(["--outbound"]) == 0
+    out = capsys.readouterr().out
+    assert "探测炸了" in out
+    assert "限时清空" in out
+
+
+def test_outbound_reports_system_mechanism_when_present(cli_env, monkeypatch, capsys):
+    """有系统机制时必须报出来 —— 这是 README 承诺的那一条。"""
+    import linglong_clip.platform as platform_module
+
+    class _WithExclusion:
+        name = "win-like"
+
+        def platform_label(self):
+            return "Windows"
+
+        def history_exclusion_formats(self):
+            return ["ExcludeClipboardContentFromMonitorProcessing"]
+
+    monkeypatch.setattr(platform_module, "detect_backend", lambda: _WithExclusion())
+    main(["--outbound"])
+    out = capsys.readouterr().out
+    assert "ExcludeClipboardContentFromMonitorProcessing" in out
+    assert "不进系统剪贴板历史" in out

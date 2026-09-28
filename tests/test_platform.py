@@ -1,5 +1,7 @@
 """平台适配层：后端探测、能力矩阵、降级。"""
 
+import ctypes
+
 import pytest
 
 from linglong_clip.platform import ClipboardBackend, NullBackend, detect_backend
@@ -1178,3 +1180,258 @@ def test_windows_is_available_follows_user32(monkeypatch):
     assert backend.is_available() is True
     monkeypatch.setattr(win_module, "user32", None)
     assert backend.is_available() is False
+
+
+# --------------------------------------------- Windows 限时剪贴板（安全粘贴）
+
+
+class _FakeWin32Transient(_FakeWin32Full):
+    """可用的假 user32：支持 EmptyClipboard / SetClipboardData / GetClipboardData。
+
+    剪贴板文本与「排除格式」分开记，便于断言「两件事都做了，顺序还对」。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.clipboard_text = ""
+        self.emptied = 0
+        self.set_data = []
+        self.empty_ok = True
+        self.text_handle = 0xB0B
+        self.closed = 0
+        self.set_ok = True
+
+    def CloseClipboard(self):  # noqa: N802
+        self.closed += 1
+        return True
+
+    def EmptyClipboard(self):  # noqa: N802
+        self.emptied += 1
+        self.clipboard_text = ""
+        return self.empty_ok
+
+    def SetClipboardData(self, fmt, handle):  # noqa: N802
+        self.calls.append(("SetClipboardData", fmt))
+        self.set_data.append(fmt)
+        # 模拟系统行为：内容写入后剪贴板里就有了它，之后 read_text 才读得到。
+        # 不做这一步，「到期时比对内容是否仍是自己写的」这条路径根本走不到。
+        if fmt == 13 and self._last_written is not None:
+            self.clipboard_text = self._last_written
+        return self.set_ok
+
+    #: 由测试的 kernel32 在 `memmove` 之后填入，代表「本次要写的内容」
+    _last_written = None
+
+    def GetClipboardData(self, fmt):  # noqa: N802
+        """只有 CF_UNICODETEXT 才返回值；其余格式返回 0。
+
+        返回的是**真实内存地址** —— `read_text` 用 `ctypes.wstring_at`
+        按 NUL 结尾读宽字符，给个假整数会读到非法地址。
+        """
+        if fmt == 13 and self.clipboard_text:
+            self._text_buffer = ctypes.create_unicode_buffer(self.clipboard_text)
+            return ctypes.addressof(self._text_buffer)
+        return 0
+
+
+class _FakeKernel32Transient(_FakeKernel32Full):
+    """假 kernel32：`GlobalLock` 返回一块**真实的**可写缓冲。
+
+    必须给真缓冲 —— `_write_text_native` 用 `ctypes.memmove` 往锁定的地址
+    拷贝，返回假整数指针会让 `memmove` 解引用非法地址并直接把测试进程打崩。
+    """
+
+    def __init__(self, fake_user):
+        super().__init__(fake_user)
+        self.buffers = {}
+
+    def GlobalAlloc(self, flags, size):  # noqa: N802
+        handle = 0x1234 + len(self.buffers)
+        # 多留一字节，`wstring_at` 依赖 NUL 结尾
+        self.buffers[handle] = ctypes.create_string_buffer(size + 2)
+        return handle
+
+    def GlobalLock(self, handle):  # noqa: N802
+        """`handle` 既可能是分配出来的句柄，也可能已经是 `GetClipboardData`
+        返回的地址（真实 Win32 里后者本来就是可锁定的内存块句柄）。
+        两种都要能锁。
+        """
+        buffer = self.buffers.get(handle)
+        if buffer is None:
+            if handle >= 0x10000:
+                return handle  # 已经是有效地址
+            return 0
+        return ctypes.addressof(buffer)
+
+    def GlobalUnlock(self, handle):  # noqa: N802
+        return True
+
+    def GlobalFree(self, handle):  # noqa: N802
+        self.buffers.pop(handle, None)
+        return 0
+
+
+def _transient_backend(monkeypatch):
+    from linglong_clip.platform import windows as win_module
+
+    user = _FakeWin32Transient()
+    kernel = _FakeKernel32Transient(user)
+    backend = win_module.WindowsBackend.__new__(win_module.WindowsBackend)
+    backend._listener_hwnd = 0
+    backend._registered = False
+    backend._sequence = 0
+    backend._timers = []
+    monkeypatch.setattr(win_module, "user32", user)
+    monkeypatch.setattr(win_module, "kernel32", kernel)
+    return backend, user, kernel
+
+
+def _read_back(kernel, handle: int) -> str:
+    """从假 kernel32 的缓冲里取出刚写入的宽字符串。"""
+    buffer = kernel.buffers.get(handle)
+    return buffer.raw.decode("utf-16-le").split("\x00")[0] if buffer else ""
+
+
+def test_windows_transient_write_marks_and_writes(monkeypatch):
+    """限时剪贴板必须先挂排除格式再写内容。
+
+    顺序反了的话，系统会在内容写入后、标记挂上前先把它记进历史，
+    而历史里的东西取不回来 —— 那就等于没排除。
+    """
+    backend, user, _ = _transient_backend(monkeypatch)
+    assert backend.is_transient_supported() is True
+    assert backend.set_transient_text("secret", expire_ms=0) is True
+
+    # 排除格式确实挂上了
+    registered = [c for c in user.calls if isinstance(c, tuple)]
+    from linglong_clip.platform import windows as win_module
+
+    assert (
+        "RegisterClipboardFormatW",
+        win_module.CLIPBOARD_FORMAT_EXCLUDE_MONITOR,
+    ) in registered
+    # 也在同一次打开里写入了内容
+    assert 13 in user.set_data
+    assert user.emptied == 1
+
+
+def test_windows_transient_requires_native_libs(monkeypatch):
+    from linglong_clip.platform import windows as win_module
+
+    backend, _, _ = _transient_backend(monkeypatch)
+    monkeypatch.setattr(win_module, "kernel32", None)
+    assert backend.is_transient_supported() is False
+    assert backend.set_transient_text("x", expire_ms=100) is False
+
+
+def test_windows_transient_open_failure(monkeypatch):
+    backend, user, _ = _transient_backend(monkeypatch)
+    user.open_ok = False
+    assert backend.set_transient_text("x", expire_ms=100) is False
+    assert user.closed == 0  # 打不开就不该瞎关
+
+
+def test_windows_transient_closes_clipboard(monkeypatch):
+    backend, user, _ = _transient_backend(monkeypatch)
+    backend.set_transient_text("x", expire_ms=0)
+    assert user.closed == 1
+
+
+def test_windows_transient_schedules_expiry(monkeypatch):
+    backend, user, _ = _transient_backend(monkeypatch)
+    backend.set_transient_text("secret", expire_ms=20)
+    assert len(backend._timers) == 1
+    assert backend._timers[0].is_alive()
+
+
+def test_windows_transient_expiry_clears_when_unchanged(monkeypatch):
+    """到期时内容仍是自己写的那份 → 清空。"""
+    import time
+
+    backend, user, _ = _transient_backend(monkeypatch)
+    backend.set_transient_text("secret", expire_ms=20)
+    user.clipboard_text = "secret"
+    time.sleep(0.15)
+    # 清空通过 set_text_native("") 完成，最终应写回空串
+    assert user.emptied >= 2
+
+
+def test_windows_transient_expiry_keeps_user_copy(monkeypatch):
+    """用户在我们写入后又复制了别的东西，过期清理不能删掉它。"""
+    import time
+
+    backend, user, _ = _transient_backend(monkeypatch)
+    backend.set_transient_text("secret", expire_ms=20)
+    user.clipboard_text = "用户后来的复制"
+    before = user.emptied
+    time.sleep(0.15)
+    assert user.emptied == before
+
+
+def test_windows_transient_zero_expiry_does_not_schedule(monkeypatch):
+    backend, user, _ = _transient_backend(monkeypatch)
+    assert backend.set_transient_text("x", expire_ms=0) is True
+    assert backend._timers == []
+
+
+def test_windows_timer_list_does_not_grow(monkeypatch):
+    import time
+
+    backend, user, _ = _transient_backend(monkeypatch)
+    for _ in range(5):
+        backend.set_transient_text("x", expire_ms=20)
+    time.sleep(0.15)
+    backend.set_transient_text("y", expire_ms=5)
+    assert len(backend._timers) <= 2
+
+
+def test_windows_read_text_returns_unicode(monkeypatch):
+    backend, user, _ = _transient_backend(monkeypatch)
+    user.clipboard_text = "剪贴板里的中文"
+    assert backend.read_text() == "剪贴板里的中文"
+
+
+def test_windows_read_text_empty_when_no_handle(monkeypatch):
+    backend, user, _ = _transient_backend(monkeypatch)
+    user.clipboard_text = ""
+    assert backend.read_text() == ""
+
+
+def test_windows_read_text_without_libs(monkeypatch):
+    from linglong_clip.platform import windows as win_module
+
+    backend, _, _ = _transient_backend(monkeypatch)
+    monkeypatch.setattr(win_module, "user32", None)
+    assert backend.read_text() == ""
+
+
+def test_windows_read_text_open_failure(monkeypatch):
+    backend, user, _ = _transient_backend(monkeypatch)
+    user.open_ok = False
+    assert backend.read_text() == ""
+
+
+def test_windows_empty_clipboard_failure(monkeypatch):
+    backend, user, _ = _transient_backend(monkeypatch)
+    user.empty_ok = False
+    assert backend.set_transient_text("x", expire_ms=0) is False
+
+
+def test_windows_write_exception_contained(monkeypatch):
+    backend, user, _ = _transient_backend(monkeypatch)
+
+    def _boom(fmt, handle):
+        raise OSError("写不了")
+
+    monkeypatch.setattr(user, "SetClipboardData", _boom)
+    assert backend.set_transient_text("x", expire_ms=0) is False
+
+
+def test_windows_transient_capabilities_match_implementation(monkeypatch):
+    """能力矩阵必须与实现一致：不能再出现「声称支持、实际没实现」。"""
+    from linglong_clip.platform import windows as win_module
+
+    backend, _, _ = _transient_backend(monkeypatch)
+    assert backend.capabilities()["transient_clipboard"] is True
+    monkeypatch.setattr(win_module, "kernel32", None)
+    assert backend.capabilities()["transient_clipboard"] is False

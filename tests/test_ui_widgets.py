@@ -1172,3 +1172,85 @@ def test_settings_flag_panel_survives_broken_store(qt_app, home):
     dialog = SettingsDialog(config)
     # 不抛异常即可，读数退化为 0
     assert dialog._count_pinned() == 0
+
+
+# ---- 出站防护（复制敏感内容）----
+
+
+def test_settings_outbound_hint_reports_missing_mechanism(qt_app, home):
+    """本平台没有系统排除机制时必须说出来，不能让用户以为已经防住了。"""
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    dialog = SettingsDialog(config)
+    dialog._exclusion_formats_override = []
+    dialog._auto_clear.setValue(30)
+    dialog._refresh_outbound_hint()
+
+    text = dialog._auto_clear_hint.text()
+    assert "没有" in text and "机制" in text
+    assert "30 秒清空剪贴板" in text
+
+
+def test_settings_outbound_hint_reports_system_mechanism(qt_app, home):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    dialog = SettingsDialog(config)
+    dialog._exclusion_formats_override = ["ExcludeClipboardContentFromMonitorProcessing"]
+    dialog._refresh_outbound_hint()
+
+    assert "系统级" in dialog._auto_clear_hint.text()
+
+
+def test_settings_outbound_hint_warns_when_clear_disabled(qt_app, home):
+    """关掉自动清空后要明说「会一直留在剪贴板」，而不是静默什么都不做。"""
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    dialog = SettingsDialog(config)
+    dialog._exclusion_formats_override = []
+    dialog._auto_clear.setValue(0)
+
+    assert "一直留在剪贴板" in dialog._auto_clear_hint.text()
+
+
+def test_settings_outbound_hint_updates_on_change(qt_app, home):
+    """改数值要立刻反映，不用等保存 —— 否则用户判断不了有没有生效。"""
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    dialog = SettingsDialog(config)
+    dialog._exclusion_formats_override = []
+    dialog._auto_clear.setValue(120)
+    assert "120 秒清空剪贴板" in dialog._auto_clear_hint.text()
+
+
+def test_settings_outbound_hint_survives_backend_probe_failure(qt_app, home, monkeypatch):
+    """探测后端失败不能让设置页打不开。"""
+    from linglong_clip.platform import base as base_module
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    def _boom():
+        raise RuntimeError("探测炸了")
+
+    monkeypatch.setattr(base_module, "detect_backend", _boom, raising=False)
+    dialog = SettingsDialog(Config(home / "config.json"))
+    # 不抛异常即可
+    assert dialog._auto_clear_hint.text() != ""
+
+
+def test_settings_saves_auto_clear_seconds(qt_app, home):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    dialog = SettingsDialog(config)
+    dialog._auto_clear.setValue(90)
+    dialog._save()
+    assert config.get("privacy.sensitive_auto_clear_seconds") == 90

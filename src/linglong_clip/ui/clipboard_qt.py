@@ -179,13 +179,25 @@ class QtClipboardAdapter:
 
     # ---- 写入 ----
 
-    def write_item(self, item: ClipboardItem, *, plain_text_only: bool = False) -> bool:
+    def write_item(
+        self,
+        item: ClipboardItem,
+        *,
+        plain_text_only: bool = False,
+        exclude_from_history: bool = False,
+    ) -> bool:
         """把一条记录写回系统剪贴板。
 
         `plain_text_only=True` 时优先写纯文本：粘贴到终端等场景下，
         带 HTML 的剪贴板会被插入大量样式噪音。
+
+        `exclude_from_history=True` 时附带系统级的「不进剪贴板历史」标记。
+        这件事**只能在写入时做**：内容一旦被系统历史记下，就没有任何接口
+        能把它取出来。所以隐私相关的出站都走这个开关，而不是事后补救。
         """
         mime = QMimeData()
+        if exclude_from_history:
+            self._mark_excluded(mime)
 
         if item.kind == "image" and item.image_path:
             image = self._load_image(item.image_path)
@@ -202,8 +214,13 @@ class QtClipboardAdapter:
             self._clipboard.setMimeData(mime)
             return True
 
+        # 纯文本分支也必须复用同一个 mime。
+        # 此前这里走的是 `self.set_text(item.content)`，把刚挂上的排除格式
+        # 连同 mime 一起丢掉了 —— 结果是「标记逻辑写了，但只对带 HTML 的
+        # 内容生效」，而敏感内容恰好绝大多数都是纯文本。
         if plain_text_only or not item.html:
-            self.set_text(item.content)
+            mime.setText(item.content)
+            self._clipboard.setMimeData(mime)
             return True
 
         mime.setHtml(item.html)
@@ -211,8 +228,51 @@ class QtClipboardAdapter:
         self._clipboard.setMimeData(mime)
         return True
 
-    def set_text(self, text: str) -> None:
+    def set_text(self, text: str, *, exclude_from_history: bool = False) -> None:
+        """写纯文本。`exclude_from_history` 时带上系统排除标记。
+
+        带标记时走 `setMimeData` 而不是 `setText`：后者无法携带自定义
+        格式，系统就看不到「别记这条」的声明。
+        """
+        if exclude_from_history:
+            mime = QMimeData()
+            mime.setText(text)
+            if self._mark_excluded(mime):
+                self._clipboard.setMimeData(mime)
+                return
         self._clipboard.setText(text, QClipboard.Mode.Clipboard)
+
+    # ---- 系统剪贴板历史排除 ----
+
+    def _exclusion_formats(self) -> List[str]:
+        """本平台声明的「不进系统剪贴板历史」格式名。
+
+        能力探测失败返回空列表而不是抛出：探测不该拦住写入 ——
+        内容是用户明确要复制的，这里失败的结果最多是「没挂上标记」。
+        """
+        getter = getattr(self._backend, "history_exclusion_formats", None)
+        if getter is None:
+            return []
+        try:
+            return [str(name) for name in (getter() or []) if name]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _mark_excluded(self, mime: QMimeData) -> bool:
+        """给剪贴板数据挂上排除格式，返回是否挂上了。
+
+        使用 `QClipboard` 而不是自己调 `OpenClipboard`：Qt 写入时会
+        自己开关剪贴板，自定义格式名会经 `RegisterClipboardFormatW`
+        映射过去。这样不必和 Qt 抢剪贴板的所有权 —— 抢的结果通常是
+        两边都写不进去。
+
+        格式的**值必须为空**：系统只检查格式是否存在。
+        塞入真实数据反而会变成一块内容，被历史当成条目存下来。
+        """
+        names = self._exclusion_formats()
+        for name in names:
+            mime.setData(name, QByteArray())
+        return bool(names)
 
     def clear(self) -> None:
         self._clipboard.clear(QClipboard.Mode.Clipboard)

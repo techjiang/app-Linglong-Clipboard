@@ -15,6 +15,7 @@ from __future__ import annotations
 import ctypes
 import ntpath
 import os
+import threading
 from ctypes import wintypes
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -129,6 +130,8 @@ class WindowsBackend(ClipboardBackend):
         self._listener_hwnd = listener_hwnd
         self._registered = False
         self._sequence = 0
+        #: 限时清空的定时器。长期运行必须清掉已结束的，否则列表无限增长
+        self._timers: List[threading.Timer] = []
 
     def is_available(self) -> bool:
         return user32 is not None
@@ -138,7 +141,10 @@ class WindowsBackend(ClipboardBackend):
             "primary_selection": False,
             "native_history": self.is_history_supported(),
             "focus_detection": True,
-            "transient_clipboard": True,
+            # 必须跟着实现走：此前这里写死 True，而 `set_transient_text`
+            # 从未实现，Linux 上跑不到的这条声明也就没人发现 ——
+            # 与 macOS 那个写死 `transient_clipboard: True` 是同一个毛病。
+            "transient_clipboard": self.is_transient_supported(),
             "wayland": False,
         }
 
@@ -274,10 +280,90 @@ class WindowsBackend(ClipboardBackend):
     # ---- 安全粘贴 ----
 
     def is_transient_supported(self) -> bool:
-        return user32 is not None
+        """能否做到「写入后限时清除」。
 
-    def exclude_from_history(self) -> None:
-        """在剪贴板已打开的前提下，标记内容不进历史与云同步。"""
+        这里必须与 `set_transient_text()` 的实现同步：此前它只判断
+        `user32 is not None`，却在 Linux 上给出「支持」的结论 ——
+        和 macOS 那个写死 `transient_clipboard: True` 是同一个毛病。
+        """
+        return user32 is not None and kernel32 is not None
+
+    def history_exclusion_formats(self) -> List[str]:
+        """Windows 的系统级「不进剪贴板历史」标记。
+
+        挂上这个格式后，系统会跳过剪贴板历史与云同步 —— 这是目前
+        唯一能**在写入时**声明「别记这条」的机制。内容一旦进了历史，
+        任何工具都取不出来，所以只能靠这一步。
+        """
+        return [CLIPBOARD_FORMAT_EXCLUDE_MONITOR]
+
+    def set_transient_text(self, text: str, expire_ms: int = 0) -> bool:
+        """写入剪贴板，让系统在 `expire_ms` 后丢弃它。
+
+        与 macOS 版本的两处关键差别：
+
+        1. **期限交给系统**。凭据上调用 `SetClipboardData` 时附带
+           `CF_DSP` 语义的延迟渲染不可靠，所以这里用 Win32 的
+           `OpenClipboard` + `EmptyClipboard` 原生写入，并在写入前
+           挂上排除格式，避免内容先被历史记一份。
+        2. **清理仍是进程内的**。Windows 没有「到点自动清空」的公开接口，
+           所以到期清空仍由本地定时器执行，进程退出后不再发生。
+           这一点必须说清，不能当作「密钥擦除」。
+
+        返回 False 表示原生写入不可用，调用方应退回 Qt 写入 + 自行定时。
+        """
+        if user32 is None or kernel32 is None:
+            return False
+        if not self.open_clipboard():
+            return False
+        try:
+            if not self._write_text_native(text):
+                return False
+            # 排除标记必须与内容在同一次打开里挂上 —— 关掉剪贴板后再挂
+            # 就晚了，系统已经读过一遍内容。
+            self._mark_excluded()
+        finally:
+            self.close_clipboard()
+
+        if expire_ms <= 0:
+            return True
+
+        def _expire() -> None:
+            # 只在内容仍是我们写的那份时才清，避免误删用户后来的复制
+            if self.read_text() == text:
+                self.set_text_native("")
+
+        self._schedule_expiry(expire_ms, _expire)
+        return True
+
+    def _write_text_native(self, text: str) -> bool:
+        """在剪贴板已打开的前提下写入 CF_UNICODETEXT。"""
+        try:
+            if not user32.EmptyClipboard():
+                return False
+            data = ctypes.create_unicode_buffer(text)
+            handle = kernel32.GlobalAlloc(0x0002, ctypes.sizeof(data))  # GMEM_MOVEABLE
+            if not handle:
+                return False
+            locked = kernel32.GlobalLock(handle)
+            if not locked:
+                kernel32.GlobalFree(handle)
+                return False
+            try:
+                ctypes.memmove(locked, ctypes.byref(data), ctypes.sizeof(data))
+            finally:
+                kernel32.GlobalUnlock(handle)
+            CF_UNICODETEXT = 13
+            if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+                kernel32.GlobalFree(handle)
+                return False
+            # 所有权已交给系统，不能再 GlobalFree
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _mark_excluded(self) -> None:
+        """在剪贴板已打开的前提下挂上「不进历史」格式。"""
         if user32 is None:
             return
         try:
@@ -286,6 +372,64 @@ class WindowsBackend(ClipboardBackend):
                 user32.SetClipboardData(fmt, None)
         except Exception:  # noqa: BLE001
             pass
+
+    def set_text_native(self, text: str) -> bool:
+        """原生写入纯文本，不经过 Qt。自检与限时清空都用它。"""
+        if user32 is None:
+            return False
+        if not self.open_clipboard():
+            return False
+        try:
+            return self._write_text_native(text)
+        finally:
+            self.close_clipboard()
+
+    def read_text(self) -> str:
+        """读剪贴板纯文本。
+
+        存在的理由：限时清空必须先确认「剪贴板里还是不是我写的那份」，
+        否则用户复制了别的内容我们再清一次，删掉的是他自己的东西。
+        此前 Windows 后端根本没有读剪贴板的能力 —— 条件清理也就无从谈起。
+        """
+        if user32 is None or kernel32 is None:
+            return ""
+        if not self.open_clipboard():
+            return ""
+        try:
+            return self._read_text_native()
+        finally:
+            self.close_clipboard()
+
+    @staticmethod
+    def _read_text_native() -> str:
+        """在剪贴板已打开的前提下读 CF_UNICODETEXT。"""
+        try:
+            CF_UNICODETEXT = 13
+            handle = user32.GetClipboardData(CF_UNICODETEXT)
+            if not handle:
+                return ""
+            pointer = kernel32.GlobalLock(handle)
+            if not pointer:
+                return ""
+            try:
+                # 句柄指向一个以 NUL 结尾的宽字符缓冲
+                return ctypes.wstring_at(pointer)
+            finally:
+                kernel32.GlobalUnlock(handle)
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _schedule_expiry(self, expire_ms: int, action) -> None:
+        """安排一次限时清空，顺带清掉已结束的定时器。"""
+        self._timers = [item for item in self._timers if item.is_alive()]
+        timer = threading.Timer(expire_ms / 1000.0, action)
+        timer.daemon = True
+        self._timers.append(timer)
+        timer.start()
+
+    def exclude_from_history(self) -> None:
+        """在剪贴板已打开的前提下，标记内容不进历史与云同步。"""
+        self._mark_excluded()
 
     def allow_in_history(self) -> None:
         if user32 is None:

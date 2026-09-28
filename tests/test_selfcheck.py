@@ -44,6 +44,11 @@ class HealthBackend(ClipboardBackend):
     def sanity_check(self):
         return True, "读写链路正常"
 
+    def history_exclusion_formats(self):
+        # 「什么都能干」的后端也要能声明出站排除，否则全绿路径走不到 ——
+        # 自检新增的出站防护一项会如实报「降级」。
+        return ["ExcludeClipboardContentFromMonitorProcessing"]
+
 
 class BrokeBackend(HealthBackend):
     name = "broke"
@@ -212,6 +217,106 @@ def test_hotkey_probe_skipped_when_backend_unavailable():
     report = _run(HealthBackend(), FakeHotkeys(available=False))
     entry = next(r for r in report.results if r.name == "全局快捷键注册")
     assert entry.status == SKIP
+
+
+# ------------------------------------------------------ 出站防护
+
+
+class _ConfigStub:
+    def __init__(self, values):
+        self._values = values
+
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+
+
+def _run_with_config(backend, seconds):
+    return NativeSelfCheck(
+        backend=backend,
+        hotkeys_factory=lambda: FakeHotkeys(),
+        config=_ConfigStub({"privacy.sensitive_auto_clear_seconds": seconds}),
+    ).run()
+
+
+def test_outbound_reports_system_level_exclusion():
+    """声明了系统级排除就必须报出来 —— 这是 README 承诺的那一条。"""
+    report = _run(HealthBackend(), FakeHotkeys())
+    entry = next(r for r in report.results if r.name == "出站防护（复制敏感内容）")
+    assert entry.status == OK
+    assert "ExcludeClipboardContentFromMonitorProcessing" in entry.detail
+
+
+def test_outbound_reports_auto_clear_seconds():
+    report = _run_with_config(HealthBackend(), 45)
+    entry = next(r for r in report.results if r.name == "出站防护（复制敏感内容）")
+    assert "45 秒后清空剪贴板" in entry.detail
+
+
+def test_outbound_degraded_without_any_means():
+    """没有任何手段时必须如实报降级，而不是含糊地报「正常」。
+
+    此前设置页有「剪贴板自动清空」而没有人读它，界面看起来一切正常。
+    """
+    class Bare(ClipboardBackend):
+        name = "bare"
+
+    report = _run_with_config(Bare(), 0)
+    entry = next(r for r in report.results if r.name == "出站防护（复制敏感内容）")
+    assert entry.status == DEGRADED
+    assert "无额外手段" in entry.detail
+    assert "自动清空" in entry.hint
+
+
+def test_outbound_ok_when_only_auto_clear_configured():
+    """没有系统机制但配了限时清空，算「有手段」而非「什么都没有」。"""
+    class Bare(ClipboardBackend):
+        name = "bare"
+
+    report = _run_with_config(Bare(), 30)
+    entry = next(r for r in report.results if r.name == "出站防护（复制敏感内容）")
+    assert entry.status == OK
+    assert "30 秒后清空剪贴板" in entry.detail
+
+
+def test_outbound_probe_failure_is_reported_not_raised():
+    class Exploding(ClipboardBackend):
+        name = "exploding"
+
+        def history_exclusion_formats(self):
+            raise RuntimeError("探测炸了")
+
+    report = _run_with_config(Exploding(), 0)
+    entry = next(r for r in report.results if r.name == "出站防护（复制敏感内容）")
+    assert entry.status == FAIL
+    assert "探测炸了" in entry.detail
+
+
+def test_outbound_empty_format_names_ignored():
+    class Blank(ClipboardBackend):
+        name = "blank"
+
+        def history_exclusion_formats(self):
+            return ["", None]
+
+    report = _run_with_config(Blank(), 0)
+    entry = next(r for r in report.results if r.name == "出站防护（复制敏感内容）")
+    # 只有空白格式名不算「有手段」
+    assert entry.status == DEGRADED
+
+
+def test_outbound_check_survives_config_get_failure():
+    class BadConfig:
+        def get(self, key, default=None):
+            raise RuntimeError("配置读不了")
+
+    report = NativeSelfCheck(
+        backend=HealthBackend(),
+        hotkeys_factory=lambda: FakeHotkeys(),
+        config=BadConfig(),
+    ).run()
+    # 读配置失败不该让自检崩，排除格式仍应报出来
+    entry = next(r for r in report.results if r.name == "出站防护（复制敏感内容）")
+    assert entry.status == OK
 
 
 # ---------------------------------------------------------------- 报告

@@ -370,8 +370,22 @@ class SettingsDialog(QDialog):
         self._auto_clear.setSuffix(" 秒")
         self._auto_clear.setSpecialValueText("不自动清除")
         self._auto_clear.setValue(int(self._config.get("privacy.sensitive_auto_clear_seconds", 30)))
-        self._auto_clear.setToolTip("安全粘贴后，若剪贴板中的敏感内容超时未被替换则自动清空。")
+        self._auto_clear.setToolTip(
+            "把敏感记录复制出去后，若剪贴板里仍是这份内容就自动清空。\n"
+            "只在内容未被替换时清，不会误删你后来的复制。\n"
+            "注意：这只是缩小暴露窗口，不是擦除痕迹 —— 剪贴板管理器、"
+            "输入法可能已经读过一次。低于 5 秒按「不清空」处理，"
+            "否则粘贴还没发生内容就没了。"
+        )
         form2.addRow("剪贴板自动清空", self._auto_clear)
+
+        self._auto_clear_hint = QLabel()
+        self._auto_clear_hint.setWordWrap(True)
+        self._auto_clear_hint.setObjectName("hintLabel")
+        form2.addRow("", self._auto_clear_hint)
+        # 改了就要立刻看到结果，不用等保存 —— 否则用户无法判断自己改的有没有生效
+        self._auto_clear.valueChanged.connect(self._refresh_outbound_hint)
+        self._refresh_outbound_hint()
 
         self._redact = QCheckBox("复制到外部时对敏感片段脱敏")
         self._redact.setChecked(bool(self._config.get("privacy.redact_on_copy_out", False)))
@@ -380,6 +394,43 @@ class SettingsDialog(QDialog):
         layout.addWidget(group2)
         layout.addStretch(1)
         return page
+
+    def _refresh_outbound_hint(self, *_args) -> None:
+        """说清这台机器上「复制敏感内容」实际能做什么。
+
+        此前这里只有一个勾选框和一句「自动清空」，而配置从头到尾没人读 ——
+        用户看到的是「已设置」，实际什么都没发生。所以状态必须写出来。
+        """
+        parts = []
+        if self._history_exclusion_formats():
+            parts.append("系统级：复制敏感内容时不写入系统剪贴板历史（Win+V）")
+        else:
+            parts.append("本平台没有「不写入系统剪贴板历史」的机制，改用限时清空")
+        seconds = self._auto_clear.value()
+        if seconds > 0:
+            parts.append(f"复制后 {seconds} 秒清空剪贴板（内容未被替换时）")
+        else:
+            parts.append("自动清空已关闭，复制出去的敏感内容会一直留在剪贴板")
+        self._auto_clear_hint.setText("\n".join(f"· {item}" for item in parts))
+
+    def _history_exclusion_formats(self):
+        """当前平台是否提供写入级的剪贴板历史排除。
+
+        默认自己探一次后端；测试可注入 `_exclusion_formats_override`
+        来覆盖 —— 否则在 Linux 上永远看不到 Windows 那一条。
+        """
+        override = getattr(self, "_exclusion_formats_override", None)
+        if override is not None:
+            return list(override)
+        try:
+            from ..platform import detect_backend
+
+            getter = getattr(detect_backend(), "history_exclusion_formats", None)
+            if getter is None:
+                return []
+            return [str(item) for item in (getter() or []) if item]
+        except Exception:  # noqa: BLE001 - 探测失败不该让设置页打不开
+            return []
 
     def _build_sync_tab(self) -> QWidget:
         page = QWidget()

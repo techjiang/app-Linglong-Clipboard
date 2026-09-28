@@ -197,6 +197,177 @@ def test_copy_redacts_when_enabled(app_instance):
     assert "hunter2xyz" not in app_instance.qt_app.clipboard().text()
 
 
+# ---- 出站防护：复制敏感内容 ----
+
+
+def _add_sensitive(app_instance, content="password: hunter2xyz", hash_="hs1"):
+    return app_instance.storage.add(
+        ClipboardItem(kind="text", content=content, preview="p",
+                      hash=hash_, sensitive=True)
+    )
+
+
+def test_copy_sensitive_marks_platform_exclusion(app_instance, qt_app):
+    """敏感内容复制出去时要挂上系统排除标记（本机没有则自然跳过）。
+
+    这里不假设平台一定支持，而是比对「编排层认为该挂」与「实际有没有挂」：
+    只要后端声明了格式名，剪贴板数据里就必须出现。
+    """
+    item = _add_sensitive(app_instance)
+    app_instance.copy_item(item.id)
+
+    formats = app_instance.qt_app.clipboard().mimeData().formats()
+    expected = app_instance.backend.history_exclusion_formats()
+    for name in expected:
+        assert name in formats
+    # 内容照常写出，标记不等于改写
+    assert "hunter2xyz" in app_instance.qt_app.clipboard().text()
+
+
+def test_copy_normal_item_has_no_exclusion_mark(app_instance):
+    """普通内容不该被打标记 —— 系统历史正是用户找回它的地方。"""
+    item = app_instance.storage.add(
+        ClipboardItem(kind="text", content="plain", preview="plain", hash="hn1")
+    )
+    app_instance.copy_item(item.id)
+
+    formats = app_instance.qt_app.clipboard().mimeData().formats()
+    assert all(
+        name not in formats
+        for name in app_instance.backend.history_exclusion_formats()
+    )
+
+
+def test_copy_sensitive_schedules_clear(app_instance, monkeypatch):
+    """配了自动清空就要真的排上，而不是只写进配置。"""
+    app_instance.config.set("privacy.sensitive_auto_clear_seconds", 30)
+    item = _add_sensitive(app_instance, hash_="hs2")
+
+    scheduled = {}
+
+    def _fake_schedule(text, seconds):
+        scheduled["text"] = text
+        scheduled["seconds"] = seconds
+        return True
+
+    monkeypatch.setattr(app_instance.releaser, "schedule", _fake_schedule)
+    app_instance.copy_item(item.id)
+
+    assert scheduled["seconds"] == 30
+    assert scheduled["text"] == "password: hunter2xyz"
+
+
+def test_copy_sensitive_without_clear_setting_does_not_schedule(app_instance, monkeypatch):
+    app_instance.config.set("privacy.sensitive_auto_clear_seconds", 0)
+    item = _add_sensitive(app_instance, hash_="hs3")
+
+    calls = []
+    monkeypatch.setattr(
+        app_instance.releaser, "schedule", lambda *a, **k: calls.append(a) or True
+    )
+    app_instance.copy_item(item.id)
+    assert calls == []
+
+
+def test_copy_sensitive_below_floor_does_not_schedule(app_instance, monkeypatch):
+    """低于下限按「不清空」处理 —— 粘贴还没发生内容就没了。"""
+    app_instance.config.set("privacy.sensitive_auto_clear_seconds", 2)
+    item = _add_sensitive(app_instance, hash_="hs4")
+
+    calls = []
+    monkeypatch.setattr(
+        app_instance.releaser, "schedule", lambda *a, **k: calls.append(a) or True
+    )
+    app_instance.copy_item(item.id)
+    assert calls == []
+
+
+def test_copy_sensitive_redacted_still_marks_and_clears(app_instance, monkeypatch):
+    """脱敏后仍要挂标记、仍要排清空：正则漏一处就漏一处，兜底不能省。"""
+    app_instance.config.set("privacy.redact_on_copy_out", True)
+    app_instance.config.set("privacy.sensitive_auto_clear_seconds", 30)
+    app_instance.guard.reload_rules()
+    item = _add_sensitive(app_instance, hash_="hs5")
+
+    scheduled = {}
+    monkeypatch.setattr(
+        app_instance.releaser,
+        "schedule",
+        lambda text, seconds: scheduled.update(text=text, seconds=seconds) or True,
+    )
+    app_instance.copy_item(item.id)
+
+    assert "hunter2xyz" not in app_instance.qt_app.clipboard().text()
+    assert scheduled["seconds"] == 30
+    assert "[已脱敏:密码字段]" in scheduled["text"]
+
+
+def test_copy_sensitive_image_reports_no_clear(app_instance, monkeypatch):
+    """图片走不通限时清空（读不到文本无从比对），要明说而不是静默。"""
+    app_instance.config.set("privacy.sensitive_auto_clear_seconds", 30)
+    app_instance.config.set("privacy.redact_on_copy_out", False)
+    item = app_instance.storage.add(
+        ClipboardItem(kind="image", content="", preview="img",
+                      hash="hi1", sensitive=True)
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        app_instance.releaser, "schedule", lambda *a, **k: calls.append(a) or True
+    )
+    notes = []
+    monkeypatch.setattr(app_instance.window, "notify", lambda *a, **k: notes.append(a))
+    app_instance.copy_item(item.id)
+
+    assert calls == []
+    assert any("图片" in str(note) for note in notes)
+
+
+def test_copy_text_marks_sensitive_transform_output(app_instance, monkeypatch):
+    """转换结果也可能是密钥（「提取 API Key」就产出它），同样要过出站判定。"""
+    app_instance.config.set("privacy.sensitive_auto_clear_seconds", 30)
+    scheduled = {}
+    monkeypatch.setattr(
+        app_instance.releaser,
+        "schedule",
+        lambda text, seconds: scheduled.update(text=text, seconds=seconds) or True,
+    )
+    app_instance.copy_text("sk-abcdefghijklmnopqrstuvwxyz012345")
+
+    expected = app_instance.backend.history_exclusion_formats()
+    formats = app_instance.qt_app.clipboard().mimeData().formats()
+    for name in expected:
+        assert name in formats
+    assert scheduled["seconds"] == 30
+
+
+def test_copy_text_normal_does_not_schedule(app_instance, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        app_instance.releaser, "schedule", lambda *a, **k: calls.append(a) or True
+    )
+    app_instance.copy_text("just some ordinary text")
+    assert calls == []
+
+
+def test_outbound_plan_uses_guard_config(app_instance):
+    """自动清空时长取自隐私配置，改配置立刻生效。"""
+    app_instance.config.set("privacy.sensitive_auto_clear_seconds", 77)
+    assert app_instance._auto_clear_seconds() == 77
+    app_instance.config.set("privacy.sensitive_auto_clear_seconds", 0)
+    assert app_instance._auto_clear_seconds() == 0
+
+
+def test_quit_cancels_pending_releases(app_instance, monkeypatch):
+    """退出时要取消待清理任务，不能留个定时器在进程退出后还去动剪贴板。"""
+    cancelled = []
+    monkeypatch.setattr(
+        app_instance.releaser, "cancel_all", lambda: cancelled.append(True)
+    )
+    app_instance.quit()
+    assert cancelled == [True]
+
+
 def test_delete_item(app_instance):
     item = app_instance.storage.add(
         ClipboardItem(kind="text", content="bye", preview="bye", hash="h4")

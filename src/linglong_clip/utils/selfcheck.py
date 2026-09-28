@@ -131,6 +131,7 @@ class NativeSelfCheck:
             lambda: self._check_capabilities(backend),
             lambda: self._check_clipboard_probe(backend),
             lambda: self._check_focus(backend),
+            lambda: self._check_outbound_guard(backend),
             self._check_hotkey_backend,
             self._check_hotkey_probe,
             self._check_ocr,
@@ -228,6 +229,48 @@ class NativeSelfCheck:
         return CheckResult(
             "前台窗口识别", OK, f"{info.display}（{info.window_title or '无标题'}）"
         )
+
+    def _check_outbound_guard(self, backend) -> CheckResult:
+        """敏感内容复制出去时，这台机器能做什么防护。
+
+        这项此前根本不存在 —— 于是「安全粘贴标记 ✅ 系统级」写在 README 里，
+        而实现从未接上连接用方都没有，谁也发现不了。自检回答的是
+        **实际会生效的手段**，不是「代码里有没有这个函数」。
+        """
+        formats: List[str] = []
+        getter = getattr(backend, "history_exclusion_formats", None)
+        if getter is not None:
+            try:
+                formats = [str(item) for item in (getter() or []) if item]
+            except Exception as exc:  # noqa: BLE001
+                return CheckResult(
+                    "出站防护（复制敏感内容）",
+                    FAIL,
+                    f"history_exclusion_formats() 失败：{exc!r}",
+                )
+
+        seconds = 0
+        if self._config is not None:
+            try:
+                seconds = int(
+                    self._config.get("privacy.sensitive_auto_clear_seconds", 30) or 0
+                )
+            except Exception:  # noqa: BLE001
+                seconds = 0
+
+        parts: List[str] = []
+        if formats:
+            parts.append(f"系统级排除剪贴板历史（{'、'.join(formats)}）")
+        if seconds > 0:
+            parts.append(f"{seconds} 秒后清空剪贴板")
+        if not parts:
+            return CheckResult(
+                "出站防护（复制敏感内容）",
+                DEGRADED,
+                "仅依赖「敏感内容不落盘」，复制出站无额外手段",
+                "在设置 → 隐私 里设定「剪贴板自动清空」可减少暴露窗口",
+            )
+        return CheckResult("出站防护（复制敏感内容）", OK, "；".join(parts))
 
     def _check_hotkey_backend(self) -> CheckResult:
         manager = self._make_hotkeys()

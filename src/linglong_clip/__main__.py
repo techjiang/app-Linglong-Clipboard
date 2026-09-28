@@ -34,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  linglong-clipboard --sync-cursor    查看各同步来源的增量游标\n"
             "  linglong-clipboard --storage-status 查看历史文件的存放位置\n"
             "  linglong-clipboard --merge-duplicates 合并重复项（含归一后新出现的）\n"
+            "  linglong-clipboard --outbound       复制敏感内容时实际生效的防护\n"
             "  linglong-clipboard --remove 12      删除第 12 条（删除会同步到其它设备）\n"
             "  linglong-clipboard --tombstones     查看删除标记的同步进度\n"
         ),
@@ -77,6 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--normalize",
         metavar="TEXT",
         help="预览归一结果：这段内容会被当成哪一条（用于排查「为什么没合并」）",
+    )
+    maintenance.add_argument(
+        "--outbound",
+        action="store_true",
+        help="查看「复制敏感内容出去」时实际生效的防护（写入级系统排除、限时清空）",
     )
     maintenance.add_argument("--import-sync", action="store_true", help="从同步来源导入")
     maintenance.add_argument("--export-sync", action="store_true", help="导出到同步来源")
@@ -340,6 +346,69 @@ def _print_items(items, *, as_json: bool, plain: bool, limit: int) -> None:
         )
 
 
+def _run_outbound(args: argparse.Namespace, config) -> int:
+    """报出「复制敏感内容出去」时实际生效的防护。
+
+    之所以要有这条命令：这件事没法靠读代码确认。README 曾写着
+    「写入时附加 ExcludeClipboardContentFromMonitorProcessing」，而
+    那个方法从来没有调用方，设置页里负责时长的勾选也没人读 ——
+    用户看到的是「已设置」，实际什么都没发生。让程序自己报最直接。
+    """
+    from .platform import detect_backend
+
+    backend = detect_backend()
+    formats: List[str] = []
+    probe_error = ""
+    getter = getattr(backend, "history_exclusion_formats", None)
+    if getter is not None:
+        try:
+            formats = [str(item) for item in (getter() or []) if item]
+        except Exception as exc:  # noqa: BLE001 - 探测失败也要给出其余结论
+            probe_error = repr(exc)
+
+    seconds = int(config.get("privacy.sensitive_auto_clear_seconds", 0) or 0)
+    redact = bool(config.get("privacy.redact_on_copy_out", False))
+    name = getattr(backend, "name", "unknown")
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "platform": backend.platform_label(),
+                    "backend": name,
+                    "history_exclusion_formats": formats,
+                    "auto_clear_seconds": seconds,
+                    "redact_on_copy_out": redact,
+                    "probe_error": probe_error,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    print(f"平台：{backend.platform_label()} · 后端：{name}")
+    if probe_error:
+        print(f"  写入级系统排除：探测失败（{probe_error}）")
+    elif formats:
+        print(f"  写入级系统排除：{'、'.join(formats)}")
+        print("      复制敏感内容时会声明「不进系统剪贴板历史」，粘贴不受影响")
+    else:
+        print("  写入级系统排除：本平台无此机制")
+        print("      敏感内容仍会被系统剪贴板历史（如 Win+V）记一份")
+    if seconds > 0:
+        print(f"  限时清空：{seconds} 秒后清空剪贴板（内容未被替换时）")
+    else:
+        print("  限时清空：关闭")
+        print("      可在设置 → 隐私 里设定；低于 5 秒按关闭处理")
+    print(f"  出站脱敏：{'已开启（敏感片段替换为占位符）' if redact else '关闭'}")
+    print()
+    print("注意：这些手段只是缩小暴露窗口，不是擦除痕迹 ——")
+    print("      剪贴板管理器、输入法、云同步可能已经读过一次。")
+    print("      真正的保障是「敏感内容压根不落盘」，见设置 → 隐私。")
+    return 0
+
+
 def _run_cli(args: argparse.Namespace) -> int:
     from .core.normalize import canonical_content
     from .core.semantic import SemanticEngine
@@ -349,6 +418,11 @@ def _run_cli(args: argparse.Namespace) -> int:
         return _run_selfcheck(args)
 
     config = Config()
+
+    if args.outbound:
+        # 与 --selfcheck 一样**不打开历史库**：它回答的是「原生能力能不能用」，
+        # 不该被历史文件损坏挡住 —— 那恰恰是最需要它的时候。
+        return _run_outbound(args, config)
 
     handled = _apply_storage_switch(args, config)
     if handled >= 0:
@@ -791,6 +865,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.merge_duplicates,
             args.recanonicalize,
             args.normalize is not None,
+            args.outbound,
             args.list,
             args.search,
             args.get is not None,

@@ -108,6 +108,20 @@ class ClipboardBackend:
     def is_transient_supported(self) -> bool:
         return False
 
+    def history_exclusion_formats(self) -> List[str]:
+        """写入剪贴板时要附加的「不进系统历史」格式名。
+
+        返回空列表表示该系统没有这类机制（或后端不具备）。调用方在
+        **写入之前**把这些格式名挂到剪贴板数据上 —— 一旦内容进了系统
+        剪贴板历史，就没有办法再把它取出来，所以只能是「写入时声明」。
+
+        平台差异：
+        - Windows 用 `ExcludeClipboardContentFromMonitorProcessing`，
+          系统会据此跳过历史与云同步；这是系统级保证。
+        - macOS / Linux 没有等价机制，返回空列表，由调用方的定时清空兜底。
+        """
+        return []
+
     # ---- 辅助 ----
 
     def platform_label(self) -> str:

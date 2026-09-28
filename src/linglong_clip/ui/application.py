@@ -19,6 +19,7 @@ from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from ..core.automation import AutomationEngine
 from ..core.collector import CAPTURED, MERGED, Collector
+from ..core.copy_guard import ClipboardReleaser, plan_outbound
 from ..core.models import ClipboardItem
 from ..core.monitor import ClipboardMonitor, FocusTracker
 from ..core.ocr import build_engine as build_ocr_engine
@@ -180,6 +181,11 @@ class Application(QObject):
             on_capture=self._on_capture_threadsafe,
             backend=self.backend,
             gui_invoke=self._invoker.call,
+        )
+        #: 复制出站后的收尾（标记不进系统历史、限时清空）
+        self.releaser = ClipboardReleaser(
+            read_text=self._read_clipboard_text,
+            clear=self.clipboard.clear,
         )
         self.focus = FocusTracker(self.backend)
 
@@ -552,6 +558,9 @@ class Application(QObject):
         self.hotkeys.unregister_all()
         self._sync_timer.stop()
         self._sweep_timer.stop()
+        # 取消待执行的限时清空：进程都要退了，再清一次剪贴板没有意义，
+        # 反而可能打断用户刚复制的内容。
+        self.releaser.cancel_all()
         self._stop_sync()
         self.storage.close()
         self.tray.hide()
@@ -616,8 +625,13 @@ class Application(QObject):
             return
 
         text = item.content
-        if item.sensitive and self.config.get("privacy.redact_on_copy_out", False):
+        redacted = item.sensitive and bool(
+            self.config.get("privacy.redact_on_copy_out", False)
+        )
+        if redacted:
             text = self.guard.redact(text)
+        plan = self._outbound_plan(item, redacted=redacted)
+        if redacted:
             patched = ClipboardItem(
                 kind=item.kind,
                 content=text,
@@ -625,21 +639,71 @@ class Application(QObject):
                 files=item.files,
                 image_path=item.image_path,
             )
-            self.clipboard.write_item(patched, plain_text_only=plain_text_only)
+            self.clipboard.write_item(
+                patched,
+                plain_text_only=plain_text_only,
+                exclude_from_history=plan.exclude_from_history,
+            )
         else:
-            self.clipboard.write_item(item, plain_text_only=plain_text_only)
+            self.clipboard.write_item(
+                item,
+                plain_text_only=plain_text_only,
+                exclude_from_history=plan.exclude_from_history,
+            )
 
         # 记下指纹，避免自己的写入又被采集一遍
         payload = item.hash if item.kind == "image" else text
         self.monitor.mark_self_write(payload or text, item.kind)
         self.storage.touch(item_id)
         self.window.reload()
-        self.window.notify(f"已复制：{item.kind_label}")
+
+        note = self._schedule_outbound_release(plan, text, item.kind)
+        self.window.notify(f"已复制：{item.kind_label}{note}")
 
     def copy_text(self, text: str) -> None:
-        self.clipboard.set_text(text)
+        # 转换结果也可能就是一段密钥（「提取 API Key」这种转换就产出它），
+        # 所以同样过一遍出站判定，而不是当作普通文本直接写出去。
+        plan = plan_outbound(
+            sensitive=self.guard.inspect(ClipboardItem(kind="text", content=text)).sensitive,
+            auto_clear_seconds=self._auto_clear_seconds(),
+        )
+        self.clipboard.set_text(text, exclude_from_history=plan.exclude_from_history)
         self.monitor.mark_self_write(text, "text")
-        self.window.notify("已复制转换结果")
+        note = self._schedule_outbound_release(plan, text, "text")
+        self.window.notify(f"已复制转换结果{note}")
+
+    # ---- 出站防护 ----
+
+    def _auto_clear_seconds(self) -> int:
+        """自动清空时长（秒）。统一从 `PrivacyGuard` 取，避免两处口径分叉。"""
+        return self.guard.auto_clear_seconds()
+
+    def _outbound_plan(self, item: ClipboardItem, *, redacted: bool = False):
+        """这条记录复制出去时该怎么处理。"""
+        return plan_outbound(
+            sensitive=bool(item.sensitive),
+            auto_clear_seconds=self._auto_clear_seconds(),
+            redacted=redacted,
+        )
+
+    def _schedule_outbound_release(self, plan, text: str, kind: str) -> str:
+        """安排限时清空，返回给用户看的说明后缀。
+
+        图片走不通这条路：剪贴板里是图像数据，`read_text()` 取不到内容，
+        也就无从比对「还是不是我写的那份」。与其做一个判不准的清理，
+        不如明确不承诺，并在文档里写明。
+        """
+        if not plan.auto_clear_seconds:
+            return ""
+        if kind == "image":
+            return "（图片无法限时清空）"
+        if not self.releaser.schedule(text, plan.auto_clear_seconds):
+            return ""
+        return f"（{plan.auto_clear_seconds} 秒后自动清空剪贴板）"
+
+    def _read_clipboard_text(self) -> str:
+        """读剪贴板纯文本，用于判断「还是不是我写的那份」。"""
+        return self.qt_app.clipboard().text() or ""
 
     def paste_item(self, item_id: int) -> None:
         """复制后尝试直接粘贴到上一次的前台窗口。"""
