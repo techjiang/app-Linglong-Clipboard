@@ -34,6 +34,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  linglong-clipboard --sync-cursor    查看各同步来源的增量游标\n"
             "  linglong-clipboard --storage-status 查看历史文件的存放位置\n"
             "  linglong-clipboard --merge-duplicates 合并重复项（含归一后新出现的）\n"
+            "  linglong-clipboard --remove 12      删除第 12 条（删除会同步到其它设备）\n"
+            "  linglong-clipboard --tombstones     查看删除标记的同步进度\n"
         ),
     )
     parser.add_argument("--version", action="version", version=f"玲珑剪切板 {__version__}")
@@ -93,6 +95,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--sync-cursor-reset",
         action="store_true",
         help="清空同步增量游标（下次同步回到全量重扫）",
+    )
+    maintenance.add_argument(
+        "--tombstones",
+        action="store_true",
+        help="查看删除标记（哪些删除还没同步到对端）",
+    )
+    maintenance.add_argument(
+        "--tombstones-reset",
+        action="store_true",
+        help="清空删除标记（之后的历史删除不再向对端传播）",
+    )
+    maintenance.add_argument(
+        "--purge-tombstones",
+        action="store_true",
+        help="清除超过保留期的删除标记",
+    )
+    maintenance.add_argument(
+        "--remove",
+        type=int,
+        metavar="ID",
+        help="删除一条记录，并让这次删除同步到其它设备",
     )
 
     storage_group = parser.add_argument_group("历史存储")
@@ -353,9 +376,70 @@ def _run_cli(args: argparse.Namespace) -> int:
         storage.close()
         return 0
 
+    if args.remove is not None:
+        from .core.tombstones import build_tombstone_store, fingerprint
+
+        item = storage.get(args.remove)
+        if item is None:
+            print(f"找不到 ID 为 {args.remove} 的记录", file=sys.stderr)
+            storage.close()
+            return 1
+        tombstones = build_tombstone_store()
+        digest = fingerprint(item)
+        storage.delete(item.id)
+        recorded = tombstones.record(digest) if digest else False
+        print(f"已删除记录 {args.remove}")
+        if recorded:
+            print("已记下删除标记：下次同步时其它设备上的同一内容会一起删除")
+        else:
+            print("未留下删除标记（这条没有指纹，无法跨设备识别），删除只在本机生效")
+        storage.close()
+        return 0
+
+    if args.tombstones or args.tombstones_reset or args.purge_tombstones:
+        from .core.tombstones import build_tombstone_store
+
+        tombstones = build_tombstone_store()
+        if args.tombstones_reset:
+            count = tombstones.reset()
+            print(f"已清空 {count} 条删除标记，之后的历史删除不再向对端传播")
+            if not args.tombstones:
+                storage.close()
+                return 0
+        if args.purge_tombstones:
+            removed = tombstones.prune()
+            print(f"已清除 {removed} 条超期删除标记")
+            if not args.tombstones:
+                storage.close()
+                return 0
+        status = tombstones.status()
+        if args.json:
+            print(json.dumps(status, ensure_ascii=False, indent=2))
+        else:
+            print(f"删除标记文件：{status['path']}")
+            print(f"共 {status['count']} 条，其中待同步 {status['pending']} 条")
+            print(f"保留期：{status['retention_seconds']} 秒（超期后不再传播）")
+            if not status["count"]:
+                print("（本机还没有被删除的内容）")
+            for row in status["tombstones"]:
+                flag = "待同步" if row["pending"] else ("已送达" if row["acknowledged"] else "已超期")
+                print(f"  {row['hash'][:12]}  {row['deleted_text']}  {flag}")
+        storage.close()
+        return 0
+
     if args.clear:
+        from .core.tombstones import build_tombstone_store, local_fingerprints
+
+        tombstones = build_tombstone_store()
+        before = set(local_fingerprints(storage))
         removed = storage.clear(keep_pinned=True)
+        survivors = set(local_fingerprints(storage))
+        # 只给「真的消失了」的指纹记墓碑：固定项还在，不能被算成删除
+        doomed = [digest for digest in before if digest not in survivors]
+        recorded = tombstones.record_many(doomed)
         print(f"已清理 {removed} 条未固定记录")
+        if recorded:
+            print(f"已记下 {recorded} 条删除标记，下次同步时其它设备上的同一内容会一起清理")
         storage.close()
         return 0
 
@@ -696,6 +780,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.import_native_history,
             args.sync_cursor,
             args.sync_cursor_reset,
+            args.tombstones,
+            args.tombstones_reset,
+            args.purge_tombstones,
+            args.remove is not None,
             args.storage_status,
             args.storage is not None,
             args.storage_migrate,

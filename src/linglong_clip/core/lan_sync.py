@@ -41,6 +41,7 @@ from .privacy import PrivacyGuard
 from .storage import Storage
 from .sync import MAX_SYNC_ENTRIES, FolderSync, SyncCipher, SyncRecord
 from .sync_cursor import SyncCursorStore
+from .tombstones import Tombstone, TombstoneStore, contains_hash
 
 _log = get_logger("lan_sync")
 
@@ -212,6 +213,7 @@ class LanSyncServer:
         cipher: Optional[SyncCipher] = None,
         guard: Optional[PrivacyGuard] = None,
         max_entries: int = MAX_SYNC_ENTRIES,
+        tombstones: Optional[TombstoneStore] = None,
     ) -> None:
         self._storage = storage
         self.device_name = device_name or socket.gethostname()
@@ -221,6 +223,7 @@ class LanSyncServer:
         self._cipher = cipher or SyncCipher(False)
         self._guard = guard
         self._max_entries = max_entries
+        self.tombstones = tombstones if tombstones is not None else TombstoneStore()
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
@@ -251,8 +254,6 @@ class LanSyncServer:
         序列化成 base64 由客户端解——明文模式下则是普通 JSON 串。
         """
         items = self._eligible_items(since=since, limit=limit)
-        if not items:
-            return []
 
         payload = [
             SyncRecord(
@@ -267,6 +268,27 @@ class LanSyncServer:
             )
             for item in items
         ]
+
+        # 删除标记：客户端按游标推进请求范围，若墓碑也受 `since` 过滤，
+        # 一个刚离线过的对端就会永远收不到这段区间里的删除。
+        # 所以墓碑单独成批，和内容一起放进同一个响应（客户端先应用删除再导入内容）。
+        pending = self.tombstones.pending()
+        payload.extend(
+            SyncRecord(
+                hash=entry.hash,
+                kind="tombstone",
+                content="",
+                preview="",
+                device=self.device_name,
+                created_at=entry.deleted_at,
+                deleted_at=entry.deleted_at,
+            )
+            for entry in pending
+        )
+
+        if not payload:
+            return []
+
         body = "\n".join(
             json.dumps(record.to_json(), ensure_ascii=False) for record in payload
         ).encode("utf-8")
@@ -343,6 +365,15 @@ class LanSyncServer:
         }
 
 
+@dataclass
+class LanImportOutcome:
+    """一次局域网导入的明细。"""
+
+    imported: int = 0
+    removed: int = 0
+    tombstones: int = 0
+
+
 class LanSyncClient:
     """从对端拉取记录并写入本地库。"""
 
@@ -356,6 +387,7 @@ class LanSyncClient:
         guard: Optional[PrivacyGuard] = None,
         timeout: float = DEFAULT_HTTP_TIMEOUT,
         cursors: Optional[SyncCursorStore] = None,
+        tombstones: Optional[TombstoneStore] = None,
     ) -> None:
         self._storage = storage
         self.device_name = device_name or socket.gethostname()
@@ -364,6 +396,7 @@ class LanSyncClient:
         self._guard = guard
         self._timeout = timeout
         self.cursors = cursors if cursors is not None else SyncCursorStore()
+        self.tombstones = tombstones if tombstones is not None else TombstoneStore()
 
     def fetch(self, peer: PeerInfo, *, since: float = 0.0, limit: int = DEFAULT_PAGE_SIZE) -> Optional[List[SyncRecord]]:
         """拉取一个对端的记录；不可达或鉴权失败时返回 `None`。"""
@@ -445,12 +478,31 @@ class LanSyncClient:
                 out.append(record)
         return out
 
-    def import_records(self, records: Iterable[SyncRecord]) -> int:
-        """写入本地库，跳过重复、自己的记录与隐私策略不允许的内容。"""
+    def import_records(self, records: Iterable[SyncRecord]) -> "LanImportOutcome":
+        """写入本地库，跳过重复、自己的记录与隐私策略不允许的内容。
+
+        先处理全部删除标记，再处理内容：同一个响应里内容排在墓碑之前，
+        若顺序反了，刚被删除的指纹会被紧随其后的内容记录写回来。
+        """
+        records = [record for record in records if record.hash]
         seen = {item.hash for item in self._storage.list(limit=MAX_SYNC_ENTRIES)}
-        imported = 0
+        # 注意：判「指纹是否已在本地」一律用 contains_hash()，
+        # 不用 `in` —— 见 tombstones.contains_hash() 的说明
+        outcome = LanImportOutcome()
+
         for record in records:
-            if not record.hash or record.hash in seen:
+            if not record.is_tombstone:
+                continue
+            if record.device == self.device_name:
+                continue
+            outcome.tombstones += 1
+            if self._apply_tombstone(record, seen):
+                outcome.removed += 1
+
+        for record in records:
+            if record.is_tombstone:
+                continue
+            if contains_hash(seen, record.hash):
                 continue
             if record.device == self.device_name:
                 continue
@@ -461,8 +513,33 @@ class LanSyncClient:
                     continue
             self._storage.add(item)
             seen.add(record.hash)
-            imported += 1
-        return imported
+            outcome.imported += 1
+        return outcome
+
+    def _apply_tombstone(self, record: SyncRecord, seen: set) -> bool:
+        """落地一条对端删除标记，并清掉本地同指纹的记录。
+
+        规则与共享文件夹模式完全一致，两处不能各写一套：
+        过期的不动本地数据、固定项不删、同一指纹只处理一次。
+        """
+        if self.tombstones.has(record.hash):
+            return False
+        self.tombstones.record(record.hash, deleted_at=record.deleted_at)
+        seen.add(record.hash)
+
+        if record.deleted_at > 0 and self.tombstones.is_expired(
+            Tombstone(hash=record.hash, deleted_at=record.deleted_at)
+        ):
+            return False
+
+        existing = self._storage.find_by_hash(record.hash)
+        if existing is None:
+            return False
+        if existing.pinned:
+            _log.info("保留固定项，跳过对端删除标记：%s", record.hash)
+            return False
+        self._storage.delete(existing.id)
+        return True
 
     @staticmethod
     def cursor_key(peer: PeerInfo) -> str:
@@ -483,12 +560,12 @@ class LanSyncClient:
             return 0
         if not records:
             return 0
-        imported = self.import_records(records)
+        outcome = self.import_records(records)
         # 只有成功拿到响应才推进；游标取本批记录的最大时间戳
         newest = max((float(getattr(r, "created_at", 0.0) or 0.0) for r in records), default=0.0)
         if newest > 0:
             self.cursors.advance(key, newest)
-        return imported
+        return outcome.imported
 
 
 class DiscoveryService:
@@ -623,6 +700,7 @@ class LanSync:
     cipher: Optional[SyncCipher] = None
     guard: Optional[PrivacyGuard] = None
     cursors: Optional[SyncCursorStore] = None
+    tombstones: Optional[TombstoneStore] = None
     _server: Optional[LanSyncServer] = field(default=None, init=False)
     _client: Optional[LanSyncClient] = field(default=None, init=False)
     _discovery: Optional[DiscoveryService] = field(default=None, init=False)
@@ -631,6 +709,8 @@ class LanSync:
         name = self.device_name or socket.gethostname()
         self.device_name = name
         cipher = self.cipher or SyncCipher(False)
+        tombstones = self.tombstones if self.tombstones is not None else TombstoneStore()
+        self.tombstones = tombstones
         self._server = LanSyncServer(
             self.storage,
             device_name=name,
@@ -638,6 +718,7 @@ class LanSync:
             port=self.port,
             cipher=cipher,
             guard=self.guard,
+            tombstones=tombstones,
         )
         cursors = self.cursors if self.cursors is not None else SyncCursorStore()
         self.cursors = cursors
@@ -648,6 +729,7 @@ class LanSync:
             cipher=cipher,
             guard=self.guard,
             cursors=cursors,
+            tombstones=tombstones,
         )
         # 端口为 0 时先不固定，等 start() 拿到系统分配的端口再用于发现广播
         self._cipher = cipher
@@ -735,8 +817,22 @@ class LanSync:
         peer.last_seen = time.time()
         return True
 
-    def status(self) -> Dict[str, object]:
+    def status(self, *, probe: bool = True) -> Dict[str, object]:
+        """同步状态摘要。
+
+        `probe=True`（默认）时逐对端打一次 `/ping`。此前每个对端的
+        `ok` / `device` 永远是空的 —— `probe()` 写好了却从来没人调用，
+        于是状态页只能列出地址，说不出「哪台在线、它是谁」。
+        """
         assert self._server is not None
+        peers = self.discover()
+        if probe:
+            for peer in peers:
+                try:
+                    self.probe(peer)
+                except Exception as exc:  # noqa: BLE001 - 探测失败只能说明不在线
+                    _log.debug("探测对端 %s 失败：%s", peer.host, exc)
+                    peer.ok = False
         return {
             "mode": "lan",
             "running": self.running,
@@ -745,7 +841,10 @@ class LanSync:
             "encrypted": self._server.encrypted,
             "auth_required": bool(self.token),
             "auto_discovery": self.auto_discovery,
-            "peers": [peer.to_json() for peer in self.discover()],
+            "peers": [peer.to_json() for peer in peers],
+            "online": sum(1 for peer in peers if peer.ok),
+            "tombstone_file": str(self.tombstones.path),
+            "pending_tombstones": len(self.tombstones.pending()),
             "cursor_file": str(self.cursors.path) if self.cursors is not None else "",
         }
 
@@ -755,6 +854,7 @@ def build_lan_sync(
     config,
     guard: Optional[PrivacyGuard] = None,
     cursors: Optional[SyncCursorStore] = None,
+    tombstones: Optional[TombstoneStore] = None,
 ) -> Optional[LanSync]:
     """按配置构造局域网同步；未启用时返回 `None`。"""
     if not config.get("sync.enabled", False):
@@ -781,4 +881,5 @@ def build_lan_sync(
         cipher=cipher,
         guard=guard,
         cursors=cursors,
+        tombstones=tombstones,
     )

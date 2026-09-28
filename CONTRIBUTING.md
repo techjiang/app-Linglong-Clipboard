@@ -53,6 +53,7 @@ sudo apt-get install -y libegl1 libglib2.0-0 libxkbcommon-x11-0 libdbus-1-3
 add / touch / update_fields / delete / delete_many / clear
 get / find_by_hash / latest / list / search
 count / count_by_kind / top_sources / dedupe / recanonicalize
+（删除相关的墓碑由 `core/tombstones.py` 独立维护，后端不必实现删除传播）
 enforce_limits / purge_expired_sensitive
 get_meta / set_meta / optimize / stats / close
 ```
@@ -132,6 +133,27 @@ _MIGRATIONS = {
 - `capture.max_text_length` 的截断位置**必须在隐私判定之后**：
   判定读的是完整内容，先截断再判定会让「落在截断线之后的密钥」被放行
 - 淘汰排序一律把固定项排前，这样关闭豁免时先被淘汰的仍是久用的普通记录
+
+### 修改同步的删除语义
+
+「删除能否跨设备生效」由 `core/tombstones.py` 与两条同步路径共同决定。
+改动前请先确认这几条约束都还成立，每条都对应一个真实会发生的错误：
+
+1. **只记指纹，不记内容**。墓碑里出现被删内容，就等于「删除后仍留一份副本」。
+2. **只有显式删除才记墓碑**。压缩淘汰、敏感过期是本机整理，不扩散到别的设备。
+3. **对端离线超过保留期就不追删**。删掉一台离线很久的设备的副本，
+   是在丢那台设备自己的数据。
+4. **固定项不被对端删除清掉**。
+5. **同一批读取中，删除必须先于内容应用**。游标有 1 秒安全窗口，
+   两类记录可能落在同一批里；顺序反了，删除会被内容覆盖。
+6. **发送侧不能用「已导出内容」的过滤去拦墓碑**。
+   「内容已发过」恰恰是删除要传达的前提，拦掉就等于删除永不传播。
+7. **失败即不推进/不确认**。对端不可达时保留待发状态，下轮重试。
+
+两条同步路径（`core/sync.py` 的共享文件夹、`core/lan_sync.py` 的局域网）
+各有一份 `_apply_tombstone()`，语义必须逐条对齐 —— 历史教训是
+「主流程过滤了、同步漏了」这类不一致最难发现。改一处就要改另一处，
+并同步更新 `tests/test_tombstones.py` 里两组同名用例。
 
 ## 测试
 

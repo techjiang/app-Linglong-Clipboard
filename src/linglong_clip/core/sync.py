@@ -25,6 +25,7 @@ from .models import ClipboardItem
 from .privacy import PrivacyGuard
 from .storage import Storage
 from .sync_cursor import SyncCursorStore
+from .tombstones import Tombstone, TombstoneStore, contains_hash
 
 _log = get_logger("sync")
 
@@ -46,9 +47,17 @@ class SyncRecord:
     created_at: float = field(default_factory=time.time)
     #: 图片等二进制内容不进同步（体积大且隐私风险高）
     payload_b64: str = ""
+    #: 非 0 表示这是一条**删除标记**而非内容记录，值为删除时刻。
+    #: 用同一根日志承载删除，是因为「传了什么」和「删了什么」必须在
+    #: 同一条有序通道上，否则顺序颠倒会让删除被后面的新增覆盖掉。
+    deleted_at: float = 0.0
+
+    @property
+    def is_tombstone(self) -> bool:
+        return self.deleted_at > 0
 
     def to_json(self) -> Dict[str, object]:
-        return {
+        payload: Dict[str, object] = {
             "hash": self.hash,
             "kind": self.kind,
             "content": self.content,
@@ -59,6 +68,9 @@ class SyncRecord:
             "created_at": self.created_at,
             "payload_b64": self.payload_b64,
         }
+        if self.deleted_at > 0:
+            payload["deleted_at"] = self.deleted_at
+        return payload
 
     @classmethod
     def from_json(cls, data: Dict[str, object]) -> Optional["SyncRecord"]:
@@ -74,6 +86,7 @@ class SyncRecord:
             tags=list(data.get("tags") or []),
             created_at=float(data.get("created_at") or time.time()),
             payload_b64=str(data.get("payload_b64", "")),
+            deleted_at=float(data.get("deleted_at") or 0.0),
         )
 
     def to_item(self) -> ClipboardItem:
@@ -88,6 +101,15 @@ class SyncRecord:
             created_at=self.created_at,
             metadata={"synced": True},
         )
+
+
+@dataclass
+class ImportOutcome:
+    """一次日志导入的明细，供调用方统计与日志。"""
+
+    imported: int = 0
+    removed: int = 0
+    tombstones: int = 0
 
 
 class SyncCipher:
@@ -145,6 +167,7 @@ class FolderSync:
         cipher: Optional[SyncCipher] = None,
         guard: Optional[PrivacyGuard] = None,
         cursors: Optional[SyncCursorStore] = None,
+        tombstones: Optional[TombstoneStore] = None,
     ) -> None:
         self._storage = storage
         self.folder = Path(folder)
@@ -152,6 +175,7 @@ class FolderSync:
         self._cipher = cipher or SyncCipher(False)
         self._guard = guard
         self.cursors = cursors if cursors is not None else SyncCursorStore()
+        self.tombstones = tombstones if tombstones is not None else TombstoneStore()
         self._lock = threading.RLock()
 
     @property
@@ -179,7 +203,7 @@ class FolderSync:
         already = self._local_hashes()
         records: List[SyncRecord] = []
         for item in self._storage.list(limit=limit):
-            if not item.hash or item.hash in already:
+            if not item.hash or contains_hash(already, item.hash):
                 continue
             if item.sensitive and not self._allow_sensitive():
                 continue
@@ -198,6 +222,27 @@ class FolderSync:
                 )
             )
 
+        # 删除标记接在新增之后：同一份日志内「先有后无」的顺序，
+        # 才能让对端按读取顺序得到正确结论（而不是反过来把删除当成新增）。
+        #
+        # 注意这里**不能**按 `already` 过滤。`already` 是「内容已导出过」的集合，
+        # 而「导出过内容」恰恰是删除标记要传达的前提：正因为对端当年收到过这一条，
+        # 才需要被告知「它已经删了」。按 `already` 过滤会把墓碑全拦掉，
+        # 删除也就永远不会传播 —— 这个 bug 有单独用例守着。
+        pending = list(self.tombstones.pending())
+        records.extend(
+            SyncRecord(
+                hash=entry.hash,
+                kind="tombstone",
+                content="",
+                preview="",
+                device=self.device_name,
+                created_at=entry.deleted_at,
+                deleted_at=entry.deleted_at,
+            )
+            for entry in pending
+        )
+
         if not records:
             return 0
 
@@ -210,6 +255,10 @@ class FolderSync:
             with open(self.journal_path, "ab") as handle:
                 handle.write(len(blob).to_bytes(4, "big"))
                 handle.write(blob)
+        # 写入成功后才确认送达：写失败时异常向上抛，墓碑保持待发状态，下轮重试。
+        # 确认之后不再复述，否则每轮同步都要重传一遍历史删除。
+        if pending:
+            self._ack_sent_tombstones()
         _log.info("导出 %d 条记录到 %s", len(records), self.journal_path.name)
         return len(records)
 
@@ -239,26 +288,72 @@ class FolderSync:
             return 0
         imported = 0
         seen_local = {item.hash for item in self._storage.list(limit=MAX_SYNC_ENTRIES)}
+        acked = False
         for path in sorted(self.folder.glob("*.llsync")):
             # 自己的日志也读，用于补齐「另一台机器先导入过」的场景
-            imported += self._import_journal(path, seen_local)
+            outcome = self._import_journal(path, seen_local)
+            imported += outcome.imported
+            acked = acked or bool(outcome.tombstones)
+        if acked:
+            # 对端确实接收过删除标记：把本机待发的那些标为已送达，之后不再复述。
+            # 放在循环外统一做一次，避免每读一份日志就重写一遍墓碑文件。
+            self._ack_sent_tombstones()
         if imported:
             _log.info("从同步目录导入 %d 条记录", imported)
         return imported
 
-    def _import_journal(self, path: Path, seen_local: set) -> int:
-        """导入单份对端日志，并推进其游标。返回导入条数。"""
+    def _ack_sent_tombstones(self) -> int:
+        """把「已经写进自己日志的」待发墓碑标为已送达。
+
+        判定依据是本地日志里确实存在这些指纹 —— 只有真的写进去了才敢确认，
+        否则（磁盘满、权限不足导致写入失败）下轮还得重发。
+        """
+        already = self._local_hashes()
+        delivered = [
+            entry.hash
+            for entry in self.tombstones.pending()
+            if contains_hash(already, entry.hash)
+        ]
+        if not delivered:
+            return 0
+        return self.tombstones.ack(delivered)
+
+    def _import_journal(self, path: Path, seen_local: set) -> "ImportOutcome":
+        """导入单份对端日志，并推进其游标。返回本轮统计。"""
         key = self.cursor_key(path)
         since = self.cursors.since_for(key)
-        imported = 0
+        outcome = ImportOutcome()
         newest = since
-        for record in self._read_journal(path):
-            created = float(getattr(record, "created_at", 0.0) or 0.0)
-            # 游标之后的新内容才值得检查；更旧的记录上轮已处理过
-            if created <= since:
+        records = [
+            record
+            for record in self._read_journal(path)
+            if float(getattr(record, "created_at", 0.0) or 0.0) > since
+        ]
+
+        # 同一份日志里被判过删除的指纹：后面的内容记录一律不再写入。
+        # 顺序至关重要 —— 日志是追加式的，「先有内容、后有删除」；
+        # 若反过来让内容记录覆盖删除，用户删掉的东西会被同一条日志复活。
+        # 游标的安全窗口（回退 1 秒）会让这两条落在同一批里，
+        # 所以这个「批内去重」不是可选项。
+        deleted_in_batch: set = set()
+        for record in records:
+            newest = max(newest, float(getattr(record, "created_at", 0.0) or 0.0))
+            if record.is_tombstone:
+                # 删除标记只认别的设备发出的：自己写进日志的那条不算
+                if record.device == self.device_name:
+                    continue
+                outcome.tombstones += 1
+                deleted_in_batch.add(record.hash)
+                if self._apply_tombstone(record, seen_local):
+                    outcome.removed += 1
+
+        for record in records:
+            if record.is_tombstone:
                 continue
-            newest = max(newest, created)
-            if record.hash in seen_local:
+            if contains_hash(deleted_in_batch, record.hash):
+                # 同一批里它已被删除，别再写回来
+                continue
+            if contains_hash(seen_local, record.hash):
                 continue
             if record.device == self.device_name:
                 continue
@@ -269,11 +364,46 @@ class FolderSync:
                     continue
             self._storage.add(item)
             seen_local.add(record.hash)
-            imported += 1
+            outcome.imported += 1
         # 只有在完整读完后才推进游标：解析中途出错不该跳过剩余记录
         if newest > since:
             self.cursors.advance(key, newest)
-        return imported
+        return outcome
+
+    def _apply_tombstone(self, record: SyncRecord, seen_local: Optional[set] = None) -> bool:
+        """收到对端的删除标记：记下它，并清掉本地同一指纹的记录。
+
+        三条约束，顺序也就是优先级：
+
+        1. **指纹已在本地墓碑里** → 幂等，直接返回。重复收到同一条删除不该有任何副作用。
+        2. **超出保留期** → 只记指纹、不动本地记录。对端离线太久，它那边删掉的
+           东西这边早已「活」了很久，此时再删就是在丢本机自己的数据。
+        3. **固定项** → 只记指纹、不动记录。用户显式标了「别动它」，
+           删除传播不该越过这条线。
+
+        注意判定用的是 `record.deleted_at`（对端的删除时刻），不是收到时刻 ——
+        否则一台设备离线很久再上线时，本该过期的删除会被当成刚发生的。
+        """
+        if self.tombstones.has(record.hash):
+            return False
+        self.tombstones.record(record.hash, deleted_at=record.deleted_at)
+        if seen_local is not None:
+            seen_local.add(record.hash)
+
+        if record.deleted_at > 0 and self.tombstones.is_expired(
+            Tombstone(hash=record.hash, deleted_at=record.deleted_at)
+        ):
+            return False
+
+        existing = self._storage.find_by_hash(record.hash)
+        if existing is None:
+            return False
+        if existing.pinned:
+            # 固定项是用户显式标记「别动它」的，删除传播不该越过这条线
+            _log.info("保留固定项，跳过对端删除标记：%s", record.hash)
+            return False
+        self._storage.delete(existing.id)
+        return True
 
     def _read_journal(self, path: Path) -> Iterable[SyncRecord]:
         """按「4 字节长度 + 载荷」的分块格式读取，单块损坏不影响其余。"""

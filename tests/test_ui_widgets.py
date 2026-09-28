@@ -11,7 +11,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6")
 
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel  # noqa: E402
 
 from linglong_clip.core.automation import AutomationEngine  # noqa: E402
 from linglong_clip.core.models import ClipboardItem  # noqa: E402
@@ -584,7 +584,6 @@ def test_settings_native_panel_renders_checks(qt_app, home):
 
     用户不该为了知道「快捷键为什么没生效」去翻日志或开终端。
     """
-    from PySide6.QtWidgets import QLabel
 
     from linglong_clip.ui.settings_dialog import SettingsDialog
     from linglong_clip.utils.config import Config
@@ -602,7 +601,6 @@ def test_settings_native_panel_renders_checks(qt_app, home):
 
 
 def test_settings_native_panel_shows_failure_hint(qt_app, home):
-    from PySide6.QtWidgets import QLabel
 
     from linglong_clip.ui.settings_dialog import SettingsDialog
     from linglong_clip.utils.config import Config
@@ -1054,3 +1052,68 @@ def test_quick_paste_overlay_paste_nth(storage, config, qt_app):
     chosen.clear()
     overlay.paste_nth(99)
     assert chosen == []
+# ---- 设置页：删除的同步 ----
+
+
+def test_settings_shows_tombstone_summary(qt_app, home):
+    from linglong_clip.core.tombstones import build_tombstone_store
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    store = build_tombstone_store()
+    store.record("aaaabbbbccccddddeeeeffff00001111")
+
+    config = Config(home / "config.json")
+    dialog = SettingsDialog(config)
+    texts = [
+        child.text()
+        for child in dialog.findChildren(QLabel)
+        if child.text()
+    ]
+    assert any("等待同步" in text for text in texts)
+    assert any("tombstones.json" in text for text in texts)
+
+
+def test_settings_tombstone_panel_survives_broken_file(qt_app, home):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+    from linglong_clip.core.tombstones import TOMBSTONE_FILENAME
+
+    (home / TOMBSTONE_FILENAME).write_text("{ not json", encoding="utf-8")
+    config = Config(home / "config.json")
+    dialog = SettingsDialog(config)  # 不该抛异常
+    texts = [child.text() for child in dialog.findChildren(QLabel) if child.text()]
+    assert any("还没有被删除的内容" in text for text in texts)
+
+
+def test_settings_reports_online_peers(qt_app, home):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    dialog = SettingsDialog(
+        config,
+        None,
+        {
+            "folder": "/tmp/x",
+            "devices": ["a"],
+            "encrypted": False,
+            "peers": [
+                {"host": "192.168.1.8", "port": 48620, "ok": True, "device": "笔记本"},
+                {"host": "192.168.1.9", "port": 48620, "ok": False, "device": ""},
+            ],
+        },
+    )
+    texts = [child.text() for child in dialog.findChildren(QLabel) if child.text()]
+    assert any("1/2 台在线" in text for text in texts)
+    assert any("笔记本" in text for text in texts)
+
+
+def test_settings_omits_peer_row_when_absent(qt_app, home):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    dialog = SettingsDialog(config, None, {"folder": "/tmp/x", "devices": []})
+    texts = [child.text() for child in dialog.findChildren(QLabel) if child.text()]
+    assert not any("台在线" in text for text in texts)

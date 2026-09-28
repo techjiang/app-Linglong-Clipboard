@@ -28,6 +28,7 @@ from ..core.repository import open_repository
 from ..core.lan_sync import LanSync, build_lan_sync
 from ..core.sync import FolderSync, SyncCipher
 from ..core.sync_cursor import SyncCursorStore
+from ..core.tombstones import TombstoneStore, fingerprint
 from ..platform import detect_backend
 from ..utils.config import Config
 from ..utils.logger import get_logger, setup_logging
@@ -147,6 +148,8 @@ class Application(QObject):
         # 同步增量游标：两种同步模式共用一份，切换模式时进度不丢
         self.sync_cursors = SyncCursorStore()
         self.sync_cursors.load()
+        self.tombstones = TombstoneStore()
+        self.tombstones.load()
 
         self.collector = Collector(
             self.storage,
@@ -276,7 +279,8 @@ class Application(QObject):
         mode = str(self.config.get("sync.mode", "folder") or "folder").lower()
         if mode == "lan":
             lan = build_lan_sync(
-                self.storage, self.config, self.guard, cursors=self.sync_cursors
+                self.storage, self.config, self.guard, cursors=self.sync_cursors,
+                tombstones=self.tombstones
             )
             if lan is not None and lan.start():
                 _log.info("局域网同步已就绪：%s", lan.status())
@@ -298,6 +302,7 @@ class Application(QObject):
             cipher=cipher,
             guard=self.guard,
             cursors=self.sync_cursors,
+            tombstones=self.tombstones,
         )
 
     def _wire_signals(self) -> None:
@@ -697,7 +702,12 @@ class Application(QObject):
             return False
 
     def delete_item(self, item_id: int) -> None:
+        # 先取指纹再删：记录没了就没法算指纹，也就没东西能告诉对端「这条删了」
+        item = self.storage.get(item_id)
+        digest = fingerprint(item) if item is not None else ""
         self.storage.delete(item_id)
+        if digest:
+            self.tombstones.record(digest)
         self.window.reload()
         self.window.notify("已删除")
 

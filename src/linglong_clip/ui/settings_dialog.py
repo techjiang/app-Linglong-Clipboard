@@ -432,6 +432,20 @@ class SettingsDialog(QDialog):
                         else "暂无"
                     ),
                 )
+            peers = self._device_status.get("peers") or []
+            if peers:
+                online = [peer for peer in peers if peer.get("ok")]
+                info_form.addRow(
+                    "可同步对端",
+                    QLabel(
+                        f"{len(online)}/{len(peers)} 台在线 · "
+                        + "、".join(
+                            f"{peer.get('host')}:{peer.get('port')}"
+                            + (f"（{peer['device']}）" if peer.get("device") else "")
+                            for peer in peers
+                        )
+                    ),
+                )
             cursor_file = str(self._device_status.get("cursor_file", "") or "")
             if cursor_file:
                 label = QLabel(cursor_file)
@@ -439,8 +453,60 @@ class SettingsDialog(QDialog):
                 info_form.addRow("游标文件", label)
             layout.addWidget(info)
 
+        layout.addWidget(self._build_tombstone_group())
+
         layout.addStretch(1)
         return page
+
+    def _build_tombstone_group(self) -> QGroupBox:
+        """删除标记面板：让「我在这台删了，那台却还在」有地方可查。"""
+        group = QGroupBox("删除的同步")
+        form = QFormLayout(group)
+
+        try:
+            from ..core.tombstones import build_tombstone_store
+
+            status = build_tombstone_store().status()
+        except Exception as exc:  # noqa: BLE001 - 面板不该因为读不到文件而崩
+            _log.debug("读取删除标记失败：%s", exc)
+            status = {}
+
+        count = int(status.get("count", 0) or 0)
+        pending = int(status.get("pending", 0) or 0)
+        if not count:
+            summary = "本机还没有被删除的内容"
+        elif pending:
+            summary = f"共 {count} 条，{pending} 条等待同步到其它设备"
+        else:
+            summary = f"共 {count} 条，均已同步到其它设备"
+        form.addRow("状态", QLabel(summary))
+
+        retention = int(status.get("retention_seconds", 0) or 0)
+        if retention:
+            days = retention / 86400
+            form.addRow(
+                "保留期",
+                QLabel(
+                    f"{days:g} 天（超期后不再向对端传播，避免误删对端自己的数据）"
+                ),
+            )
+
+        path = str(status.get("path", "") or "")
+        if path:
+            label = QLabel(path)
+            label.setToolTip(
+                "记录本机删除过的内容指纹（不含内容本身）。\n"
+                "删掉这个文件只会让已发出的删除不再复述，不影响本地删除。"
+            )
+            form.addRow("标记文件", label)
+
+        hint = QLabel(
+            "在一台设备上删除记录后，其它设备上的同一内容会在下次同步时一起删除；\n"
+            "固定项与「本轮之前就存在很久」的删除会被保留。"
+        )
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+        return group
 
     def _build_lan_group(self) -> QGroupBox:
         """局域网直连：同网段设备互相拉取，不经过任何服务器。"""
