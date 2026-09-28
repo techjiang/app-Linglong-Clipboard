@@ -30,6 +30,11 @@ from ..core.lan_sync import LanSync, build_lan_sync
 from ..core.sync import FolderSync, SyncCipher
 from ..core.sync_cursor import SyncCursorStore
 from ..core.tombstones import TombstoneStore, fingerprint
+from ..core.flag_changes import (
+    FLAG_FAVORITE,
+    FLAG_PINNED,
+    FlagChangeStore,
+)
 from ..platform import detect_backend
 from ..utils.config import Config
 from ..utils.logger import get_logger, setup_logging
@@ -161,6 +166,10 @@ class Application(QObject):
         self.sync_cursors.load()
         self.tombstones = TombstoneStore()
         self.tombstones.load()
+        # 标记变更通道：让「取消固定/取消收藏」也能跨设备传播。
+        # 与墓碑并列，见 `core/flag_changes.py`。
+        self.flag_changes = FlagChangeStore()
+        self.flag_changes.load()
 
         self.collector = Collector(
             self.storage,
@@ -325,7 +334,7 @@ class Application(QObject):
         if mode == "lan":
             lan = build_lan_sync(
                 self.storage, self.config, self.guard, cursors=self.sync_cursors,
-                tombstones=self.tombstones
+                tombstones=self.tombstones, flag_changes=self.flag_changes,
             )
             if lan is not None and lan.start():
                 _log.info("局域网同步已就绪：%s", lan.status())
@@ -348,6 +357,7 @@ class Application(QObject):
             guard=self.guard,
             cursors=self.sync_cursors,
             tombstones=self.tombstones,
+            flag_changes=self.flag_changes,
         )
 
     def _wire_signals(self) -> None:
@@ -810,13 +820,18 @@ class Application(QObject):
     def toggle_flag(self, item_id: int, field: str, value: bool) -> None:
         """切换固定/收藏标记。
 
-        界面只发意图，写入在这里做，因为有两件界面不该操心的事：
+        界面只发意图，写入在这里做，因为有三件界面不该操心的事：
 
         1. **固定标记要记来源设备**（`pinned_by`）。删除传播默认会被固定标记
            挡住（「别动它」的意图优先），但若固定是**发起删除的那台设备**设的，
            就说明它已经改主意了，那个固定是过期残留，不该继续挡着。
            记下来源，收到删除标记时才判断得出这一点 —— 详见 `pin_is_stale`。
         2. **写入要能被同步层看见**：标记靠同步传播，顺序不能乱。
+        3. **「取消」也要记成事件**。只写 `pinned=False` 的话，同步层拿到的
+           仍然只是一个布尔值 —— 「取消过」和「从未设过」还是分不开，
+           并集语义下取消就传不出去。所以这里额外往变更通道里记一笔
+           （带时间戳的显式动作），对端才推得出「这台设备取消了」。
+           详见 `core/flag_changes.py`。
         """
         if field not in ("pinned", "favorite"):
             return
@@ -835,7 +850,24 @@ class Application(QObject):
             metadata=metadata,
             **{field: bool(value)},
         )
+        self._record_flag_change(item, field, bool(value))
         self.window.reload()
+
+    def _record_flag_change(self, item: ClipboardItem, field: str, value: bool) -> None:
+        """把这次显式动作记进变更通道（含取消）。
+
+        只在指纹已知时记：没指纹的记录本来就不参与同步，
+        记下来也只会变成一条永远匹配不上的死事件。
+        失败只记日志 —— 取消传播不上不该影响用户在这台机器上的操作。
+        """
+        digest = fingerprint(item)
+        if not digest:
+            return
+        flag = FLAG_PINNED if field == "pinned" else FLAG_FAVORITE
+        try:
+            self.flag_changes.record(digest, flag, value)
+        except Exception:  # noqa: BLE001 - 变更记录是辅助信息，失败不该冒泡到界面
+            _log.exception("记录标记变更失败：%s %s", digest, flag)
 
     def delete_item(self, item_id: int) -> None:
         # 先取指纹再删：记录没了就没法算指纹，也就没东西能告诉对端「这条删了」

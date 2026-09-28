@@ -1036,3 +1036,102 @@ def test_monitor_primary_flag_reaches_cli_branch():
 
     args = build_parser().parse_args(["--monitor-primary"])
     assert args.monitor_primary is True
+
+
+# ------------------------------------------- 标记变更（取消固定/收藏）
+
+
+def test_flag_changes_skips_gui_dispatch(cli_env, monkeypatch, capsys):
+    """必须命中 CLI 分支，不能落到 GUI 分支把进程挂住。
+
+    与 `--merge-duplicates` 那次的回归同类：漏登记分发表不是报错，
+    是静默挂起，靠测试超时才发现。
+    """
+    from linglong_clip.ui import application as app_module
+
+    def boom(*args, **kwargs):
+        raise AssertionError("不该启动 GUI")
+
+    monkeypatch.setattr(app_module, "Application", boom)
+    assert main(["--flag-changes"]) == 0
+
+
+def test_flag_changes_reset_skips_gui_dispatch(cli_env, monkeypatch, capsys):
+    from linglong_clip.ui import application as app_module
+
+    def boom(*args, **kwargs):
+        raise AssertionError("不该启动 GUI")
+
+    monkeypatch.setattr(app_module, "Application", boom)
+    assert main(["--flag-changes-reset"]) == 0
+
+
+def test_flag_changes_empty_state(cli_env, capsys):
+    """还没有任何显式调整时给一句可读解释，而不是空白。"""
+    assert main(["--flag-changes"]) == 0
+    out = capsys.readouterr().out
+    assert "标记变更文件" in out
+    assert "本机还没有对固定/收藏做过显式调整" in out
+
+
+def test_flag_changes_lists_records(cli_env, capsys):
+    """有变更时列出正负两向，且显示是谁做的。"""
+    from linglong_clip.core.flag_changes import (
+        FLAG_FAVORITE,
+        FLAG_PINNED,
+        build_flag_change_store,
+    )
+
+    store = build_flag_change_store()
+    store.record("abc123", FLAG_PINNED, True, at=1_700_000_000, device="")
+    store.record("abc123", FLAG_PINNED, False, at=1_700_000_100, device="")
+    store.record("def456", FLAG_FAVORITE, True, at=1_700_000_200, device="laptop")
+
+    assert main(["--flag-changes"]) == 0
+    out = capsys.readouterr().out
+    assert "固定设置" in out
+    assert "固定取消" in out
+    assert "收藏设置" in out
+    assert "laptop" in out
+    assert "本机" in out
+
+
+def test_flag_changes_json_output(cli_env, capsys):
+    import json as _json
+
+    from linglong_clip.core.flag_changes import FLAG_PINNED, build_flag_change_store
+
+    build_flag_change_store().record("abc", FLAG_PINNED, False, at=1_700_000_000)
+    assert main(["--flag-changes", "--json"]) == 0
+    payload = _json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["changes"][0]["value"] is False
+
+
+def test_flag_changes_reset_also_prints_status(cli_env, capsys):
+    """两个标志同时给出时，重置之后接着展示现状（与 --tombstones 一致）。"""
+    from linglong_clip.core.flag_changes import FLAG_PINNED, build_flag_change_store
+
+    build_flag_change_store().record("abc", FLAG_PINNED, True, at=1_700_000_000)
+    assert main(["--flag-changes-reset", "--flag-changes"]) == 0
+    out = capsys.readouterr().out
+    assert "已清空 1 条标记变更" in out
+    assert "共 0 条" in out
+
+
+def test_flag_changes_reset_alone_exits(cli_env, capsys):
+    from linglong_clip.core.flag_changes import FLAG_PINNED, build_flag_change_store
+
+    build_flag_change_store().record("abc", FLAG_PINNED, True, at=1_700_000_000)
+    assert main(["--flag-changes-reset"]) == 0
+    out = capsys.readouterr().out
+    assert "已清空 1 条标记变更" in out
+
+
+def test_flag_changes_flags_registered_in_dispatch_table():
+    """两个标志都要在 `main()` 的分发表里 —— 这是最容易漏的一步。"""
+    from linglong_clip.__main__ import build_parser
+
+    parser = build_parser()
+    assert parser.parse_args(["--flag-changes"]).flag_changes is True
+    assert parser.parse_args(["--flag-changes-reset"]).flag_changes_reset is True

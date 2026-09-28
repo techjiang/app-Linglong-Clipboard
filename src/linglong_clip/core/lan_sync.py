@@ -41,14 +41,18 @@ from .privacy import PrivacyGuard
 from .storage import Storage
 from .sync import (
     MAX_SYNC_ENTRIES,
+    FlagSnapshot,
     FolderSync,
     SyncCipher,
     SyncRecord,
+    _apply_resolved_flags,
+    _resolved_flags,
     apply_flags,
     pin_is_stale,
 )
 from .sync_cursor import SyncCursorStore
 from .tombstones import Tombstone, TombstoneStore, contains_hash
+from .flag_changes import FlagChangeStore
 
 _log = get_logger("lan_sync")
 
@@ -183,7 +187,9 @@ class _PeerHandler(BaseHTTPRequestHandler):
             except ValueError:
                 limit = DEFAULT_PAGE_SIZE
             limit = max(1, min(limit, MAX_SYNC_ENTRIES))
-            records = owner.collect_records(since=since, limit=limit)
+            records, sent_tombstones, sent_changes = owner.collect_records_detailed(
+                since=since, limit=limit
+            )
             self._send_json(
                 200,
                 {
@@ -194,6 +200,11 @@ class _PeerHandler(BaseHTTPRequestHandler):
                     "records": records,
                 },
             )
+            # 写出成功之后才确认送达：`_send_json` 里的 `wfile.write` 失败会
+            # 抛异常，走不到这一行，事件保持待发、下轮重传。
+            # 之前这里没有确认，于是「已送达的不再复述」在局域网模式下
+            # 从未生效 —— 每轮同步都在重传全部历史删除。
+            owner.ack_delivered(sent_tombstones, sent_changes)
             return
 
         self._send_json(404, {"ok": False, "error": "not found"})
@@ -221,6 +232,7 @@ class LanSyncServer:
         guard: Optional[PrivacyGuard] = None,
         max_entries: int = MAX_SYNC_ENTRIES,
         tombstones: Optional[TombstoneStore] = None,
+        flag_changes: Optional[FlagChangeStore] = None,
     ) -> None:
         self._storage = storage
         self.device_name = device_name or socket.gethostname()
@@ -231,6 +243,10 @@ class LanSyncServer:
         self._guard = guard
         self._max_entries = max_entries
         self.tombstones = tombstones if tombstones is not None else TombstoneStore()
+        #: 标记变更通道：让「取消固定/取消收藏」也能跨设备传播。
+        self.flag_changes = (
+            flag_changes if flag_changes is not None else FlagChangeStore()
+        )
         self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.RLock()
@@ -259,7 +275,24 @@ class LanSyncServer:
 
         返回字符串列表而不是对象，是因为加密后的载荷就是字节串，
         序列化成 base64 由客户端解——明文模式下则是普通 JSON 串。
+
+        真正要确认送达的是 ``collect_records_detailed``，见它。
         """
+        return self.collect_records_detailed(since=since, limit=limit)[0]
+
+    def collect_records_detailed(
+        self, *, since: float = 0.0, limit: int = DEFAULT_PAGE_SIZE
+    ) -> tuple:
+        """同 `collect_records`，但额外返回「本批带出去的墓碑与标记变更」。
+
+        为什么要返回它们：局域网是**拉取模型**，服务端只有在写出响应之后
+        才知道对端拿到了数据。确认送达必须发生在写成功之后（见
+        `_handle_records`），而这些对象正是那一批的内容 —— 不返回它们，
+        后面的 `ack` 就无从下手，于是「已送达的不再复述」这条约定在
+        局域网模式下从未生效，每轮都在重传全部历史删除。
+        """
+        sent_tombstones: List[Tombstone] = []
+        sent_changes: List[FlagChange] = []
         items = self._eligible_items(since=since, limit=limit)
 
         payload = [
@@ -287,6 +320,7 @@ class LanSyncServer:
         # 一个刚离线过的对端就会永远收不到这段区间里的删除。
         # 所以墓碑单独成批，和内容一起放进同一个响应（客户端先应用删除再导入内容）。
         pending = self.tombstones.pending()
+        sent_tombstones.extend(pending)
         payload.extend(
             SyncRecord(
                 hash=entry.hash,
@@ -300,21 +334,65 @@ class LanSyncServer:
             for entry in pending
         )
 
+        # 标记变更（取消固定/收藏）：与墓碑同理，不能受 `since` 过滤 ——
+        # 取消要传达的前提正是「对端当年收到过这个标记」，按游标裁掉就会
+        # 永远传不出去。变更的 `device` 在这里补上发送方设备名，
+        # 对端才能按设备取最新意图（见 flag_changes.resolve_flag）。
+        pending_changes = self.flag_changes.pending()
+        sent_changes.extend(pending_changes)
+        payload.extend(
+            SyncRecord(
+                hash=change.hash,
+                kind="flag_change",
+                content="",
+                preview="",
+                device=self.device_name,
+                created_at=change.at,
+                flag_change=change.flag,
+                flag_value=change.value,
+            )
+            for change in pending_changes
+        )
+
         if not payload:
-            return []
+            return [], sent_tombstones, sent_changes
 
         body = "\n".join(
             json.dumps(record.to_json(), ensure_ascii=False) for record in payload
         ).encode("utf-8")
 
         if not self._cipher.enabled:
-            return [json.dumps(record.to_json(), ensure_ascii=False) for record in payload]
+            return (
+                [json.dumps(record.to_json(), ensure_ascii=False) for record in payload],
+                sent_tombstones,
+                sent_changes,
+            )
 
         # 加密模式：整块加密后 base64 成一行，客户端按同一密钥解
         import base64
 
         blob = self._cipher.encrypt(body)
-        return ["ENC:" + base64.b64encode(blob).decode("ascii")]
+        return (
+            ["ENC:" + base64.b64encode(blob).decode("ascii")],
+            sent_tombstones,
+            sent_changes,
+        )
+
+    def ack_delivered(self, tombstones: Iterable, changes: Iterable) -> None:
+        """确认这一批事件已经写进响应、交给对端。
+
+        只在 HTTP 写出成功之后调用：写失败时 `wfile.write` 抛异常，
+        调用方根本走不到这里，事件保持待发、下轮重传 —— 宁可重复告知，
+        也不能漏（漏一次就是删除/取消没有传播）。
+        """
+        tombstone_list = list(tombstones)
+        if tombstone_list:
+            self.tombstones.ack([entry.hash for entry in tombstone_list])
+        change_list = list(changes)
+        if change_list:
+            self.flag_changes.ack(
+                [self.flag_changes._key(change) for change in change_list]
+            )
 
     def _eligible_items(self, *, since: float, limit: int) -> List[ClipboardItem]:
         """挑选可外发的记录：过隐私、跳过图片与敏感项，且晚于 `since`。"""
@@ -388,6 +466,8 @@ class LanImportOutcome:
     tombstones: int = 0
     #: 因对端带来了本地没有的标记（固定/收藏）而被更新的条数
     flags_updated: int = 0
+    #: 因对端带来了本机不知道的标记变更（含取消）而入账的条数
+    flag_changes: int = 0
 
 
 class LanSyncClient:
@@ -404,6 +484,7 @@ class LanSyncClient:
         timeout: float = DEFAULT_HTTP_TIMEOUT,
         cursors: Optional[SyncCursorStore] = None,
         tombstones: Optional[TombstoneStore] = None,
+        flag_changes: Optional[FlagChangeStore] = None,
     ) -> None:
         self._storage = storage
         self.device_name = device_name or socket.gethostname()
@@ -413,6 +494,10 @@ class LanSyncClient:
         self._timeout = timeout
         self.cursors = cursors if cursors is not None else SyncCursorStore()
         self.tombstones = tombstones if tombstones is not None else TombstoneStore()
+        #: 标记变更通道（与共享文件夹模式共用同一份规则）
+        self.flag_changes = (
+            flag_changes if flag_changes is not None else FlagChangeStore()
+        )
 
     def fetch(self, peer: PeerInfo, *, since: float = 0.0, limit: int = DEFAULT_PAGE_SIZE) -> Optional[List[SyncRecord]]:
         """拉取一个对端的记录；不可达或鉴权失败时返回 `None`。"""
@@ -515,12 +600,31 @@ class LanSyncClient:
             if self._apply_tombstone(record, seen):
                 outcome.removed += 1
 
+        # 标记变更要先于内容处理：一条「取消固定」的事件必须先落进变更存储，
+        # 后面同批里的内容记录才能算出正确的标记终值。顺序反了的话，
+        # 取消会被同批内容的并集盖回去 —— 与墓碑「先删后写」同理。
+        for record in records:
+            if not record.is_flag_change:
+                continue
+            if record.device == self.device_name:
+                continue
+            if self.flag_changes.record(
+                record.hash,
+                record.flag_change,
+                record.flag_value,
+                at=record.created_at,
+                device=record.device,
+            ):
+                outcome.flag_changes += 1
+            if self._apply_flag_change(record.hash, seen):
+                outcome.flags_updated += 1
+
         # 本地已记墓碑的指纹不再写回：否则本机删掉的记录会从对端日志里复活。
         # 与共享文件夹模式同一条规则，两处不能各写一套。
         deleted_in_store = self.tombstones.all_hashes()
 
         for record in records:
-            if record.is_tombstone:
+            if record.is_tombstone or record.is_flag_change:
                 continue
             if contains_hash(deleted_in_store, record.hash):
                 _log.debug("跳过已删除的记录（本地有墓碑）：%s", record.hash)
@@ -529,7 +633,7 @@ class LanSyncClient:
                 # 内容本地已有 —— 但**标记可能还没有**。此前这里直接跳过，
                 # 于是对端后加的固定/收藏永远传不过来。与共享文件夹模式
                 # 共用同一份 apply_flags，两条路径不能各写一套规则。
-                if apply_flags(self._storage, record, seen):
+                if apply_flags(self._storage, record, seen, self.flag_changes):
                     outcome.flags_updated += 1
                 continue
             if record.device == self.device_name:
@@ -541,9 +645,54 @@ class LanSyncClient:
                     continue
             self._storage.add(item)
             seen.add(record.hash)
-            apply_flags(self._storage, record, seen)
+            apply_flags(self._storage, record, seen, self.flag_changes)
             outcome.imported += 1
         return outcome
+
+    def _apply_flag_change(self, target_hash: str, seen: set) -> bool:
+        """把某指纹上解出来的标记终值落到本地记录上。
+
+        与共享文件夹模式共用同一份解算规则（`_resolved_flags` /
+        `_apply_resolved_flags`），两条路径不能各写一套。
+
+        为什么不能只靠内容记录：内容只发一次，标记变化是之后的动作，
+        所以变更到达时同批里往往没有那条的内容记录 —— 只靠内容循环里的
+        `apply_flags` 永远碰不到它。本地没有这条内容时无处可落，
+        等它随内容记录一起来时再处理。
+        """
+        from .models import PINNED_BY_KEY
+
+        existing = self._storage.find_by_hash(target_hash)
+        if existing is None:
+            return False
+        resolved = _resolved_flags(self.flag_changes, target_hash)
+        if resolved is None:
+            return False
+        local = FlagSnapshot(
+            pinned=existing.pinned,
+            favorite=existing.favorite,
+            pinned_by=existing.pinned_by,
+        )
+        merged = _apply_resolved_flags(local, self.flag_changes, target_hash)
+        if (
+            merged.pinned == existing.pinned
+            and merged.favorite == existing.favorite
+            and merged.pinned_by == existing.pinned_by
+        ):
+            return False
+        metadata = dict(existing.metadata)
+        if merged.pinned and merged.pinned_by:
+            metadata[PINNED_BY_KEY] = merged.pinned_by
+        else:
+            metadata.pop(PINNED_BY_KEY, None)
+        self._storage.update_fields(
+            existing.id,
+            pinned=merged.pinned,
+            favorite=merged.favorite,
+            metadata=metadata,
+        )
+        seen.add(target_hash)
+        return True
 
     def _apply_tombstone(self, record: SyncRecord, seen: set) -> bool:
         """落地一条对端删除标记，并清掉本地同指纹的记录。
@@ -744,6 +893,7 @@ class LanSync:
     guard: Optional[PrivacyGuard] = None
     cursors: Optional[SyncCursorStore] = None
     tombstones: Optional[TombstoneStore] = None
+    flag_changes: Optional[FlagChangeStore] = None
     _server: Optional[LanSyncServer] = field(default=None, init=False)
     _client: Optional[LanSyncClient] = field(default=None, init=False)
     _discovery: Optional[DiscoveryService] = field(default=None, init=False)
@@ -754,6 +904,10 @@ class LanSync:
         cipher = self.cipher or SyncCipher(False)
         tombstones = self.tombstones if self.tombstones is not None else TombstoneStore()
         self.tombstones = tombstones
+        flag_changes = (
+            self.flag_changes if self.flag_changes is not None else FlagChangeStore()
+        )
+        self.flag_changes = flag_changes
         self._server = LanSyncServer(
             self.storage,
             device_name=name,
@@ -762,6 +916,7 @@ class LanSync:
             cipher=cipher,
             guard=self.guard,
             tombstones=tombstones,
+            flag_changes=flag_changes,
         )
         cursors = self.cursors if self.cursors is not None else SyncCursorStore()
         self.cursors = cursors
@@ -773,6 +928,7 @@ class LanSync:
             guard=self.guard,
             cursors=cursors,
             tombstones=tombstones,
+            flag_changes=flag_changes,
         )
         # 端口为 0 时先不固定，等 start() 拿到系统分配的端口再用于发现广播
         self._cipher = cipher
@@ -859,6 +1015,7 @@ class LanSync:
             total.removed += outcome.removed
             total.tombstones += outcome.tombstones
             total.flags_updated += outcome.flags_updated
+            total.flag_changes += outcome.flag_changes
         return total
 
     def probe(self, peer: PeerInfo) -> bool:
@@ -913,6 +1070,7 @@ def build_lan_sync(
     guard: Optional[PrivacyGuard] = None,
     cursors: Optional[SyncCursorStore] = None,
     tombstones: Optional[TombstoneStore] = None,
+    flag_changes: Optional[FlagChangeStore] = None,
 ) -> Optional[LanSync]:
     """按配置构造局域网同步；未启用时返回 `None`。"""
     if not config.get("sync.enabled", False):
@@ -940,4 +1098,5 @@ def build_lan_sync(
         guard=guard,
         cursors=cursors,
         tombstones=tombstones,
+        flag_changes=flag_changes,
     )

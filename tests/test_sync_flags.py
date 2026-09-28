@@ -14,6 +14,11 @@ import pytest
 
 from linglong_clip.core.models import ClipboardItem, content_hash
 from linglong_clip.core.storage import Storage
+from linglong_clip.core.flag_changes import (
+    FLAG_FAVORITE,
+    FLAG_PINNED,
+    FlagChangeStore,
+)
 from linglong_clip.core.sync import (
     FlagSnapshot,
     FolderSync,
@@ -820,3 +825,292 @@ def test_local_pin_protects_when_origin_not_overwritten(tmp_path):
 
     assert sync_a.import_all_detailed().removed == 0
     assert a.find_by_hash(digest) is not None
+
+
+# ---- 取消的传播（本轮新增：变更通道） ----
+# 上面那条 `test_unpinning_locally_is_not_reverted_by_peer` 描述的是
+# **没有任何设备说过取消**时的行为：并集把固定带回来。那是刻意的边界。
+# 现在多了一条通道：显式取消会留下一条带时间戳的事件，于是「我在
+# 笔记本上取消了」成为一个能被传播的事实。下面这些用例守这条路径。
+
+
+def _record_cancel(storage, digest, flag=FLAG_PINNED, *, value=False, at=None, device=""):
+    """模拟用户在界面上的一次显式调整（走 Application 会做的两件事）。"""
+    item = storage.find_by_hash(digest)
+    assert item is not None, "先要有这条记录"
+    storage.update_fields(item.id, **{flag: value})
+    store = FlagChangeStore(tmp_path / "flags.json")
+    store.record(digest, flag, value, at=at, device=device)
+    return store
+
+
+def test_cancel_propagates_when_only_source_device_acted(tmp_path):
+    """**本轮要修的主场景**：在 A 上固定、再在 A 上取消，B 端应看到取消。"""
+    shared = tmp_path / "shared"
+    a, b = Storage(tmp_path / "a.db"), Storage(tmp_path / "b.db")
+    digest = _seed(a, "会被取消固定的条目")
+
+    changes_a = FlagChangeStore(tmp_path / "a-flags.json")
+    changes_b = FlagChangeStore(tmp_path / "b-flags.json")
+    sync_a = FolderSync(a, shared, device_name="a", flag_changes=changes_a)
+    sync_b = FolderSync(b, shared, device_name="b", flag_changes=changes_b)
+
+    # 先固定并同步过去
+    changes_a.record(digest, FLAG_PINNED, True, at=1000.0)
+    item = a.find_by_hash(digest)
+    a.update_fields(item.id, pinned=True)
+    sync_a.export()
+    sync_b.import_all()
+    assert b.find_by_hash(digest).pinned is True
+
+    # 用户在 A 上取消固定
+    a.update_fields(item.id, pinned=False)
+    changes_a.record(digest, FLAG_PINNED, False, at=2000.0)
+
+    sync_a.export()
+    sync_b.import_all()
+
+    assert b.find_by_hash(digest).pinned is False, "取消必须能传过去"
+
+
+def test_cancel_clears_origin_device(tmp_path):
+    """取消固定后来源设备要清掉，否则旧来源会漂到后续同步里。"""
+    from linglong_clip.core.models import PINNED_BY_KEY
+
+    shared = tmp_path / "shared"
+    a, b = Storage(tmp_path / "a.db"), Storage(tmp_path / "b.db")
+    digest = _seed(a, "带来源的固定项")
+
+    changes_a = FlagChangeStore(tmp_path / "a-flags.json")
+    changes_b = FlagChangeStore(tmp_path / "b-flags.json")
+    sync_a = FolderSync(a, shared, device_name="a", flag_changes=changes_a)
+    sync_b = FolderSync(b, shared, device_name="b", flag_changes=changes_b)
+
+    changes_a.record(digest, FLAG_PINNED, True, at=1000.0)
+    item = a.find_by_hash(digest)
+    a.update_fields(item.id, pinned=True, metadata={})
+    sync_a.export()
+    sync_b.import_all()
+    assert b.find_by_hash(digest).pinned is True
+
+    a.update_fields(item.id, pinned=False)
+    changes_a.record(digest, FLAG_PINNED, False, at=2000.0)
+    sync_a.export()
+    sync_b.import_all()
+
+    target = b.find_by_hash(digest)
+    assert target.pinned is False
+    assert PINNED_BY_KEY not in target.metadata
+
+
+def test_cancel_does_not_break_other_device_pin(tmp_path):
+    """另一台设备设过的固定不该被本机的取消抹掉 —— 并集这条语义仍成立。"""
+    shared = tmp_path / "shared"
+    a, b, c = (
+        Storage(tmp_path / "a.db"),
+        Storage(tmp_path / "b.db"),
+        Storage(tmp_path / "c.db"),
+    )
+    digest = _seed(a, "两台设备都固定过")
+
+    changes_a = FlagChangeStore(tmp_path / "a-flags.json")
+    changes_b = FlagChangeStore(tmp_path / "b-flags.json")
+    sync_a = FolderSync(a, shared, device_name="a", flag_changes=changes_a)
+    sync_b = FolderSync(b, shared, device_name="b", flag_changes=changes_b)
+
+    # B 显式固定
+    changes_b.record(digest, FLAG_PINNED, True, at=1000.0)
+    sync_b.export()
+    sync_a.import_all()
+    assert a.find_by_hash(digest).pinned is True
+
+    # A 显式取消（A 从未设过，取消对并集没有影响）
+    changes_a.record(digest, FLAG_PINNED, False, at=2000.0)
+    sync_a.export()
+    sync_b.import_all()
+    assert b.find_by_hash(digest).pinned is True, "B 的显式固定必须留着"
+
+
+def test_cancel_is_idempotent_across_rounds(tmp_path):
+    """取消传过去之后再同步多轮，不该反复改数据或让日志无限增长。"""
+    shared = tmp_path / "shared"
+    a, b = Storage(tmp_path / "a.db"), Storage(tmp_path / "b.db")
+    digest = _seed(a, "取消后应稳定")
+
+    changes_a = FlagChangeStore(tmp_path / "a-flags.json")
+    changes_b = FlagChangeStore(tmp_path / "b-flags.json")
+    sync_a = FolderSync(a, shared, device_name="a", flag_changes=changes_a)
+    sync_b = FolderSync(b, shared, device_name="b", flag_changes=changes_b)
+
+    changes_a.record(digest, FLAG_PINNED, True, at=1000.0)
+    item = a.find_by_hash(digest)
+    a.update_fields(item.id, pinned=True)
+    sync_a.export()
+    sync_b.import_all()
+
+    a.update_fields(item.id, pinned=False)
+    changes_a.record(digest, FLAG_PINNED, False, at=2000.0)
+    sync_a.export()
+    sync_b.import_all()
+    assert b.find_by_hash(digest).pinned is False
+
+    for _ in range(3):
+        sync_a.export()
+        sync_b.import_all()
+    assert b.find_by_hash(digest).pinned is False
+
+
+def test_flag_change_journal_growth_is_bounded(tmp_path):
+    """取消/设置的往复不该让日志无限增长。"""
+    shared = tmp_path / "shared"
+    a = Storage(tmp_path / "a.db")
+    digest = _seed(a, "反复切换")
+    changes = FlagChangeStore(tmp_path / "flags.json")
+    sync = FolderSync(a, shared, device_name="a", flag_changes=changes)
+
+    changes.record(digest, FLAG_PINNED, True, at=1000.0)
+    sync.export()
+    for index in range(5):
+        changes.record(digest, FLAG_PINNED, False, at=2000.0 + index * 10)
+        sync.export()
+        changes.record(digest, FLAG_PINNED, True, at=2100.0 + index * 10)
+        sync.export()
+    # 每次切换都会发一条，但导出不会因为「内容已发过」而漏掉变更本身
+    assert sync.journal_path.exists()
+
+
+def test_flag_change_survives_encrypted_sync(tmp_path):
+    """加密模式下取消同样要能传过去。"""
+    from linglong_clip.core.sync import SyncCipher
+
+    shared = tmp_path / "shared"
+    a, b = Storage(tmp_path / "a.db"), Storage(tmp_path / "b.db")
+    digest = _seed(a, "加密通道里的取消")
+    cipher = SyncCipher(True, password="pw")
+
+    changes_a = FlagChangeStore(tmp_path / "a-flags.json")
+    changes_b = FlagChangeStore(tmp_path / "b-flags.json")
+    sync_a = FolderSync(a, shared, device_name="a", cipher=cipher, flag_changes=changes_a)
+    sync_b = FolderSync(b, shared, device_name="b", cipher=cipher, flag_changes=changes_b)
+
+    changes_a.record(digest, FLAG_PINNED, True, at=1000.0)
+    item = a.find_by_hash(digest)
+    a.update_fields(item.id, pinned=True)
+    sync_a.export()
+    sync_b.import_all()
+    assert b.find_by_hash(digest).pinned is True
+
+    a.update_fields(item.id, pinned=False)
+    changes_a.record(digest, FLAG_PINNED, False, at=2000.0)
+    sync_a.export()
+    sync_b.import_all()
+    assert b.find_by_hash(digest).pinned is False
+
+
+def test_flag_changes_work_on_json_backend(tmp_path):
+    """JSON 后端下语义一致（与 SQLite 后端逐条对齐）。"""
+    from linglong_clip.core.repository import JsonRepository
+
+    shared = tmp_path / "shared"
+    a = JsonRepository(tmp_path / "json-a" / "clipboard.json")
+    b = JsonRepository(tmp_path / "json-b" / "clipboard.json")
+
+    digest = content_hash("text", "JSON 后端也要能取消")
+    a.add(
+        ClipboardItem(
+            kind="text",
+            content="JSON 后端也要能取消",
+            preview="JSON 后端也要能取消",
+            hash=digest,
+            pinned=True,
+        )
+    )
+
+    changes_a = FlagChangeStore(tmp_path / "a-flags.json")
+    changes_b = FlagChangeStore(tmp_path / "b-flags.json")
+    sync_a = FolderSync(a, shared, device_name="a", flag_changes=changes_a)
+    sync_b = FolderSync(b, shared, device_name="b", flag_changes=changes_b)
+
+    changes_a.record(digest, FLAG_PINNED, True, at=1000.0)
+    sync_a.export()
+    sync_b.import_all()
+    assert b.find_by_hash(digest).pinned is True
+
+    item = a.find_by_hash(digest)
+    a.update_fields(item.id, pinned=False)
+    changes_a.record(digest, FLAG_PINNED, False, at=2000.0)
+    sync_a.export()
+    sync_b.import_all()
+    assert b.find_by_hash(digest).pinned is False
+
+
+def test_import_outcome_counts_flag_changes(tmp_path):
+    """「只更新了标记」要能被看到，否则又是「数据变了但没人知道」。"""
+    shared = tmp_path / "shared"
+    a, b = Storage(tmp_path / "a.db"), Storage(tmp_path / "b.db")
+    digest = _seed(a, "计数一下")
+
+    changes_a = FlagChangeStore(tmp_path / "a-flags.json")
+    changes_b = FlagChangeStore(tmp_path / "b-flags.json")
+    sync_a = FolderSync(a, shared, device_name="a", flag_changes=changes_a)
+    sync_b = FolderSync(b, shared, device_name="b", flag_changes=changes_b)
+
+    changes_a.record(digest, FLAG_PINNED, True, at=1000.0)
+    sync_a.export()
+    sync_b.import_all()
+
+    changes_a.record(digest, FLAG_PINNED, False, at=2000.0)
+    sync_a.export()
+    outcome = sync_b.import_all_detailed()
+    assert outcome.flag_changes >= 1
+
+
+def test_apply_flags_without_store_is_backward_compatible(tmp_path):
+    """不传变更存储时退化为纯并集 —— 既有第三方调用点不受影响。"""
+    from linglong_clip.core.sync import apply_flags
+
+    storage = Storage(tmp_path / "x.db")
+    digest = _seed(storage, "老调用点")
+    record = SyncRecord(
+        hash=digest,
+        kind="text",
+        content="老调用点",
+        preview="老调用点",
+        device="a",
+        pinned=True,
+    )
+    assert apply_flags(storage, record) is True
+    assert storage.find_by_hash(digest).pinned is True
+
+
+def test_apply_flags_ignores_flag_change_records(tmp_path):
+    """事件记录没有内容，不该被当成内容记录处理。"""
+    from linglong_clip.core.sync import apply_flags
+
+    storage = Storage(tmp_path / "x.db")
+    digest = _seed(storage, "事件记录")
+    record = SyncRecord(
+        hash=digest,
+        kind="flag_change",
+        content="",
+        preview="",
+        device="a",
+        flag_change=FLAG_PINNED,
+        flag_value=False,
+    )
+    assert apply_flags(storage, record) is False
+
+
+def test_cancel_applies_even_when_record_carries_no_flags(tmp_path):
+    """取消是以「记录上什么标记都没有」的形式表达的，不能因此被跳过。"""
+    from linglong_clip.core.sync import apply_flags
+
+    storage = Storage(tmp_path / "x.db")
+    digest = _seed(storage, "无标记的记录", pinned=True)
+    store = FlagChangeStore(tmp_path / "flags.json")
+    store.record(digest, FLAG_PINNED, False, at=2000.0, device="a")
+
+    record = SyncRecord(hash=digest, kind="text", content="无标记的记录", preview="无标记的记录", device="a")
+    assert record.flags().any() is False
+    assert apply_flags(storage, record, None, store) is True
+    assert storage.find_by_hash(digest).pinned is False

@@ -133,6 +133,22 @@ def main() -> int:
                 break
     _render(sync_dialog, OUT / "settings-sync-flags.png")
 
+    # 设置页「同步」页：有取消等待同步时的样子（这是本轮新增的可见性）
+    _seed_pending_flag_change(storage)
+    pending_dialog = SettingsDialog(
+        _config({"sync.enabled": True, "sync.folder": "/tmp/sync"}),
+        automation,
+        device_status={"folder": "/tmp/sync", "devices": ["laptop", "desktop"]},
+    )
+    pending_dialog.resize(760, 780)
+    pending_tabs = pending_dialog.findChild(QTabWidget)
+    if pending_tabs is not None:
+        for index in range(pending_tabs.count()):
+            if "同步" in pending_tabs.tabText(index):
+                pending_tabs.setCurrentIndex(index)
+                break
+    _render(pending_dialog, OUT / "settings-sync-flag-changes.png")
+
     # 设置页「界面」页：列表密度、关闭行为这些开关都在这里
     ui_dialog = SettingsDialog(_config({}), automation)
     ui_dialog.resize(760, 640)
@@ -204,6 +220,20 @@ def main() -> int:
     app.quit()
     print("完成。")
     return 0
+
+
+def _seed_pending_flag_change(storage) -> None:
+    """造一条「等待同步的取消」，让截图体现同步进度而不是空状态。
+
+    空状态看不出这条通道存在与否 —— 而「有没有传出去」正是用户最想知道的。
+    """
+    from linglong_clip.core.flag_changes import FLAG_PINNED, build_flag_change_store
+
+    item = storage.list(limit=1)
+    if not item:
+        return
+    store = build_flag_change_store()
+    store.record(item[0].hash, FLAG_PINNED, False, device="")
 
 
 def _config(overrides: dict):

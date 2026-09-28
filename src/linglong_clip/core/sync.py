@@ -26,6 +26,13 @@ from .privacy import PrivacyGuard
 from .storage import Storage
 from .sync_cursor import SyncCursorStore
 from .tombstones import Tombstone, TombstoneStore, contains_hash
+from .flag_changes import (
+    FLAG_FAVORITE,
+    FLAG_PINNED,
+    FlagChange,
+    FlagChangeStore,
+    resolve_flag,
+)
 
 _log = get_logger("sync")
 
@@ -58,10 +65,20 @@ class SyncRecord:
     #: 用同一根日志承载删除，是因为「传了什么」和「删了什么」必须在
     #: 同一条有序通道上，否则顺序颠倒会让删除被后面的新增覆盖掉。
     deleted_at: float = 0.0
+    #: 标记变更记录：非空表示这是一条「取消/设置固定或收藏」的事件，
+    #: 值为标记名（``pinned`` / ``favorite``）。与墓碑同理走同一条有序通道，
+    #: 否则「取消」会被同批里的内容记录盖回去。
+    flag_change: str = ""
+    #: 该变更的目标值（True=设置，False=取消）。
+    flag_value: bool = False
 
     @property
     def is_tombstone(self) -> bool:
         return self.deleted_at > 0
+
+    @property
+    def is_flag_change(self) -> bool:
+        return bool(self.flag_change)
 
     def to_json(self) -> Dict[str, object]:
         payload: Dict[str, object] = {
@@ -84,6 +101,9 @@ class SyncRecord:
             payload["favorite"] = True
         if self.deleted_at > 0:
             payload["deleted_at"] = self.deleted_at
+        if self.flag_change:
+            payload["flag_change"] = self.flag_change
+            payload["flag_value"] = bool(self.flag_value)
         return payload
 
     @classmethod
@@ -104,6 +124,8 @@ class SyncRecord:
             created_at=float(data.get("created_at") or time.time()),
             payload_b64=str(data.get("payload_b64", "")),
             deleted_at=float(data.get("deleted_at") or 0.0),
+            flag_change=str(data.get("flag_change", "") or ""),
+            flag_value=bool(data.get("flag_value", False)),
         )
 
     def to_item(self) -> ClipboardItem:
@@ -199,6 +221,8 @@ class ImportOutcome:
     tombstones: int = 0
     #: 因对端带来了本地没有的标记而被更新的条数
     flags_updated: int = 0
+    #: 因对端带来了本机不知道的标记变更（含取消）而入账的条数
+    flag_changes: int = 0
 
 
 class SyncCipher:
@@ -257,6 +281,7 @@ class FolderSync:
         guard: Optional[PrivacyGuard] = None,
         cursors: Optional[SyncCursorStore] = None,
         tombstones: Optional[TombstoneStore] = None,
+        flag_changes: Optional[FlagChangeStore] = None,
     ) -> None:
         self._storage = storage
         self.folder = Path(folder)
@@ -265,6 +290,11 @@ class FolderSync:
         self._guard = guard
         self.cursors = cursors if cursors is not None else SyncCursorStore()
         self.tombstones = tombstones if tombstones is not None else TombstoneStore()
+        #: 标记变更（取消固定/取消收藏）的传播通道。与墓碑并列，
+        #: 见 `core/flag_changes.py` 的说明。
+        self.flag_changes = (
+            flag_changes if flag_changes is not None else FlagChangeStore()
+        )
         self._lock = threading.RLock()
 
     @property
@@ -365,6 +395,26 @@ class FolderSync:
             for entry in pending
         )
 
+        # 标记变更接在删除之后：两者都是「事件」而非「内容」。
+        # 与墓碑一样**不能**按 `already` 过滤 —— 取消要传达的前提正是
+        # 「对端当年收到过这个标记」，按「内容已导出」过滤会把取消全拦掉。
+        # 变更的 `device` 在这里补上自己的设备名：本机动作在存储里是空串，
+        # 而对端必须知道「是谁取消的」才能按设备取最新意图。
+        pending_changes = list(self.flag_changes.pending())
+        records.extend(
+            SyncRecord(
+                hash=change.hash,
+                kind="flag_change",
+                content="",
+                preview="",
+                device=self.device_name,
+                created_at=change.at,
+                flag_change=change.flag,
+                flag_value=change.value,
+            )
+            for change in pending_changes
+        )
+
         if not records:
             return 0
 
@@ -377,10 +427,12 @@ class FolderSync:
             with open(self.journal_path, "ab") as handle:
                 handle.write(len(blob).to_bytes(4, "big"))
                 handle.write(blob)
-        # 写入成功后才确认送达：写失败时异常向上抛，墓碑保持待发状态，下轮重试。
-        # 确认之后不再复述，否则每轮同步都要重传一遍历史删除。
+        # 写入成功后才确认送达：写失败时异常向上抛，墓碑与变更保持待发状态，
+        # 下轮重试。确认之后不再复述，否则每轮同步都要重传一遍历史事件。
         if pending:
             self._ack_sent_tombstones()
+        if pending_changes:
+            self._ack_sent_flag_changes(pending_changes)
         _log.info("导出 %d 条记录到 %s", len(records), self.journal_path.name)
         return len(records)
 
@@ -440,6 +492,7 @@ class FolderSync:
             total.removed += outcome.removed
             total.tombstones += outcome.tombstones
             total.flags_updated += outcome.flags_updated
+            total.flag_changes += outcome.flag_changes
             acked = acked or bool(outcome.tombstones)
         if acked:
             # 对端确实接收过删除标记：把本机待发的那些标为已送达，之后不再复述。
@@ -465,16 +518,34 @@ class FolderSync:
             return 0
         return self.tombstones.ack(delivered)
 
+    def _ack_sent_flag_changes(self, sent: List[FlagChange]) -> int:
+        """把「已经写进自己日志的」待发变更标为已送达。
+
+        与墓碑同理：只有真的写进去了才敢确认，否则（磁盘满、权限不足）
+        下轮还得重发。这里直接拿写进去的那批对象来确认 ——
+        `export()` 已经在写入成功后调用本方法，不必再从日志里反查。
+        """
+        if not sent:
+            return 0
+        return self.flag_changes.ack([self.flag_changes._key(change) for change in sent])
+
     def _import_journal(self, path: Path, seen_local: set) -> "ImportOutcome":
         """导入单份对端日志，并推进其游标。返回本轮统计。"""
         key = self.cursor_key(path)
         since = self.cursors.since_for(key)
         outcome = ImportOutcome()
         newest = since
+        all_records = list(self._read_journal(path))
+        # 标记变更**不受游标过滤**：它的时间戳是「用户做那个动作的时刻」，
+        # 与同批内容记录的 `created_at` 无关。若按游标裁掉，一条晚到的取消
+        # （比如对端离线了一阵才上线）会永远传不过来 —— 而取消恰恰是
+        # 「对端曾经收过这个标记」的后续事件，漏一次就再也不会有第二次机会。
+        # 与局域网模式的处理一致（那边墓碑与变更都单独成批）。
         records = [
             record
-            for record in self._read_journal(path)
-            if float(getattr(record, "created_at", 0.0) or 0.0) > since
+            for record in all_records
+            if record.is_flag_change
+            or float(getattr(record, "created_at", 0.0) or 0.0) > since
         ]
 
         # 同一份日志里被判过删除的指纹：后面的内容记录一律不再写入。
@@ -484,7 +555,10 @@ class FolderSync:
         # 所以这个「批内去重」不是可选项。
         deleted_in_batch: set = set()
         for record in records:
-            newest = max(newest, float(getattr(record, "created_at", 0.0) or 0.0))
+            if not record.is_flag_change:
+                # 标记变更不参与游标推进：它的时间戳与内容记录不同源，
+                # 混进来会让游标跳到一个与内容无关的时刻。
+                newest = max(newest, float(getattr(record, "created_at", 0.0) or 0.0))
             if record.is_tombstone:
                 # 删除标记只认别的设备发出的：自己写进日志的那条不算
                 if record.device == self.device_name:
@@ -501,8 +575,32 @@ class FolderSync:
         # 这一批日志里又读到」这种情况，两者缺一不可。
         deleted_in_store = self.tombstones.all_hashes()
 
+        # 标记变更同样要先于内容处理：一条「取消固定」的事件必须先落进
+        # 变更存储，后面同批里的内容记录才能算出正确的标记终值。
+        # 顺序反了的话，取消会被同批内容的并集盖回去 —— 这与墓碑
+        # 「先删后写」的批内顺序问题是同一类。
         for record in records:
-            if record.is_tombstone:
+            if not record.is_flag_change:
+                continue
+            if record.device == self.device_name:
+                # 自己写进日志的那条不算「对端发生的动作」，但它是
+                # 本机动作的权威记录：把它补进变更存储，本机才知道
+                # 「这个标记已经按日志发出去了」，不必重复补发。
+                continue
+            recorded = self.flag_changes.record(
+                record.hash,
+                record.flag_change,
+                record.flag_value,
+                at=record.created_at,
+                device=record.device,
+            )
+            if recorded:
+                outcome.flag_changes += 1
+            if self._apply_flag_change(target_hash=record.hash, seen_local=seen_local):
+                outcome.flags_updated += 1
+
+        for record in records:
+            if record.is_tombstone or record.is_flag_change:
                 continue
             if contains_hash(deleted_in_batch, record.hash):
                 # 同一批里它已被删除，别再写回来
@@ -514,7 +612,7 @@ class FolderSync:
                 # 内容本地已经有了。此前这里直接跳过，于是**对端后加的固定/收藏
                 # 永远传不过来**（导出侧虽补发了标记变化，导入侧却不看）。
                 # 标记是用户的显式动作，内容重复不代表这个动作可以丢。
-                if apply_flags(self._storage, record, seen_local):
+                if apply_flags(self._storage, record, seen_local, self.flag_changes):
                     outcome.flags_updated += 1
                 continue
             if record.device == self.device_name:
@@ -526,12 +624,63 @@ class FolderSync:
                     continue
             self._storage.add(item)
             seen_local.add(record.hash)
-            apply_flags(self._storage, record, seen_local)
+            apply_flags(self._storage, record, seen_local, self.flag_changes)
             outcome.imported += 1
         # 只有在完整读完后才推进游标：解析中途出错不该跳过剩余记录
         if newest > since:
             self.cursors.advance(key, newest)
         return outcome
+
+    def _apply_flag_change(
+        self, *, target_hash: str, seen_local: Optional[set] = None
+    ) -> bool:
+        """把某指纹上解出来的标记终值落到本地记录上。
+
+        为什么需要这一步，而不是只依赖内容记录：
+
+        内容记录**只发一次**（发过的不再重发），而标记变化是之后的动作。
+        所以「对端固定了某条」这件事到达时，同批里根本没有那条的内容记录 ——
+        只靠内容循环里的 `apply_flags` 就永远碰不到它。取消同理，
+        而且取消更容易被漏（它是「记录上什么都没变」的反向信息）。
+
+        只动本地已存在的记录：本地没有这条内容时无处可落，
+        等它随内容记录一起来时再处理。
+        """
+        existing = self._storage.find_by_hash(target_hash)
+        if existing is None:
+            return False
+        resolved = _resolved_flags(self.flag_changes, target_hash)
+        if resolved is None:
+            return False
+        # 本地值可能是「对端带来的并集」之外的信息（比如本机用户刚固定过），
+        # 所以先把本地的固定意图并进去，再让解出来的终值覆盖 —— 与
+        # `apply_flags` 里的顺序一致，两条路径不能各写一套。
+        local = FlagSnapshot(
+            pinned=existing.pinned,
+            favorite=existing.favorite,
+            pinned_by=existing.pinned_by,
+        )
+        merged = _apply_resolved_flags(local, self.flag_changes, target_hash)
+        if (
+            merged.pinned == existing.pinned
+            and merged.favorite == existing.favorite
+            and merged.pinned_by == existing.pinned_by
+        ):
+            return False
+        metadata = dict(existing.metadata)
+        if merged.pinned and merged.pinned_by:
+            metadata[PINNED_BY_KEY] = merged.pinned_by
+        else:
+            metadata.pop(PINNED_BY_KEY, None)
+        self._storage.update_fields(
+            existing.id,
+            pinned=merged.pinned,
+            favorite=merged.favorite,
+            metadata=metadata,
+        )
+        if seen_local is not None:
+            seen_local.add(target_hash)
+        return True
 
     def _apply_tombstone(self, record: SyncRecord, seen_local: Optional[set] = None) -> bool:
         """收到对端的删除标记：记下它，并清掉本地同一指纹的记录。
@@ -695,6 +844,7 @@ def apply_flags(
     storage: Storage,
     record: SyncRecord,
     seen_local: Optional[set] = None,
+    flag_changes: Optional[FlagChangeStore] = None,
 ) -> bool:
     """把对端记录上的用户标记合并到本地同指纹的记录上。
 
@@ -702,14 +852,34 @@ def apply_flags(
     ``LanSyncClient.import_records`` 若各写一套，迟早分叉
     （此前的墓碑处理就踩过这个坑，所以那次专门抽了同一个规则）。
 
-    合并方向是**取并集**（见 ``FlagSnapshot.merge``）：固定与收藏都是
+    合并方向**默认是取并集**（见 ``FlagSnapshot.merge``）：固定与收藏都是
     加法式的用户意图，取并集是唯一不会把用户的显式标记悄悄弄丢的选择。
+
+    但并集有一个已知代价：**取消传不出去**。有了 ``flag_changes`` 之后，
+    只要某台设备**显式取消过**（这是一个带时间戳的事实），就可以压过并集 ——
+    具体规则见 `flag_changes.resolve_flag`：设备内取最新、设备间取并集。
+
+    优先级刻意是「变更存储 > 记录上的并集」：变更存储里带着「谁在什么时候
+    取消了」，信息量严格大于一个布尔值。记录上的 `pinned` 只说明「有人设过」，
+    它没有能力表达取消。
+
+    ``flag_changes`` 为 None 时退化为纯并集，行为与改造前完全一致 ——
+    调用方（尤其第三方集成与既有用例）不传就还是老样子。
 
     返回是否真的改动了本地数据 —— 调用方用它统计「有多少条只更新了标记」，
     这个数字要能被看到，否则又是「数据变了但没人知道」。
     """
-    if record.is_tombstone or not record.flags().any():
+    if record.is_tombstone or record.is_flag_change:
         return False
+    if not record.flags().any():
+        # 记录上没有标记。**仍然要看变更存储** —— 「取消」恰恰是以
+        # 「记录上什么都没有」的形式表达的，直接返回会把取消吞掉，
+        # 那本轮修的东西就不存在了。有存储时继续往下走。
+        if flag_changes is None:
+            return False
+        resolved_any = _resolved_flags(flag_changes, record.hash)
+        if resolved_any is None:
+            return False
     existing = storage.find_by_hash(record.hash)
     if existing is None:
         return False
@@ -722,6 +892,10 @@ def apply_flags(
     remote = record.flags()
     # `merge` 的 `other` 语义是「后到的一份」，对端记录就是后到的
     merged = local.merge(remote)
+
+    if flag_changes is not None:
+        merged = _apply_resolved_flags(merged, flag_changes, record.hash)
+
     if (
         merged.pinned == existing.pinned
         and merged.favorite == existing.favorite
@@ -744,3 +918,38 @@ def apply_flags(
     if seen_local is not None:
         seen_local.add(record.hash)
     return True
+
+
+def _resolved_flags(flag_changes: FlagChangeStore, digest: str) -> Optional[FlagSnapshot]:
+    """把变更存储里该指纹的终值解出来；没有任何变更时返回 None。"""
+    pinned = resolve_flag(flag_changes.changes_for(digest), FLAG_PINNED)
+    favorite = resolve_flag(flag_changes.changes_for(digest), FLAG_FAVORITE)
+    if pinned is None and favorite is None:
+        return None
+    return FlagSnapshot(
+        pinned=bool(pinned),
+        favorite=bool(favorite),
+    )
+
+
+def _apply_resolved_flags(
+    merged: FlagSnapshot,
+    flag_changes: FlagChangeStore,
+    digest: str,
+) -> FlagSnapshot:
+    """用变更存储的终值覆盖并集结果（只覆盖有人明确表过态的那些标记）。"""
+    changes = flag_changes.changes_for(digest)
+    if not changes:
+        return merged
+    pinned = resolve_flag(changes, FLAG_PINNED)
+    favorite = resolve_flag(changes, FLAG_FAVORITE)
+    result = FlagSnapshot(
+        pinned=merged.pinned if pinned is None else bool(pinned),
+        favorite=merged.favorite if favorite is None else bool(favorite),
+        pinned_by=merged.pinned_by,
+    )
+    if not result.pinned:
+        # 取消固定后来源一并清掉，否则旧来源会跟着一个「未固定」的记录
+        # 漂到后续同步里，删除保护的判断会读到过期的设备名。
+        result.pinned_by = ""
+    return result

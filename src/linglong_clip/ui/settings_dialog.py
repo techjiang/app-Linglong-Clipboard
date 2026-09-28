@@ -616,13 +616,49 @@ class SettingsDialog(QDialog):
         # 上一版写了，界面上直接显示成字面的星号，截图里一眼能看出来。
         hint = QLabel(
             "在一台设备上固定或收藏某条记录，其它设备下次同步也会带上这个标记。\n"
-            "标记取并集：一台设过就一直保留，因此在另一台取消后，\n"
-            "再同步一轮会重新出现 —— 因为无法区分「那边取消过」和「那边从没设过」。\n"
-            "想彻底取消，请在每台设备上分别取消。"
+            "取消也会同步：本机取消后，没在别处设过这个标记的设备下次同步会跟着取消。\n"
+            "但标记仍是并集的：只要还有另一台设备设过，取消就不会把它抹掉 ——\n"
+            "那是那台设备的显式意图，不该被本机的取消覆盖。"
         )
         hint.setWordWrap(True)
         form.addRow("", hint)
+
+        form.addRow("", self._build_flag_change_summary())
         return group
+
+    def _build_flag_change_summary(self) -> QLabel:
+        """标记变更的同步进度。
+
+        为什么要显示：用户点了取消之后，最想知道的是「这个取消传出去了没有」。
+        不说的话，另一台设备上还是已收藏，用户只能猜是没同步还是设计如此。
+        """
+        try:
+            from ..core.flag_changes import build_flag_change_store
+
+            status = build_flag_change_store().status()
+        except Exception as exc:  # noqa: BLE001 - 面板不该因为读不到文件而崩
+            _log.debug("读取标记变更失败：%s", exc)
+            status = {}
+
+        count = int(status.get("count", 0) or 0)
+        pending = int(status.get("pending", 0) or 0)
+        if not count:
+            text = "标记变更：暂无（本机还没有调整过固定/收藏）"
+        elif pending:
+            text = f"标记变更：共 {count} 条，{pending} 条等待同步到其它设备"
+        else:
+            text = f"标记变更：共 {count} 条，均已同步到其它设备"
+
+        label = QLabel(text)
+        label.setWordWrap(True)
+        path = str(status.get("path", "") or "")
+        if path:
+            label.setToolTip(
+                f"{path}\n"
+                "记录本机对固定/收藏做过的显式调整（含取消），不含内容本身。\n"
+                "删掉它只会让已发出的取消不再复述，不影响本机标记。"
+            )
+        return label
 
     def _build_tombstone_group(self) -> QGroupBox:
         """删除标记面板：让「我在这台删了，那台却还在」有地方可查。"""

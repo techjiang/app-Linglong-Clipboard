@@ -124,6 +124,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="清除超过保留期的删除标记",
     )
     maintenance.add_argument(
+        "--flag-changes",
+        action="store_true",
+        help="查看标记变更（取消固定/收藏）的同步进度",
+    )
+    maintenance.add_argument(
+        "--flag-changes-reset",
+        action="store_true",
+        help="清空标记变更（之后的历史取消不再向对端传播）",
+    )
+    maintenance.add_argument(
         "--remove",
         type=int,
         metavar="ID",
@@ -571,6 +581,34 @@ def _run_cli(args: argparse.Namespace) -> int:
         storage.close()
         return 0
 
+    if args.flag_changes or args.flag_changes_reset:
+        from .core.flag_changes import build_flag_change_store
+
+        changes = build_flag_change_store()
+        if args.flag_changes_reset:
+            count = changes.reset()
+            print(f"已清空 {count} 条标记变更，之后的历史取消不再向对端传播")
+            print("（已在其它设备上生效的取消不受影响，那些设备上的标记已经是取消后的状态）")
+            if not args.flag_changes:
+                storage.close()
+                return 0
+        status = changes.status()
+        if args.json:
+            print(json.dumps(status, ensure_ascii=False, indent=2))
+        else:
+            print(f"标记变更文件：{status['path']}")
+            print(f"共 {status['count']} 条，其中待同步 {status['pending']} 条")
+            if not status["count"]:
+                print("（本机还没有对固定/收藏做过显式调整）")
+            for row in status["changes"]:
+                name = "固定" if row["flag"] == "pinned" else "收藏"
+                action = "设置" if row["value"] else "取消"
+                flag = "待同步" if row["pending"] else "已送达"
+                who = row["device"] or "本机"
+                print(f"  {row['hash'][:12]}  {name}{action}   {row['at_text']}  {who}  {flag}")
+        storage.close()
+        return 0
+
     if args.clear:
         from .core.tombstones import build_tombstone_store, local_fingerprints
 
@@ -744,6 +782,7 @@ def _run_cli(args: argparse.Namespace) -> int:
 
                             label += f" · 已同步至 {_time.strftime('%m-%d %H:%M', _time.localtime(since))}"
                         print(f"  {label}")
+                    _print_pending_event_summary()
                 node.stop()
             else:
                 print("局域网同步服务启动失败（端口可能被占用）", file=sys.stderr)
@@ -763,6 +802,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                 print("模式：共享文件夹")
                 print(f"同步目录：{folder or '未配置'}")
                 print(f"游标文件：{cursors.path}")
+                _print_pending_event_summary()
         storage.close()
         return 0
 
@@ -903,6 +943,27 @@ def _run_native_history_import(args: argparse.Namespace, storage, config) -> int
     return 0
 
 
+def _print_pending_event_summary() -> None:
+    """打印「还有多少删除/取消等事件等待同步」。
+
+    这两类事件不受增量游标约束、每次同步都会重发直到被确认，所以
+    「有几条待发」是判断同步是否真的走通的直接线索 —— 不说的话，
+    用户看到对端没反应只能猜。
+    """
+    try:
+        from .core.flag_changes import build_flag_change_store
+        from .core.tombstones import build_tombstone_store
+
+        tombstones = build_tombstone_store().status()
+        changes = build_flag_change_store().status()
+    except Exception:  # noqa: BLE001 - 状态摘要读不到不该让命令失败
+        return
+    print(
+        f"待同步事件：删除 {tombstones.get('pending', 0)} 条"
+        f"、标记变更 {changes.get('pending', 0)} 条"
+    )
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
@@ -929,6 +990,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.tombstones,
             args.tombstones_reset,
             args.purge_tombstones,
+            args.flag_changes,
+            args.flag_changes_reset,
             args.remove is not None,
             args.storage_status,
             args.storage is not None,

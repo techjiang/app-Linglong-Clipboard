@@ -665,3 +665,65 @@ def test_window_clear_button_does_not_delete_before_confirmation(app_instance):
         QMessageBox.question = original
     assert app_instance.storage.get(item.id) is not None
     assert "cl5" not in app_instance.tombstones.all_hashes()
+
+
+def test_toggle_flag_records_cancel_for_sync(app_instance, tmp_path):
+    """取消固定/收藏也要记进变更通道 —— 否则同步层分不出「取消过」和「从未设过」。
+
+    这正是「我在笔记本上取消了，另一台还是已收藏」的根因：
+    只写 `pinned=False` 时，同步层拿到的仍然只是一个布尔值。
+    """
+    from linglong_clip.core.flag_changes import FLAG_PINNED, FlagChangeStore
+
+    app_instance.flag_changes = FlagChangeStore(tmp_path / "flags.json")
+    item = app_instance.storage.add(
+        ClipboardItem(kind="text", content="cancel me", preview="cancel me", hash="fc1")
+    )
+
+    app_instance.toggle_flag(item.id, "pinned", True)
+    assert app_instance.flag_changes.effective("fc1", FLAG_PINNED) is True
+
+    app_instance.toggle_flag(item.id, "pinned", False)
+    assert app_instance.flag_changes.effective("fc1", FLAG_PINNED) is False
+
+
+def test_toggle_flag_records_favorite_separately(app_instance, tmp_path):
+    from linglong_clip.core.flag_changes import FLAG_FAVORITE, FlagChangeStore
+
+    app_instance.flag_changes = FlagChangeStore(tmp_path / "flags.json")
+    item = app_instance.storage.add(
+        ClipboardItem(kind="text", content="fav", preview="fav", hash="fc2")
+    )
+    app_instance.toggle_flag(item.id, "favorite", True)
+    assert app_instance.flag_changes.effective("fc2", FLAG_FAVORITE) is True
+
+
+def test_record_flag_change_skips_item_without_fingerprint(app_instance, tmp_path):
+    """没有指纹时不该记事件 —— 它永远匹配不上对端的任何记录。
+
+    `storage.add` 会按内容补算指纹，所以这里直接传一个没有载荷的记录，
+    验证守卫本身（它是防御性的，不是常见路径）。
+    """
+    from linglong_clip.core.flag_changes import FlagChangeStore
+
+    app_instance.flag_changes = FlagChangeStore(tmp_path / "flags.json")
+    blank = ClipboardItem(kind="text", content="", preview="", hash="")
+    app_instance._record_flag_change(blank, "pinned", True)
+    assert app_instance.flag_changes.all_changes() == []
+
+
+def test_toggle_flag_survives_flag_change_write_failure(app_instance, monkeypatch):
+    """变更记录写不进去只告警 —— 用户在这台机器上的操作不该因此失败。"""
+    from linglong_clip.core.flag_changes import FlagChangeStore
+
+    app_instance.flag_changes = FlagChangeStore()
+    monkeypatch.setattr(
+        FlagChangeStore,
+        "record",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("磁盘满")),
+    )
+    item = app_instance.storage.add(
+        ClipboardItem(kind="text", content="boom", preview="boom", hash="fc3")
+    )
+    app_instance.toggle_flag(item.id, "pinned", True)
+    assert app_instance.storage.get(item.id).pinned is True

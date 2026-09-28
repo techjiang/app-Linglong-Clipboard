@@ -586,3 +586,142 @@ def test_lan_local_tombstone_blocks_reimport(nodes):
     b.tombstones.record(digest)
     assert b.sync_all() == 0
     assert remote.find_by_hash(digest) is None
+
+
+# ---------- 标记变更（取消固定/收藏）的传播 ----------
+# 局域网与共享文件夹共用同一份解算规则，但入口完全独立，
+# 所以每条都要在两条路径上各测一次 —— 只测一条等于没测。
+
+
+def _make_lan(storage, home, name, changes, started):
+    """建一个带独立变更存储的节点（把 store 同时接到服务端与客户端）。"""
+    from linglong_clip.core.flag_changes import FlagChangeStore
+
+    node = LanSync(
+        storage=storage,
+        device_name=name,
+        port=0,
+        flag_changes=FlagChangeStore(home / f"{name}-flags.json"),
+    )
+    assert node.start()
+    started.append(node)
+    return node
+
+
+@pytest.fixture()
+def lan_pair(storage, home):
+    """两个带独立标记变更存储的节点，配对完成。"""
+    from linglong_clip.core.storage import Storage
+
+    other = Storage(home / "peer-flag.db")
+    started = []
+    a = _make_lan(storage, home, "laptop", None, started)
+    b = _make_lan(other, home, "desktop", None, started)
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+    yield a, b, storage, other
+    for node in started:
+        node.stop()
+    other.close()
+
+
+def test_lan_cancel_propagates(lan_pair):
+    """**本轮主场景**：A 固定后取消，B 端要看到取消。"""
+    from linglong_clip.core.flag_changes import FLAG_PINNED
+
+    a, b, local, remote = lan_pair
+    digest = _add_flagged(local, "局域网里的取消", pinned=True)
+    a.flag_changes.record(digest, FLAG_PINNED, True, at=1000.0)
+
+    b.sync_all()
+    assert remote.find_by_hash(digest).pinned is True
+
+    local.update_fields(local.find_by_hash(digest).id, pinned=False)
+    a.flag_changes.record(digest, FLAG_PINNED, False, at=2000.0)
+
+    b.sync_all()
+    assert remote.find_by_hash(digest).pinned is False, "取消必须能传过去"
+
+
+def test_lan_cancel_is_idempotent(lan_pair):
+    """取消传过去之后再同步多轮，不该反复改数据。"""
+    from linglong_clip.core.flag_changes import FLAG_PINNED
+
+    a, b, local, remote = lan_pair
+    digest = _add_flagged(local, "局域网取消后稳定", pinned=True)
+    a.flag_changes.record(digest, FLAG_PINNED, True, at=1000.0)
+    b.sync_all()
+
+    local.update_fields(local.find_by_hash(digest).id, pinned=False)
+    a.flag_changes.record(digest, FLAG_PINNED, False, at=2000.0)
+    b.sync_all()
+    assert remote.find_by_hash(digest).pinned is False
+
+    assert b.sync_all() == 0
+    assert remote.find_by_hash(digest).pinned is False
+
+
+def test_lan_cancel_does_not_break_other_device_pin(lan_pair):
+    """B 自己显式设的固定，不该被 A 的取消抹掉（并集这条语义仍成立）。"""
+    from linglong_clip.core.flag_changes import FLAG_PINNED
+
+    a, b, local, remote = lan_pair
+    digest = _add_flagged(local, "两台都固定过")
+    b.sync_all()
+
+    # B 显式固定它，并拉回给 A
+    b.flag_changes.record(digest, FLAG_PINNED, True, at=1000.0)
+    remote.update_fields(remote.find_by_hash(digest).id, pinned=True)
+    a.peers = [f"127.0.0.1:{b.status()['port']}"]
+    a.sync_all()
+    assert local.find_by_hash(digest).pinned is True
+
+    # A 取消（A 从未设过），并推给 B
+    a.flag_changes.record(digest, FLAG_PINNED, False, at=2000.0)
+    b.sync_all()
+    assert remote.find_by_hash(digest).pinned is True, "B 的显式固定必须留着"
+
+
+def test_lan_cancel_arrives_without_content_record(lan_pair):
+    """变更到达时同批没有内容记录 —— 只靠内容循环永远碰不到它。"""
+    from linglong_clip.core.flag_changes import FLAG_PINNED
+
+    a, b, local, remote = lan_pair
+    digest = _add_flagged(local, "只发变更不发内容")
+    # 内容先同步过去
+    b.sync_all()
+    assert remote.find_by_hash(digest) is not None
+
+    # A 取消（A 从未固定过，但这也是一条显式动作）
+    a.flag_changes.record(digest, FLAG_PINNED, True, at=1000.0)
+    a.flag_changes.record(digest, FLAG_PINNED, False, at=2000.0)
+    outcome = b.sync_all_detailed()
+    assert outcome.flag_changes >= 1
+
+
+def test_lan_flag_changes_are_acked_after_serve(lan_pair):
+    """服务端写出响应之后要确认送达 —— 否则每轮都在重传全部历史事件。
+
+    这正是「已送达的不再复述」在局域网模式下从未生效的那个洞。
+    """
+    from linglong_clip.core.flag_changes import FLAG_PINNED
+
+    a, b, local, remote = lan_pair
+    digest = _add_flagged(local, "确认送达")
+    a.flag_changes.record(digest, FLAG_PINNED, True, at=1000.0)
+
+    b.sync_all()
+    # 已经交付过，不该再待发
+    assert a.flag_changes.pending() == []
+
+
+def test_lan_tombstones_are_acked_after_serve(lan_pair):
+    """墓碑同理：局域网是拉取模型，写出成功即视为送达。"""
+    a, b, local, remote = lan_pair
+    digest = _add_flagged(local, "删除也要确认送达")
+    b.sync_all()
+
+    local.delete(local.find_by_hash(digest).id)
+    a.tombstones.record(digest)
+
+    assert b.sync_all() == 0  # 对方没有新内容，只有一条删除
+    assert a.tombstones.pending() == [], "写出成功后不该还待发"
