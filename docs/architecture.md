@@ -108,8 +108,15 @@ JSON 后端的 `_sort_key`），所以先被淘汰的仍是久未使用的普通
 | `read_windows()` | 系统剪贴板历史 | 返回空列表，导入入口提示不支持 |
 | `current_focus()` | 来源应用识别 | 来源显示「未知来源」 |
 | `set_transient_text()` | 安全粘贴（限时清除） | 返回 False，改由定时器清空 |
+| `history_exclusion_formats()` | 写入级「不进系统剪贴板历史」的格式名 | 返回空列表，仅依赖限时清空 |
 
 `capabilities()` 返回能力矩阵，供设置页展示与功能降级。
+
+**出站防护**（`core/copy_guard.py`）收在一处：`plan_outbound()` 决定
+「这条内容复制出去要不要挂排除标记、要不要限时清空」，`ClipboardReleaser`
+负责到期后的**带条件**清理（只在内容仍是我们写的那份时才清）。
+平台差异由 `history_exclusion_formats()` 表达，Qt 写回时把格式名挂到
+剪贴板数据上 —— 必须在写入时声明，内容进了系统历史就取不回来。
 
 **Windows** 用 `ctypes` 直接调 Win32，零第三方依赖：
 

@@ -37,6 +37,11 @@
 
 ![设置·同步](docs/screenshots/settings-sync-flags.png)
 
+设置页「隐私」—— 敏感内容出站时这台机器实际能做什么，写在下面对话框里
+（这里显示的是 Windows 上的样子；Linux 没有系统级排除，会如实说明改用限时清空）：
+
+![设置·隐私](docs/screenshots/settings-privacy-outbound.png)
+
 列表密度两档，同一批记录：
 
 ![舒适](docs/screenshots/density-comfortable.png)
@@ -276,6 +281,10 @@ linglong-clipboard --merge-duplicates  # 重算 + 合并（含历史里的存量
   PEM 私钥是硬拦截，不给配置机会。
 - **按需脱敏**：开启后，复制到外部时敏感片段替换为 `[已脱敏:密码字段]`，
   字段名保留可读性。
+- **出站防护**：敏感内容复制出去时（这是唯一会把内容带出机器的动作），
+  Windows 上附带系统级标记，让它**不进系统剪贴板历史**（`Win+V` 里找不到）；
+  各平台都支持「N 秒后清空剪贴板」—— 只在内容未被替换时才清，不会误删你
+  后来的复制。查当前生效的手段：`linglong-clipboard --outbound`。
 - **本地优先**：数据只存本机 SQLite，不上传任何服务器。
 - **同步内容加密**：跨设备同步可选 Fernet 对称加密（PBKDF2 派生的密钥）。
 - **敏感项不进同步**：即使本地保留，也不导出。
@@ -290,13 +299,14 @@ linglong-clipboard --merge-duplicates  # 重算 + 合并（含历史里的存量
 | 主选择区（PRIMARY） | — | ✅ | ✅ wl-paste | — |
 | 系统剪贴板历史导入 | ✅ Win10 1809+ 文本 | — | — | — |
 | 安全粘贴标记 | ✅ 系统级 | — | — | ⚠️ 定时清空（有条件） |
+| 不进系统剪贴板历史 | ✅ 写入时声明 | — | — | — |
 | 全局快捷键 | ✅ RegisterHotKey | ✅ XGrabKey | ⚠️ 需桌面环境绑定 | ✅ Quartz 事件 tap |
 
 所有原生能力失败都会**优雅降级**（退回 Qt 剪贴板 + 轮询 + 应用内快捷键），
 不会因为缺依赖而无法启动。
 
 - **Windows**：走 `AddClipboardFormatListener` 事件驱动，避免轮询空转；
-  写入时附加 `ExcludeClipboardContentFromMonitorProcessing`，
+  写入敏感内容时附加 `ExcludeClipboardContentFromMonitorProcessing`，
   让敏感内容不进系统剪贴板历史；可把系统剪贴板历史读回来，
   补齐本工具启动前的记录（见下）
 - **macOS**：全局快捷键用 Quartz 事件 tap，需要辅助功能权限，
@@ -661,18 +671,34 @@ linglong-clipboard --selfcheck                # 自检原生能力是否真的�
 linglong-clipboard --selfcheck --json         # 同上，JSON 输出便于回帖
 linglong-clipboard --config-audit             # 找出「改了不生效」的空转配置
 linglong-clipboard --config-audit --json      # 同上，JSON 输出便于回帖
+linglong-clipboard --outbound                 # 复制敏感内容出去时实际生效的防护
+linglong-clipboard --outbound --json          # 同上，JSON 输出便于回帖
 ```
 
 `--selfcheck` 退出码：`0` 全部正常、`1` 有降级、`2` 有失败，
 可以塞进脚本里判断。它在换机器部署或报障时第一个该跑的命令 ——
 「快捷键没反应」「截图搜不到字」这类问题不必翻日志。
 
-自检覆盖后端探测、能力矩阵、剪贴板读写、前台窗口、全局快捷键注册与**截图 OCR**。
+自检覆盖后端探测、能力矩阵、剪贴板读写、前台窗口、**出站防护**、
+全局快捷键注册与**截图 OCR**。
 OCR 一项查的是「真的能识别吗」，而不是「tesseract 在不在 PATH 里」：
 
 ```
 ~ 截图 OCR：实际使用 eng（期望 jpn）· 已安装：chi_sim、chi_tra、eng、osd
     提示：缺少 jpn 的数据，已回退到 eng。装齐语言包，或在设置页「识别语言」里手动指定已装的
+```
+
+`--outbound` 回答的是「我把密钥复制出去之后，到底有什么在保护我」——
+这件事没法靠读代码确认（README 曾写着「系统级安全粘贴标记」，
+而实现从未接上），所以让程序自己报：
+
+```
+$ linglong-clipboard --outbound
+平台：Windows · 后端：windows
+  写入级系统排除：ExcludeClipboardContentFromMonitorProcessing
+      复制敏感内容时会声明「不进系统剪贴板历史」，粘贴不受影响
+  限时清空：30 秒后清空剪贴板（内容未被替换时）
+  出站脱敏：关闭
 ```
 
 `--config-audit` 退出码：`0` 没有空转配置、`1` 有。
@@ -864,6 +890,7 @@ src/linglong_clip/
 │   ├── classify.py          #   类型识别、敏感检测、标签抽取
 │   ├── normalize.py         #   内容归一：链接去跟踪参数、路径写法收敛
 │   ├── privacy.py           #   隐私策略与脱敏
+│   ├── copy_guard.py        #   出站防护：写入级系统排除 + 限时清空剪贴板
 │   ├── semantic.py          #   意图解析与多信号排序
 │   ├── collector.py         #   采集管线：识别→风控→去重→落库
 │   ├── monitor.py           #   剪贴板监听调度

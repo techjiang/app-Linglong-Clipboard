@@ -144,6 +144,24 @@ def main() -> int:
                 break
     _render(ui_dialog, OUT / "settings-interface.png")
 
+    # 设置页「隐私」：出站防护的状态提示（本平台有什么机制、清空几秒）
+    privacy_dialog = SettingsDialog(_config({}), automation)
+    privacy_dialog.resize(760, 700)
+    privacy_tabs = privacy_dialog.findChild(QTabWidget)
+    if privacy_tabs is not None:
+        for index in range(privacy_tabs.count()):
+            if "隐私" in privacy_tabs.tabText(index):
+                privacy_tabs.setCurrentIndex(index)
+                break
+    # 截图里并到「有系统机制」的那一档，否则图上看不出差别（Linux 上永远没有）。
+    # 注意顺序：先设覆盖、再改数值触发刷新，否则显示的仍是探测结果。
+    privacy_dialog._exclusion_formats_override = [
+        "ExcludeClipboardContentFromMonitorProcessing"
+    ]
+    privacy_dialog._auto_clear.setValue(30)
+    privacy_dialog._refresh_outbound_hint()
+    _render(privacy_dialog, OUT / "settings-privacy-outbound.png")
+
     # 列表密度对比：同一批记录在两种密度下的行高差异
     from linglong_clip.ui.main_window import MainWindow as _Window
 
