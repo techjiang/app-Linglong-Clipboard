@@ -531,3 +531,137 @@ def test_oversized_image_is_not_inlined(home, monkeypatch, qt_app):
 def test_sqlite_backend_does_not_inline_images(app_instance):
     app_instance._on_image_saved("images/abc.png", b"data")
     assert not hasattr(app_instance.storage, "set_image_data")
+
+
+# ---- 固定/收藏标记的写入路径 ----
+# 界面只发意图（见 test_ui.py 的 flag_toggled 用例），真正写入在这里。
+# 写入要顺带处理「固定是谁设的」，那是界面拿不到的信息。
+
+
+def test_toggle_flag_pins_and_clears_origin(app_instance):
+    item = app_instance.storage.add(
+        ClipboardItem(kind="text", content="pin me", preview="pin me", hash="pf1")
+    )
+    # 先制造一个「对端设的固定」残留
+    app_instance.storage.update_fields(item.id, pinned=True, metadata={"pinned_by": "peer"})
+    assert app_instance.storage.get(item.id).pinned_by == "peer"
+
+    # 本机用户取消固定：来源要一起清掉
+    app_instance.toggle_flag(item.id, "pinned", False)
+    assert app_instance.storage.get(item.id).pinned is False
+    assert app_instance.storage.get(item.id).pinned_by == ""
+
+    # 本机用户重新固定：来源为空（= 本机意图，永不被判为过期）
+    app_instance.toggle_flag(item.id, "pinned", True)
+    assert app_instance.storage.get(item.id).pinned is True
+    assert app_instance.storage.get(item.id).pinned_by == ""
+
+
+def test_toggle_favorite_does_not_touch_pinned_by(app_instance):
+    item = app_instance.storage.add(
+        ClipboardItem(kind="text", content="fav me", preview="fav me", hash="pf2")
+    )
+    app_instance.storage.update_fields(item.id, metadata={"pinned_by": "peer"})
+    app_instance.toggle_flag(item.id, "favorite", True)
+    stored = app_instance.storage.get(item.id)
+    assert stored.favorite is True
+    # 收藏与固定的来源是两码事，不该互相干扰
+    assert stored.pinned_by == "peer"
+
+
+def test_toggle_flag_ignores_unknown_field_and_missing_item(app_instance):
+    item = app_instance.storage.add(
+        ClipboardItem(kind="text", content="x", preview="x", hash="pf3")
+    )
+    app_instance.toggle_flag(item.id, "bogus", True)  # 不认识的字段，静默忽略
+    assert app_instance.storage.get(item.id).pinned is False
+
+    app_instance.toggle_flag(99999, "pinned", True)  # 不存在的记录，不抛异常
+
+
+def test_toggle_flag_metadata_is_not_shared_between_items(app_instance):
+    """元数据是 dict，改动要落在副本上，不能串到别的记录。"""
+    one = app_instance.storage.add(
+        ClipboardItem(kind="text", content="one", preview="one", hash="pf4")
+    )
+    two = app_instance.storage.add(
+        ClipboardItem(kind="text", content="two", preview="two", hash="pf5")
+    )
+    app_instance.toggle_flag(one.id, "pinned", True)
+    assert app_instance.storage.get(two.id).pinned is False
+
+
+def test_window_flag_signal_is_wired_to_application(app_instance):
+    """端到端：窗口发信号 → Application 写库。这条守着「信号有没有接上」。"""
+    item = app_instance.storage.add(
+        ClipboardItem(kind="text", content="wired", preview="wired", hash="pf6")
+    )
+    app_instance.window.reload()
+    app_instance.window._select(item.id)
+    app_instance.window._toggle_pin_selected()
+    assert app_instance.storage.get(item.id).pinned is True
+    assert app_instance.storage.get(item.id).pinned_by == ""
+
+
+# ---- 清理未固定记录：必须记删除标记，否则别的设备上会复活 ----
+# 界面上那个「清理未固定记录」按钮此前直接 storage.clear()，墓碑一条都不记。
+# 表现是「在这台清了、别的设备上还在」，下一轮同步又原样回来 ——
+# 与「删一条」的传播漏掉是同一个错误，只是入口不同。
+
+
+def test_clear_unpinned_records_tombstones(app_instance):
+    alive = app_instance.storage.add(
+        ClipboardItem(kind="text", content="会被清掉", preview="会被清掉", hash="cl1")
+    )
+    kept = app_instance.storage.add(
+        ClipboardItem(kind="text", content="固定项留着", preview="固定项留着", hash="cl2", pinned=True)
+    )
+    assert app_instance.clear_unpinned() is None
+    assert app_instance.storage.get(alive.id) is None
+    assert app_instance.storage.get(kept.id) is not None
+
+    hashes = app_instance.tombstones.all_hashes()
+    assert "cl1" in hashes
+    # 固定项没消失，不能被算成删除，否则会误删别的设备上那份
+    assert "cl2" not in hashes
+
+
+def test_clear_unpinned_with_nothing_to_clear(app_instance):
+    app_instance.clear_unpinned()  # 空库不该抛异常
+
+
+def test_window_clear_request_is_wired(app_instance):
+    """端到端：窗口发信号 → Application 清理并记墓碑。"""
+    item = app_instance.storage.add(
+        ClipboardItem(kind="text", content="清我", preview="清我", hash="cl3")
+    )
+    app_instance.window.clear_requested.emit()
+    assert app_instance.storage.get(item.id) is None
+    assert "cl3" in app_instance.tombstones.all_hashes()
+
+
+def test_window_compact_request_is_wired(app_instance):
+    app_instance.storage.add(
+        ClipboardItem(kind="text", content="x", preview="x", hash="cl4")
+    )
+    app_instance.window.compact_requested.emit()  # 不抛异常即可
+
+
+def test_window_clear_button_does_not_delete_before_confirmation(app_instance):
+    """清理按钮先弹确认框；用户选「否」时不该有任何副作用。
+
+    这条同时守着「界面不自己写库」：清理由 Application 在确认之后执行。
+    """
+    from PySide6.QtWidgets import QMessageBox
+
+    item = app_instance.storage.add(
+        ClipboardItem(kind="text", content="别删我", preview="别删我", hash="cl5")
+    )
+    original = QMessageBox.question
+    QMessageBox.question = staticmethod(lambda *a, **k: QMessageBox.StandardButton.No)
+    try:
+        app_instance.window._clear_unpinned()
+    finally:
+        QMessageBox.question = original
+    assert app_instance.storage.get(item.id) is not None
+    assert "cl5" not in app_instance.tombstones.all_hashes()

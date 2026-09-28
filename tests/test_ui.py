@@ -161,20 +161,44 @@ def test_window_pinned_filter(window, seeded):
     assert all(item.pinned for item in window._items)
 
 
-def test_window_toggle_pin(window, seeded):
+def test_window_toggle_pin_emits_intent(window, seeded):
+    """切换固定只发信号，不自己写库。
+
+    界面拿不到「这条固定是谁设的」这类跨设备信息，写入交给 Application ——
+    所以这里断言的是**发出去的意图**，落库由 Application 的用例守着。
+    """
     window.reload()
     target = next(item for item in window._items if not item.pinned)
     window._select(target.id)
+    received = []
+    window.flag_toggled.connect(lambda *args: received.append(args))
     window._toggle_pin_selected()
-    assert window._storage.get(target.id).pinned is True
+    assert received == [(target.id, "pinned", True)]
 
 
-def test_window_toggle_favorite(window, seeded):
+def test_window_toggle_favorite_emits_intent(window, seeded):
     window.reload()
     target = window._items[0]
     window._select(target.id)
+    received = []
+    window.flag_toggled.connect(lambda *args: received.append(args))
     window._toggle_favorite_selected()
-    assert window._storage.get(target.id).favorite is True
+    assert received == [(target.id, "favorite", True)]
+
+
+def test_window_toggle_does_not_write_storage_directly(window, seeded):
+    """界面不再直接写库：没接 Application 时，存储内容必须原样不动。
+
+    这条守着 CONTRIBUTING 里的分层约束（ui/ 不直接读写数据库）。
+    写库要顺带做「记录固定来源」这种跨设备的事，界面做不到也不该替它做。
+    """
+    window.reload()
+    target = next(item for item in window._items if not item.pinned)
+    window._select(target.id)
+    before = window._storage.get(target.id)
+    window._toggle_pin_selected()
+    after = window._storage.get(target.id)
+    assert after.pinned == before.pinned is False
 
 
 def test_window_empty_state(window, storage):
