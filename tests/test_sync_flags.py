@@ -526,3 +526,297 @@ def test_flags_sync_works_on_json_backend(tmp_path):
     assert b.find_by_hash(digest).pinned is True
     a.close()
     b.close()
+
+
+# ---- 固定标记的来源：删除保护必须能分辨「谁设的固定」 ----
+# 这一组守的是一类**删除失效**的缺陷，它比「标记传不过去」更坏：
+# 标记同步取并集，任何一台设备上的固定都会传播到所有设备；而固定又会
+# 阻断删除传播。于是「发起固定的那台自己删掉」之后，别的设备仍带着一个
+# 它设的固定而拒绝删除，记录永远删不掉，还会被重新导出复活。
+#
+# 判据是固定的来源设备：来源 == 发起删除的设备 时，固定已失效，删除照做。
+
+
+def _pair(tmp_path, a_name="a", b_name="b"):
+    from linglong_clip.core.tombstones import TombstoneStore
+
+    shared = tmp_path / "shared"
+    a, b = Storage(tmp_path / f"{a_name}.db"), Storage(tmp_path / f"{b_name}.db")
+    sync_a = FolderSync(
+        a, shared, device_name=a_name, tombstones=TombstoneStore(tmp_path / f"t{a_name}.json")
+    )
+    sync_b = FolderSync(
+        b, shared, device_name=b_name, tombstones=TombstoneStore(tmp_path / f"t{b_name}.json")
+    )
+    return a, b, sync_a, sync_b
+
+
+def test_export_stamps_local_pin_with_own_device_name(tmp_path):
+    """本机设的固定导出时要带上自己的设备名，对端才知道「是谁设的」。
+
+    不带的话，对端收到来源为空的固定，会理解成「对端本机设的」，
+    于是收到删除标记时误判成自己的固定意图 —— 正是复活 bug 的成因。
+    """
+    a, _b, sync_a, _sync_b = _pair(tmp_path)
+    digest = _seed(a, "本机固定的内容")
+    a.update_fields(a.find_by_hash(digest).id, pinned=True, metadata={})
+
+    sync_a.export()
+    records = [r for r in sync_a._read_journal(sync_a.journal_path) if not r.is_tombstone]
+    assert records and records[0].pinned is True
+    assert records[0].pinned_by == "a"
+
+
+def test_received_pin_records_origin_device(tmp_path):
+    """从对端收到的固定，本地要记住「设它的是谁」。"""
+    a, b, sync_a, sync_b = _pair(tmp_path)
+    digest = _seed(a, "对端固定的内容")
+    sync_a.export()
+    sync_b.import_all()
+
+    b.update_fields(b.find_by_hash(digest).id, pinned=True, metadata={})
+    sync_b.export()
+    sync_a.import_all()
+
+    assert a.find_by_hash(digest).pinned is True
+    assert a.find_by_hash(digest).pinned_by == "b"
+
+
+def test_pin_from_deleter_does_not_block_delete(tmp_path):
+    """U 型路径：B 固定 → 并集让 A 也带上固定 → B 删除。
+
+    A 上的固定其实是 B 设的，B 已经改主意了，A 不该继续拦着。
+    修复前：A 拒绝删除并把记录重新导出，于是 B 上被删的东西又活了。
+    """
+    a, b, sync_a, sync_b = _pair(tmp_path)
+    digest = _seed(a, "会被复活的内容")
+    sync_a.export()
+    sync_b.import_all()
+
+    # B 固定（B 的本机意图，导出时带上 "b"）
+    b_item = b.find_by_hash(digest)
+    b.update_fields(b_item.id, pinned=True, metadata={})
+    sync_b.export()
+    sync_a.import_all()
+    assert a.find_by_hash(digest).pinned is True
+    assert a.find_by_hash(digest).pinned_by == "b"
+
+    # 用户在 B 上删掉它
+    b.delete(b_item.id)
+    sync_b.tombstones.record(digest)
+    sync_b.export()
+
+    outcome = sync_a.import_all_detailed()
+    assert outcome.removed == 1
+    assert a.find_by_hash(digest) is None
+
+    # 关键：A 不该把它重新导出，B 上也不能复活
+    assert sync_a.export() == 0
+    sync_b.import_all()
+    assert b.find_by_hash(digest) is None
+
+
+def test_pin_from_third_party_still_protects(tmp_path):
+    """固定是第三台设备设的、删除是另一台发起的 —— 保护必须仍然生效。
+
+    这一条与 `test_pin_from_deleter_does_not_block_delete` 成对：
+    只修前者会把保护整个改坏，两者都要过。
+    """
+    a, b, sync_a, sync_b = _pair(tmp_path)
+    digest = _seed(a, "第三方固定的内容")
+    sync_a.export()
+    sync_b.import_all()
+
+    # B 固定它 —— 固定来自 b
+    b.update_fields(b.find_by_hash(digest).id, pinned=True, metadata={})
+    sync_b.export()
+    sync_a.import_all()
+    assert a.find_by_hash(digest).pinned_by == "b"
+
+    # A 发起删除：但它身上的固定来自 b，不是自己设的，保护仍应生效
+    a.delete(a.find_by_hash(digest).id)
+    sync_a.tombstones.record(digest)
+    sync_a.export()
+
+    assert sync_b.import_all_detailed().removed == 0
+    assert b.find_by_hash(digest) is not None
+
+
+def test_locally_pinned_record_deleted_by_peer_is_still_protected(tmp_path):
+    """本机自己固定的项，不该被对端的删除干掉。
+
+    来源为空表示「本机意图」，不能因为判来源而误伤。
+    """
+    a, b, sync_a, sync_b = _pair(tmp_path)
+    digest = _seed(a, "本机固定的内容")
+    sync_a.export()
+    sync_b.import_all()
+
+    a.update_fields(a.find_by_hash(digest).id, pinned=True, metadata={})
+    sync_a.export()
+    sync_b.import_all()
+    # A 的固定导出后会以 "a" 记录来源；B 端上它是 a 设的
+    assert b.find_by_hash(digest).pinned_by == "a"
+
+    b.delete(b.find_by_hash(digest).id)
+    sync_b.tombstones.record(digest)
+    sync_b.export()
+
+    assert sync_a.import_all_detailed().removed == 0
+    assert a.find_by_hash(digest) is not None
+
+
+def test_pin_is_stale_helper_edges():
+    """来源判定的四个边角，逐个钉住。"""
+    from linglong_clip.core.sync import SyncRecord, pin_is_stale
+
+    def item(pinned, by):
+        it = ClipboardItem(kind="text", content="c", preview="c")
+        it.pinned = pinned
+        if by:
+            it.metadata["pinned_by"] = by
+        return it
+
+    record = SyncRecord(hash="h", kind="text", content="c", preview="c", device="b")
+    # 没固定 → 谈不上过期
+    assert pin_is_stale(item(False, "b"), record) is False
+    # 来源为空 = 本机设的 → 不过期
+    assert pin_is_stale(item(True, ""), record) is False
+    # 来源就是发起删除的设备 → 过期
+    assert pin_is_stale(item(True, "b"), record) is True
+    # 来源是第三方 → 不过期
+    assert pin_is_stale(item(True, "c"), record) is False
+
+
+def test_unpin_clears_origin(tmp_path):
+    """取消固定要连来源一起清掉，否则旧来源会在后续重设时串味。"""
+    a, _b, sync_a, _sync_b = _pair(tmp_path)
+    digest = _seed(a, "先固定后取消")
+    item = a.find_by_hash(digest)
+    a.update_fields(item.id, pinned=True, metadata={"pinned_by": "b"})
+    assert a.find_by_hash(digest).pinned_by == "b"
+
+    a.update_fields(item.id, pinned=False, metadata={})
+    assert a.find_by_hash(digest).pinned_by == ""
+
+
+def test_pinned_by_survives_json_roundtrip():
+    record = SyncRecord(
+        hash="h1", kind="text", content="c", preview="c",
+        pinned=True, pinned_by="laptop",
+    )
+    restored = SyncRecord.from_json(record.to_json())
+    assert restored is not None
+    assert restored.pinned_by == "laptop"
+
+
+def test_pinned_by_absent_for_unpinned_record():
+    """没有固定标记时不该白写一个来源字段，省日志体积。"""
+    record = SyncRecord(hash="h1", kind="text", content="c", preview="c")
+    assert "pinned_by" not in record.to_json()
+
+
+def test_to_item_carries_pinned_by():
+    record = SyncRecord(
+        hash="h1", kind="text", content="c", preview="c",
+        pinned=True, pinned_by="desktop",
+    )
+    assert record.to_item().metadata.get("pinned_by") == "desktop"
+
+
+def test_to_item_omits_pinned_by_when_not_pinned():
+    record = SyncRecord(hash="h1", kind="text", content="c", preview="c", pinned_by="desktop")
+    assert "pinned_by" not in record.to_item().metadata
+
+
+# ---- 已删除的记录不该从任何日志里被读回来（含自己的） ----
+
+
+def test_local_delete_blocks_reimport_from_own_journal(tmp_path):
+    """一台设备把自己删掉的记录从**自己的日志**里复活。
+
+    路径：B 把某条的标记变化写进自己的日志 → 用户删掉它 → 下一轮导入
+    又读到那份日志里的同一条 → 记录回来了。判据是本地已记墓碑的指纹。
+    """
+    _a, b, _sync_a, sync_b = _pair(tmp_path, a_name="a", b_name="b")
+    digest = _seed(b, "自己删掉的内容")
+    b.update_fields(b.find_by_hash(digest).id, pinned=True, metadata={})
+    sync_b.export()  # 自己日志里有了这条内容
+
+    b.delete(b.find_by_hash(digest).id)
+    sync_b.tombstones.record(digest)
+
+    sync_b.import_all()
+    assert b.find_by_hash(digest) is None
+
+
+def test_peer_delete_blocks_reimport_from_own_journal(tmp_path):
+    """A 收到 B 的删除标记后，不该再从自己的日志里把这条读回来。"""
+    a, b, sync_a, sync_b = _pair(tmp_path)
+    digest = _seed(a, "被对端删掉的内容")
+    sync_a.export()
+    sync_b.import_all()
+
+    # B 删掉并广播
+    b.delete(b.find_by_hash(digest).id)
+    sync_b.tombstones.record(digest)
+    sync_b.export()
+
+    assert sync_a.import_all_detailed().removed == 1
+    # A 自己日志里还有这条内容，再导入一次不能复活
+    sync_a.import_all()
+    assert a.find_by_hash(digest) is None
+
+
+def test_unjournaled_new_record_still_imports(tmp_path):
+    """反向守卫：没被删过的新记录必须照常导入，别把判据写宽了。"""
+    a, b, sync_a, sync_b = _pair(tmp_path)
+    _seed(a, "全新内容")
+    sync_a.export()
+    assert sync_b.import_all_detailed().imported == 1
+    assert b.find_by_hash(content_hash("text", "全新内容")) is not None
+
+
+def test_local_pin_origin_survives_peer_pin(tmp_path):
+    """本机固定过的记录，来源不能被对端的固定顶掉。
+
+    若被顶成对端设备名，对端反悔删除时会连本机这份一起删 ——
+    但本机用户从没说过要删。来源保持在「本机（空串）」才对。
+    """
+    a, b, sync_a, sync_b = _pair(tmp_path)
+    digest = _seed(a, "两边都固定过")
+
+    # A 本机固定（来源为空）
+    a.update_fields(a.find_by_hash(digest).id, pinned=True, metadata={})
+    sync_a.export()
+
+    # B 收到并固定（B 上来源是 a），再发回来
+    sync_b.import_all()
+    assert b.find_by_hash(digest).pinned_by == "a"
+    b.update_fields(b.find_by_hash(digest).id, pinned=True, metadata={})
+    sync_b.export()
+    sync_a.import_all()
+
+    # A 仍然是「本机设的固定」，没被 B 的来源覆盖
+    assert a.find_by_hash(digest).pinned is True
+    assert a.find_by_hash(digest).pinned_by == ""
+
+
+def test_local_pin_protects_when_origin_not_overwritten(tmp_path):
+    """接上一条：来源没被顶掉，删除保护才继续有效。"""
+    a, b, sync_a, sync_b = _pair(tmp_path)
+    digest = _seed(a, "本机固定别被顶掉")
+    a.update_fields(a.find_by_hash(digest).id, pinned=True, metadata={})
+    sync_a.export()
+    sync_b.import_all()
+    b.update_fields(b.find_by_hash(digest).id, pinned=True, metadata={})
+    sync_b.export()
+    sync_a.import_all()
+
+    # B 删掉并广播：A 的固定来自本机，保护应当生效
+    b.delete(b.find_by_hash(digest).id)
+    sync_b.tombstones.record(digest)
+    sync_b.export()
+
+    assert sync_a.import_all_detailed().removed == 0
+    assert a.find_by_hash(digest) is not None

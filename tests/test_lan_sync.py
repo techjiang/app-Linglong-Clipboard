@@ -513,3 +513,76 @@ def test_lan_no_repeat_pull_when_flags_unchanged(nodes):
 
     assert b.sync_all() == 1
     assert b.sync_all() == 0
+
+
+# ---------- 固定标记的来源：删除保护要能分辨「谁设的固定」 ----------
+# 与共享文件夹模式同一条规则，两条路径各写一套用例 —— 只测一条等于没测。
+
+
+def test_lan_received_pin_records_origin_device(nodes):
+    make, local, remote = nodes
+    digest = _add_flagged(local, "局域网里被固定的项", pinned=True)
+    a, b = make(local, "laptop", token="t"), make(remote, "desktop", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+    b.sync_all()
+
+    assert remote.find_by_hash(digest).pinned is True
+    assert remote.find_by_hash(digest).pinned_by == "laptop"
+
+
+def test_lan_pin_from_deleter_does_not_block_delete(nodes):
+    """B 固定 → 同步给 A → B 删除：A 上的固定是 B 设的，不该继续拦着。"""
+    make, local, remote = nodes
+    digest = _add_flagged(local, "别复活我")
+    a, b = make(local, "laptop", token="t"), make(remote, "desktop", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+    a.peers = [f"127.0.0.1:{b.status()['port']}"]
+
+    # B 先拿到这条
+    b.sync_all()
+    # B 固定它，A 反向拉回，于是 A 上也有（来源是 desktop）
+    remote.update_fields(remote.find_by_hash(digest).id, pinned=True, metadata={})
+    a.sync_all()
+    assert local.find_by_hash(digest).pinned_by == "desktop"
+
+    # B 删掉它并广播
+    remote.delete(remote.find_by_hash(digest).id)
+    b.tombstones.record(digest)
+    outcome = a.sync_all_detailed()
+    assert outcome.removed == 1
+    assert local.find_by_hash(digest) is None
+
+
+def test_lan_own_pin_then_delete_propagates(nodes):
+    """A 自己固定、随后自己删除：这个固定是 laptop 设的，删除应当传过去。
+
+    与 `test_lan_pin_from_deleter_does_not_block_delete` 是同一条规则的两面：
+    固定标记只在对它**仍有效**时保护记录，发起固定的那台自己反悔了就不该保护。
+    """
+    make, local, remote = nodes
+    digest = _add_flagged(local, "自删自的", pinned=True)
+    a, b = make(local, "laptop", token="t"), make(remote, "desktop", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+    b.sync_all()
+    assert remote.find_by_hash(digest).pinned_by == "laptop"
+
+    local.delete(local.find_by_hash(digest).id)
+    a.tombstones.record(digest)
+    outcome = b.sync_all_detailed()
+    assert outcome.removed == 1
+    assert remote.find_by_hash(digest) is None
+
+
+def test_lan_local_tombstone_blocks_reimport(nodes):
+    """B 已记墓碑的指纹，不该从对端再读回来。"""
+    make, local, remote = nodes
+    digest = _add_flagged(local, "删了就别回来")
+    a, b = make(local, "laptop", token="t"), make(remote, "desktop", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+    b.sync_all()
+    assert remote.find_by_hash(digest) is not None
+
+    remote.delete(remote.find_by_hash(digest).id)
+    b.tombstones.record(digest)
+    assert b.sync_all() == 0
+    assert remote.find_by_hash(digest) is None

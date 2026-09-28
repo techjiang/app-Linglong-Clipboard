@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 from ..utils.logger import get_logger
-from .models import ClipboardItem
+from .models import PINNED_BY_KEY, ClipboardItem
 from .privacy import PrivacyGuard
 from .storage import Storage
 from .sync_cursor import SyncCursorStore
@@ -48,6 +48,9 @@ class SyncRecord:
     #: 这两个标记跨设备就丢了 —— 详见 ``FlagSnapshot`` 的说明。
     pinned: bool = False
     favorite: bool = False
+    #: 固定标记是谁设的。收到删除标记时要用它判断「这个固定是否已失效」，
+    #: 详见 ``models.PINNED_BY_KEY`` 的说明。
+    pinned_by: str = ""
     created_at: float = field(default_factory=time.time)
     #: 图片等二进制内容不进同步（体积大且隐私风险高）
     payload_b64: str = ""
@@ -75,6 +78,8 @@ class SyncRecord:
         # 只有为真时才写：老版本读到缺字段即视为 False，向后兼容
         if self.pinned:
             payload["pinned"] = True
+            if self.pinned_by:
+                payload["pinned_by"] = self.pinned_by
         if self.favorite:
             payload["favorite"] = True
         if self.deleted_at > 0:
@@ -95,6 +100,7 @@ class SyncRecord:
             tags=list(data.get("tags") or []),
             pinned=bool(data.get("pinned", False)),
             favorite=bool(data.get("favorite", False)),
+            pinned_by=str(data.get("pinned_by", "") or ""),
             created_at=float(data.get("created_at") or time.time()),
             payload_b64=str(data.get("payload_b64", "")),
             deleted_at=float(data.get("deleted_at") or 0.0),
@@ -112,12 +118,20 @@ class SyncRecord:
             favorite=self.favorite,
             hash=self.hash,
             created_at=self.created_at,
-            metadata={"synced": True},
+            metadata=(
+                {"synced": True, PINNED_BY_KEY: self.pinned_by}
+                if self.pinned and self.pinned_by
+                else {"synced": True}
+            ),
         )
 
     def flags(self) -> "FlagSnapshot":
-        """本条记录携带的用户标记。"""
-        return FlagSnapshot(pinned=self.pinned, favorite=self.favorite)
+        """本条记录携带的用户标记（含固定的来源设备）。"""
+        return FlagSnapshot(
+            pinned=self.pinned,
+            favorite=self.favorite,
+            pinned_by=self.pinned_by,
+        )
 
 
 @dataclass
@@ -136,6 +150,9 @@ class FlagSnapshot:
 
     pinned: bool = False
     favorite: bool = False
+    #: 固定标记的来源设备（空串表示本机设的 / 未知）。取并集时跟着一起并，
+    #: 否则「谁设的固定」会丢，删除保护就无法判断是否已失效。
+    pinned_by: str = ""
 
     def any(self) -> bool:
         return self.pinned or self.favorite
@@ -148,10 +165,26 @@ class FlagSnapshot:
         因为无法区分「对端取消过」和「对端从未设过」。取并集是唯一不会
         把用户的显式标记悄悄弄丢的选择。想真正取消，需要的是单独的
         取消传播通道（与墓碑同性质），不是在这里猜。
+
+        `pinned_by` 跟固定标记一起合并，规则是**优先保留 `self` 的来源**：
+
+        - `self` 已固定 → 用 `self.pinned_by`（空串也是有效值，表示「本机设的」）。
+          这条很关键：本机用户亲手固定的记录，来源必须保持空串，才不会被
+          对端带来的来源顶掉 —— 一旦被顶成对端设备名，对端反悔删除时会
+          连着本机这份一起删掉，而本机用户并没有说要删。
+        - `self` 没固定、`other` 固定了 → 用 `other.pinned_by`（谁设的答案在那边）。
         """
+        pinned = self.pinned or other.pinned
+        if not pinned:
+            pinned_by = ""
+        elif self.pinned:
+            pinned_by = self.pinned_by
+        else:
+            pinned_by = other.pinned_by
         return FlagSnapshot(
-            pinned=self.pinned or other.pinned,
+            pinned=pinned,
             favorite=self.favorite or other.favorite,
+            pinned_by=pinned_by,
         )
 
 
@@ -267,13 +300,31 @@ class FolderSync:
             if not item.hash:
                 continue
 
-            flags = FlagSnapshot(pinned=item.pinned, favorite=item.favorite)
+            # 固定的来源要**以「发送方」为基准**落进日志：本机设的固定（来源为空）
+            # 在这里补上自己的设备名，对端才会知道「这条固定是这台设备设的」。
+            # 不补的话，来源为空在对端语义里等于「对端本机设的」，于是对端
+            # 收到删除标记时会误判成「自己的固定意图」而拒绝删除 —— 这正是
+            # 「删了的东西在另一台机器上复活」的成因。来源非空的原样转发，
+            # 保持「谁设的」这个事实一路可追溯。
+            pinned_by = item.pinned_by or self.device_name
+            flags = FlagSnapshot(
+                pinned=item.pinned,
+                favorite=item.favorite,
+                pinned_by=pinned_by,
+            )
             if contains_hash(already, item.hash):
                 # 内容已经发过了。此前这里直接跳过，于是**标记的后续变化永远传不出去** ——
                 # 用户在设备 B 上收藏了某条，A 端永远不知道。
                 # 只有「本地标记比上次发出去的多」时才补发一条，避免每轮重传全部历史。
+                #
+                # 比的是布尔标记本身，不含 `pinned_by`：来源变化（比如先在本机固定、
+                # 后来对端也固定）不该单独触发重传，它只有在标记状态真的变了的时候
+                # 才有意义。否则每轮同步都会因为来源来回覆盖而反复补发。
                 previous = sent_flags.get(item.hash, FlagSnapshot())
-                if flags.merge(previous) == previous:
+                if (
+                    flags.merge(previous).pinned == previous.pinned
+                    and flags.merge(previous).favorite == previous.favorite
+                ):
                     # 对端已知的标记已经覆盖了本地这些，没有新东西要传
                     continue
                 _log.debug("补发标记变化：%s", item.hash)
@@ -288,6 +339,7 @@ class FolderSync:
                     tags=list(item.tags),
                     pinned=item.pinned,
                     favorite=item.favorite,
+                    pinned_by=pinned_by,
                     created_at=item.created_at,
                 )
             )
@@ -442,11 +494,21 @@ class FolderSync:
                 if self._apply_tombstone(record, seen_local):
                     outcome.removed += 1
 
+        # 本地已经记过墓碑的指纹：不管来源是哪份日志（**包括自己的**），
+        # 都不能再写回来。少了这一条，一台设备会把自己删掉的记录从自己的
+        # 日志里复活 —— 只要它此前往日志里写过这条的标记变化就够了。
+        # `deleted_in_batch` 只覆盖「同一批里先有删除」，管不到「上一批删过、
+        # 这一批日志里又读到」这种情况，两者缺一不可。
+        deleted_in_store = self.tombstones.all_hashes()
+
         for record in records:
             if record.is_tombstone:
                 continue
             if contains_hash(deleted_in_batch, record.hash):
                 # 同一批里它已被删除，别再写回来
+                continue
+            if contains_hash(deleted_in_store, record.hash):
+                _log.debug("跳过已删除的记录（本地有墓碑）：%s", record.hash)
                 continue
             if contains_hash(seen_local, record.hash):
                 # 内容本地已经有了。此前这里直接跳过，于是**对端后加的固定/收藏
@@ -480,7 +542,10 @@ class FolderSync:
         2. **超出保留期** → 只记指纹、不动本地记录。对端离线太久，它那边删掉的
            东西这边早已「活」了很久，此时再删就是在丢本机自己的数据。
         3. **固定项** → 只记指纹、不动记录。用户显式标了「别动它」，
-           删除传播不该越过这条线。
+           删除传播不该越过这条线 —— 但**只在本机的固定意图仍然有效时**。
+           若这个固定标记正是「正在删除的那台设备」设的（`pinned_by` 相同），
+           说明发起方自己已经改主意删掉了，这个固定是它留下的过期残留，
+           删除照做。详见 ``pin_is_stale``。
 
         注意判定用的是 `record.deleted_at`（对端的删除时刻），不是收到时刻 ——
         否则一台设备离线很久再上线时，本该过期的删除会被当成刚发生的。
@@ -499,10 +564,16 @@ class FolderSync:
         existing = self._storage.find_by_hash(record.hash)
         if existing is None:
             return False
-        if existing.pinned:
+        if existing.pinned and not pin_is_stale(existing, record):
             # 固定项是用户显式标记「别动它」的，删除传播不该越过这条线
             _log.info("保留固定项，跳过对端删除标记：%s", record.hash)
             return False
+        if existing.pinned:
+            _log.info(
+                "固定标记来自发起删除的设备 %s，已失效，按删除处理：%s",
+                record.device,
+                record.hash,
+            )
         self._storage.delete(existing.id)
         return True
 
@@ -587,6 +658,39 @@ class FolderSync:
         }
 
 
+def pin_is_stale(item: ClipboardItem, record: SyncRecord) -> bool:
+    """本地这条的固定标记，是不是「正在删除它的那台设备」留下的过期残留。
+
+    为什么需要这个判断：固定标记会阻断删除传播，理由是「用户显式说了别动它」。
+    但标记同步取并集，任何一台设备上的固定都会传播到所有设备 —— 包括
+    发起固定的那台自己。于是出现了这条路径：
+
+        设备 B 固定了某条  →  并集把固定传给了 A（A 上也变成已固定）
+        用户在 B 上删掉它  →  B 发出删除标记
+        A 收到标记，看到自己是「已固定」→ 拒绝删除
+        A 把它重新导出     →  B 上又被复活
+
+    用户删了的东西在自己另一台机器上活过来，且永远删不掉 —— 因为并集语义下
+    这个固定标记没有任何办法被清除。
+
+    判据就是**固定的来源设备**：`pinned_by` 等于发起删除的设备时，说明
+    这个固定正是它设的、而它现在已经删掉了，固定意图不复存在，删除应当生效。
+
+    两类要放行（不能误判成过期）的情形：
+
+    - `pinned_by` 为空：固定是本机设的（老版本数据也没有这个字段），
+      本机用户的「别动它」意图仍然有效，必须保留。
+    - `pinned_by` 与发起删除的设备不同：固定是第三台设备设的，
+      它的用户并没有改主意，删除传播不该越过它。
+    """
+    if not item.pinned:
+        return False
+    source = item.pinned_by
+    if not source:
+        return False
+    return source == record.device
+
+
 def apply_flags(
     storage: Storage,
     record: SyncRecord,
@@ -609,15 +713,33 @@ def apply_flags(
     existing = storage.find_by_hash(record.hash)
     if existing is None:
         return False
-    merged = FlagSnapshot(pinned=existing.pinned, favorite=existing.favorite).merge(
-        record.flags()
+
+    local = FlagSnapshot(
+        pinned=existing.pinned,
+        favorite=existing.favorite,
+        pinned_by=existing.pinned_by,
     )
-    if merged.pinned == existing.pinned and merged.favorite == existing.favorite:
+    remote = record.flags()
+    # `merge` 的 `other` 语义是「后到的一份」，对端记录就是后到的
+    merged = local.merge(remote)
+    if (
+        merged.pinned == existing.pinned
+        and merged.favorite == existing.favorite
+        and merged.pinned_by == existing.pinned_by
+    ):
         return False
+
+    metadata = dict(existing.metadata)
+    if merged.pinned and merged.pinned_by:
+        metadata[PINNED_BY_KEY] = merged.pinned_by
+    else:
+        # 没有固定标记时不留来源，避免旧来源在后续取消/重设之间串味
+        metadata.pop(PINNED_BY_KEY, None)
     storage.update_fields(
         existing.id,
         pinned=merged.pinned,
         favorite=merged.favorite,
+        metadata=metadata,
     )
     if seen_local is not None:
         seen_local.add(record.hash)

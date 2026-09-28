@@ -45,6 +45,7 @@ from .sync import (
     SyncCipher,
     SyncRecord,
     apply_flags,
+    pin_is_stale,
 )
 from .sync_cursor import SyncCursorStore
 from .tombstones import Tombstone, TombstoneStore, contains_hash
@@ -272,6 +273,11 @@ class LanSyncServer:
                 tags=list(item.tags),
                 pinned=item.pinned,
                 favorite=item.favorite,
+                # 固定的来源以「发送方」为基准：本机设的（来源为空）补上自己的
+                # 设备名，对端才知道这条固定是谁设的。不补的话对端会把它
+                # 理解成自己的意图，于是收到删除标记时拒绝删除 —— 与共享
+                # 文件夹模式同一条规则，两处不能各写一套。
+                pinned_by=(item.pinned_by or self.device_name) if item.pinned else "",
                 created_at=item.created_at,
             )
             for item in items
@@ -509,8 +515,15 @@ class LanSyncClient:
             if self._apply_tombstone(record, seen):
                 outcome.removed += 1
 
+        # 本地已记墓碑的指纹不再写回：否则本机删掉的记录会从对端日志里复活。
+        # 与共享文件夹模式同一条规则，两处不能各写一套。
+        deleted_in_store = self.tombstones.all_hashes()
+
         for record in records:
             if record.is_tombstone:
+                continue
+            if contains_hash(deleted_in_store, record.hash):
+                _log.debug("跳过已删除的记录（本地有墓碑）：%s", record.hash)
                 continue
             if contains_hash(seen, record.hash):
                 # 内容本地已有 —— 但**标记可能还没有**。此前这里直接跳过，
@@ -537,6 +550,8 @@ class LanSyncClient:
 
         规则与共享文件夹模式完全一致，两处不能各写一套：
         过期的不动本地数据、固定项不删、同一指纹只处理一次。
+        固定项的判定同样共用 `pin_is_stale` —— 由发起删除的设备自己设下的
+        固定标记是过期残留，不该阻断删除（详见该函数说明）。
         """
         if self.tombstones.has(record.hash):
             return False
@@ -551,9 +566,15 @@ class LanSyncClient:
         existing = self._storage.find_by_hash(record.hash)
         if existing is None:
             return False
-        if existing.pinned:
+        if existing.pinned and not pin_is_stale(existing, record):
             _log.info("保留固定项，跳过对端删除标记：%s", record.hash)
             return False
+        if existing.pinned:
+            _log.info(
+                "固定标记来自发起删除的设备 %s，已失效，按删除处理：%s",
+                record.device,
+                record.hash,
+            )
         self._storage.delete(existing.id)
         return True
 

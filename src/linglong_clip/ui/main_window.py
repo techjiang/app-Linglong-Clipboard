@@ -194,6 +194,15 @@ class MainWindow(QWidget):
     copy_requested = Signal(int, bool)  # (item_id, plain_text_only)
     paste_requested = Signal(int)
     delete_requested = Signal(int)
+    #: 切换固定/收藏：(item_id, 字段名, 目标值)。
+    #: 界面只发意图，真正的写入交给 Application —— 写入要顺带记「固定是谁设的」
+    #: 并广播给同步层，界面不该知道这些。CONTRIBUTING 里的分层约束也明确要求
+    #: 「ui/ 不直接读写数据库」。
+    flag_toggled = Signal(int, str, bool)
+    #: 请求清理未固定记录 / 压缩数据库。同样是「只发意图」：
+    #: 清理要顺带给消失的指纹记删除标记，否则别的设备上它们会复活。
+    clear_requested = Signal()
+    compact_requested = Signal()
     #: 转换完成：(原记录, 动作 key, 产物)
     transform_ready = Signal(object, str, str)
     #: 用户点了窗口关闭按钮。由 Application 决定「收进托盘」还是「退出」，
@@ -618,7 +627,9 @@ class MainWindow(QWidget):
         if item is None:
             return
         new_value = not getattr(item, field)
-        self._storage.update_fields(self._selected_id, **{field: new_value})
+        # 只发意图，不自己写库：写入要顺带记「固定来源设备」并广播给同步层，
+        # 那是 Application 的职责。CONTRIBUTING 的分层约束也要求 ui/ 不直接写库。
+        self.flag_toggled.emit(self._selected_id, field, new_value)
         label = "固定" if field == "pinned" else "收藏"
         self._status_label.setText(f"已{'取消' if not new_value else ''}{label}")
         self.reload()
@@ -711,12 +722,19 @@ class MainWindow(QWidget):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-        removed = self._storage.clear(keep_pinned=True)
+        # 只发意图：清理要顺带给消失的指纹记删除标记（否则别的设备上会复活），
+        # 那是 Application 的职责，界面不该替它做。
+        self.clear_requested.emit()
+
+    def notify_cleared(self, removed: int) -> None:
+        """由 Application 在清理完成后回调，用于更新状态栏与列表。"""
         self._status_label.setText(f"已清理 {removed} 条记录")
         self.reload()
 
     def _compact_db(self) -> None:
-        self._storage.optimize()
+        self.compact_requested.emit()
+
+    def notify_compacted(self) -> None:
         self._status_label.setText("数据库已压缩")
 
     def focus_search(self) -> None:

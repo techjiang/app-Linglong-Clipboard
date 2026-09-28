@@ -30,6 +30,17 @@ KIND_LABELS: Dict[str, str] = {
 }
 
 
+#: `metadata` 里记录「这条的固定标记是谁设的」的键。
+#:
+#: 为什么需要它：固定标记会阻断删除传播（「别动它」的显式意图优先）。
+#: 但标记同步取并集，于是一台设备上的固定会传播到所有设备。若发起固定的
+#: 那台设备随后自己删掉了这条，别的设备仍带着一个「它设的固定」而拒绝删除，
+#: 记录就永远删不掉，还会在同一条日志里被复活。记下来源设备后，
+#: 收到删除标记时可以判断「这个固定是不是那个正在删除的设备设的」——
+#: 是，就说明它已失效，删除照做。
+PINNED_BY_KEY = "pinned_by"
+
+
 def content_hash(kind: str, payload: str) -> str:
     """内容指纹：用于去重与跨设备同步时的冲突判定。"""
     digest = hashlib.blake2b(digest_size=16)
@@ -87,6 +98,16 @@ class ClipboardItem:
     @property
     def display_source(self) -> str:
         return self.source_app or "未知来源"
+
+    @property
+    def pinned_by(self) -> str:
+        """最近一次把这个固定标记设进来的设备名（空串表示本机/未知）。
+
+        存进 `metadata` 而不是单开一个列：它是同步用的辅助信息，
+        不是用户可见的数据，旧库缺这个键时按空串处理即可，不必迁移。
+        """
+        value = self.metadata.get(PINNED_BY_KEY)
+        return str(value) if value else ""
 
     @property
     def size_label(self) -> str:

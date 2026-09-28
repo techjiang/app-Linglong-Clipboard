@@ -20,7 +20,7 @@ from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 from ..core.automation import AutomationEngine
 from ..core.collector import CAPTURED, MERGED, Collector
 from ..core.copy_guard import ClipboardReleaser, plan_outbound
-from ..core.models import ClipboardItem
+from ..core.models import PINNED_BY_KEY, ClipboardItem
 from ..core.monitor import ClipboardMonitor, FocusTracker
 from ..core.ocr import build_engine as build_ocr_engine
 from ..core.privacy import PrivacyGuard
@@ -357,6 +357,9 @@ class Application(QObject):
         self.window.copy_requested.connect(self.copy_item)
         self.window.paste_requested.connect(self.paste_item)
         self.window.delete_requested.connect(self.delete_item)
+        self.window.flag_toggled.connect(self.toggle_flag)
+        self.window.clear_requested.connect(self.clear_unpinned)
+        self.window.compact_requested.connect(self.compact_storage)
         self.window.transform_ready.connect(self._show_transform)
         self.preview.item_chosen.connect(self._on_quick_chosen)
         self.preview.closed.connect(self._on_preview_closed)
@@ -804,6 +807,36 @@ class Application(QObject):
         except OSError:
             return False
 
+    def toggle_flag(self, item_id: int, field: str, value: bool) -> None:
+        """切换固定/收藏标记。
+
+        界面只发意图，写入在这里做，因为有两件界面不该操心的事：
+
+        1. **固定标记要记来源设备**（`pinned_by`）。删除传播默认会被固定标记
+           挡住（「别动它」的意图优先），但若固定是**发起删除的那台设备**设的，
+           就说明它已经改主意了，那个固定是过期残留，不该继续挡着。
+           记下来源，收到删除标记时才判断得出这一点 —— 详见 `pin_is_stale`。
+        2. **写入要能被同步层看见**：标记靠同步传播，顺序不能乱。
+        """
+        if field not in ("pinned", "favorite"):
+            return
+        item = self.storage.get(item_id)
+        if item is None:
+            return
+
+        metadata = dict(item.metadata)
+        if field == "pinned":
+            # 本机用户刚刚做了决定：固定就是本机设的，来源清空。
+            # 空来源在 `pin_is_stale` 里表示「本机的意图」，永远不判为过期；
+            # 写对端设备名反而会让本机的固定被误判成别的设备的残留。
+            metadata.pop(PINNED_BY_KEY, None)
+        self.storage.update_fields(
+            item_id,
+            metadata=metadata,
+            **{field: bool(value)},
+        )
+        self.window.reload()
+
     def delete_item(self, item_id: int) -> None:
         # 先取指纹再删：记录没了就没法算指纹，也就没东西能告诉对端「这条删了」
         item = self.storage.get(item_id)
@@ -813,6 +846,32 @@ class Application(QObject):
             self.tombstones.record(digest)
         self.window.reload()
         self.window.notify("已删除")
+
+    def clear_unpinned(self) -> None:
+        """清理未固定记录，并给**真的消失了**的指纹记删除标记。
+
+        走这里而不是让界面直接 `storage.clear()`：界面上那个按钮此前直接清库，
+        墓碑一条都不记，于是「在这台清了、别的设备上还在」，下一轮同步又原样
+        回来 —— 与「删一条」的传播漏掉是同一个错误，只是入口不同。
+        CLI 的 `--clear` 早就是这么做的，两边必须一致。
+
+        只给真正消失的指纹记墓碑：固定项不受清理影响、仍在库里，
+        把它们算成删除会误删别的设备上那些记录。
+        """
+        from ..core.tombstones import local_fingerprints
+
+        before = set(local_fingerprints(self.storage))
+        removed = self.storage.clear(keep_pinned=True)
+        survivors = set(local_fingerprints(self.storage))
+        doomed = [digest for digest in before if digest not in survivors]
+        recorded = self.tombstones.record_many(doomed) if doomed else 0
+        _log.info("清理未固定记录 %d 条，记下 %d 条删除标记", removed, recorded)
+        self.window.notify_cleared(removed)
+
+    def compact_storage(self) -> None:
+        """压缩存储文件。界面只发意图，实际动作留在这里，保持分层。"""
+        self.storage.optimize()
+        self.window.notify_compacted()
 
     # ---- 界面 ----
 
