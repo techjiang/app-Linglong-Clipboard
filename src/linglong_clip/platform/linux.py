@@ -65,7 +65,10 @@ class LinuxBackend(ClipboardBackend):
 
     def is_available(self) -> bool:
         if self._session == "wayland":
-            return self._has_wl or self._xlib is not None
+            # 注意 `self._xlib` 是三态：True=连通、False=试过但失败、None=没试过。
+            # 之前写的是 `self._xlib is not None` —— 于是「试过且失败」也被算成
+            # 可用，Wayland 下没有 wl-clipboard 又连不上 X 时会谎报可用。
+            return self._has_wl or self._xlib is True
         return True
 
     def _init_xlib(self) -> None:
@@ -185,13 +188,24 @@ class LinuxBackend(ClipboardBackend):
             title = self._window_property(window, "_NET_WM_NAME") or self._window_property(
                 window, "WM_NAME"
             )
-            wm_class = self._window_property(window, "WM_CLASS") or ""
-            app_id = wm_class.split("\x00")[-1].strip() if wm_class else ""
+            # WM_CLASS 的取值是 `实例名\0类名` 两段，要的是**类名**（后一段）。
+            # 必须用保留 NUL 的原始读取：`_window_property()` 会把 NUL 换成空格
+            # 方便展示，拿它再 split("\x00") 永远分不开，app_id 会变成
+            # 「实例名 类名」整串 —— 而 app_id 是要喂给隐私判定的
+            # （`is_password_manager(app_id)`），串了就等于放行密码管理器。
+            raw_class = self._window_raw_property(window, "WM_CLASS")
+            app_id = _wm_class_to_app_id(raw_class)
             return FocusInfo(app_id=app_id, app_name=app_id or title, window_title=title)
         except Exception:  # noqa: BLE001
             return FocusInfo()
 
     def _window_property(self, window, name: str) -> str:
+        """读窗口属性，返回**可直接展示**的文本（NUL 换成空格）。"""
+        raw = self._window_raw_property(window, name)
+        return raw.replace("\x00", " ").strip()
+
+    def _window_raw_property(self, window, name: str) -> str:
+        """读窗口属性并**保留 NUL 分隔符**，供需要按段解析的调用方使用。"""
         try:
             atom = self._x_display.get_atom(name)  # type: ignore[union-attr]
             prop = window.get_full_property(atom, 0)
@@ -199,10 +213,25 @@ class LinuxBackend(ClipboardBackend):
                 return ""
             value = prop.value
             if isinstance(value, bytes):
-                return value.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
-            return str(value).strip()
+                return value.decode("utf-8", "replace")
+            return str(value)
         except Exception:  # noqa: BLE001
             return ""
+
+
+def _wm_class_to_app_id(raw: str) -> str:
+    """把 `WM_CLASS` 的原始值解析成应用标识。
+
+    取值形如 `chrome\0Google-chrome`，后一段（类名）才稳定，因为它由
+    WM_CLASS 的第二个字段决定、与实例名无关。只有一段时就用那一段。
+    取不到时返回空串，交给调用方回落到窗口标题。
+    """
+    if not raw:
+        return ""
+    parts = [part.strip() for part in raw.split("\x00") if part.strip()]
+    if not parts:
+        return ""
+    return parts[-1]
 
 
 def _process_name(pid: int) -> str:

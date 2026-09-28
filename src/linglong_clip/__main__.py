@@ -28,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  linglong-clipboard --search '上周的截图'\n"
             "  linglong-clipboard --get 12         输出第 12 条内容\n"
             "  linglong-clipboard --stats          查看统计与检索能力\n"
+            "  linglong-clipboard --import-native-history  导入系统剪贴板历史\n"
             "  linglong-clipboard --selfcheck      自检原生能力是否真的可用\n"
             "  linglong-clipboard --sync-status    查看同步模式与对端状态\n"
             "  linglong-clipboard --sync-cursor    查看各同步来源的增量游标\n"
@@ -78,6 +79,11 @@ def build_parser() -> argparse.ArgumentParser:
     maintenance.add_argument("--import-sync", action="store_true", help="从同步来源导入")
     maintenance.add_argument("--export-sync", action="store_true", help="导出到同步来源")
     maintenance.add_argument("--sync-status", action="store_true", help="查看同步模式与对端状态")
+    maintenance.add_argument(
+        "--import-native-history",
+        action="store_true",
+        help="导入系统剪贴板历史（Windows 10 1809+，补齐本工具启动前的记录）",
+    )
     maintenance.add_argument(
         "--sync-cursor",
         action="store_true",
@@ -386,6 +392,9 @@ def _run_cli(args: argparse.Namespace) -> int:
         storage.close()
         return 0
 
+    if args.import_native_history:
+        return _run_native_history_import(args, storage, config)
+
     if args.list or args.search:
         if args.search:
             engine = SemanticEngine(storage)
@@ -578,6 +587,63 @@ def _run_selfcheck(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_native_history_import(args: argparse.Namespace, storage, config) -> int:
+    """把系统剪贴板历史导入本工具。
+
+    走 `Collector`，与实时采集同一条管线 —— 隐私判定、去重、类型识别、
+    OCR 一个都不跳过。绝不直接往 storage 里塞：那样系统历史就成了
+    「绕过风控的后门」，从里面捞回的密码会直接落库。
+    """
+    from .core.collector import Collector
+    from .core.native_history import import_native_history
+    from .core.ocr import build_engine as build_ocr_engine
+    from .core.privacy import PrivacyGuard
+    from .platform import detect_backend
+
+    backend = detect_backend()
+    guard = PrivacyGuard(config)
+    collector = Collector(
+        storage,
+        config,
+        guard,
+        ocr=build_ocr_engine(config),
+    )
+    report = import_native_history(backend, collector, limit=args.limit)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "backend": getattr(backend, "name", "unknown"),
+                    "supported": report.supported,
+                    "scanned": report.scanned,
+                    "captured": report.captured,
+                    "merged": report.merged,
+                    "skipped_privacy": report.skipped_privacy,
+                    "skipped_other": report.skipped_other,
+                    "reason": report.unsupported_reason,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        storage.close()
+        # 不支持不算失败：这是一项增强能力，缺它不影响本工具工作
+        return 0
+
+    if not report.supported:
+        print(report.unsupported_reason)
+        storage.close()
+        return 0
+
+    print(report.summary())
+    if report.blocked_samples:
+        preview = "、".join(report.blocked_samples)
+        print(f"（被隐私策略拦下的内容已丢弃，示例预览：{preview}）")
+    storage.close()
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
@@ -597,6 +663,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.import_sync,
             args.export_sync,
             args.sync_status,
+            args.import_native_history,
             args.sync_cursor,
             args.sync_cursor_reset,
             args.storage_status,

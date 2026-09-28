@@ -134,12 +134,75 @@ def run_windows_extras() -> int:
         _row("user32 加载", "fail", repr(exc))
         return 2
 
-    # 系统剪贴板历史是否开启（Win10 1809+）
+    # 剪贴板序列号：事件驱动之外最省的变化检测
     try:
         seq = int(user32.GetClipboardSequenceNumber())
         _row("剪贴板序列号", "ok" if seq else "degraded", f"当前序列号 {seq}")
     except Exception as exc:  # noqa: BLE001
         _row("剪贴板序列号", "fail", repr(exc))
+
+    # 系统剪贴板历史：开关（读注册表）+ 真实读取能力
+    try:
+        from linglong_clip.platform.windows import history_enabled
+
+        enabled = history_enabled()
+        if enabled is True:
+            _row("系统剪贴板历史开关", "ok", "已开启")
+        elif enabled is False:
+            _row(
+                "系统剪贴板历史开关",
+                "degraded",
+                "已关闭",
+                "设置 → 系统 → 剪贴板 → 打开「剪贴板历史记录」，"
+                "否则 --import-native-history 读不到任何东西",
+            )
+        else:
+            _row(
+                "系统剪贴板历史开关",
+                "degraded",
+                "读不到注册表值（可能从未开启过）",
+                "同上；读不到只影响提示，不影响其它功能",
+            )
+    except Exception as exc:  # noqa: BLE001
+        _row("系统剪贴板历史开关", "fail", repr(exc))
+
+    # WinRT 投影：历史读取靠它，缺了就只能空手而归
+    try:
+        from linglong_clip.platform.windows import _load_winrt
+
+        _load_winrt()
+        _row("WinRT 投影", "ok", "可导入（历史读取依赖它）")
+    except Exception as exc:  # noqa: BLE001
+        _row(
+            "WinRT 投影",
+            "degraded",
+            f"不可用：{exc}",
+            "pip install winrt 或 pip install winsdk；"
+            "缺了只影响系统历史导入，其余功能不受影响",
+        )
+
+    # 真去读一次历史：符号在 vs 真能读到东西，是两回事
+    try:
+        from linglong_clip.platform.windows import WindowsBackend
+
+        backend = WindowsBackend()
+        supported = backend.is_history_supported()
+        if supported:
+            items = backend.read_windows(limit=5)
+            _row(
+                "系统剪贴板历史读取",
+                "ok",
+                f"读到 {len(items)} 条文本（最多取 5 条验证）",
+            )
+        else:
+            _row(
+                "系统剪贴板历史读取",
+                "degraded",
+                "能力探测判定不可用",
+                "需 Win10 1809+、系统历史已开启、且装了 WinRT 投影",
+            )
+    except Exception as exc:  # noqa: BLE001
+        _row("系统剪贴板历史读取", "fail", repr(exc))
 
     # 事件驱动监听依赖 AddClipboardFormatListener
     try:

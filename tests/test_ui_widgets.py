@@ -544,3 +544,142 @@ def test_settings_native_panel_does_not_break_saving(qt_app, home):
     dialog._capture_enabled.setChecked(False)
     dialog._save()
     assert config.get("capture.enabled") is False
+
+
+# --------------------------------------------------- 设置页：系统剪贴板历史
+
+
+def test_settings_has_native_history_group(qt_app, home):
+    """导入入口要在界面上，用户不必为一次性操作去开终端。"""
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    dialog = SettingsDialog(Config(home / "config.json"))
+    assert hasattr(dialog, "_native_import_button")
+    assert hasattr(dialog, "_native_import_status")
+    assert dialog._native_import_button.text()
+
+
+def test_native_history_button_disabled_when_unsupported(qt_app, home, monkeypatch):
+    """平台不支持时按钮要禁用，并把原因写清楚 —— 别让人点了没反应。"""
+    from linglong_clip.platform import base as base_module
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    class _Unsupported:
+        name = "linux"
+
+        def is_history_supported(self):
+            return False
+
+    monkeypatch.setattr(base_module, "detect_backend", lambda: _Unsupported())
+    monkeypatch.setattr(
+        "linglong_clip.platform.detect_backend", lambda: _Unsupported(), raising=False
+    )
+
+    dialog = SettingsDialog(Config(home / "config.json"))
+    dialog._refresh_native_history_state()
+    assert dialog._native_import_button.isEnabled() is False
+    assert "不可用" in dialog._native_import_status.text()
+
+
+def test_native_history_button_enabled_when_supported(qt_app, home, monkeypatch):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    class _Supported:
+        name = "windows"
+
+        def is_history_supported(self):
+            return True
+
+        def read_windows(self, limit=30):
+            return []
+
+    monkeypatch.setattr(
+        "linglong_clip.platform.detect_backend", lambda: _Supported(), raising=False
+    )
+    dialog = SettingsDialog(Config(home / "config.json"))
+    dialog._refresh_native_history_state()
+    assert dialog._native_import_button.isEnabled() is True
+    assert "可用" in dialog._native_import_status.text()
+
+
+def test_native_history_state_survives_probe_failure(qt_app, home, monkeypatch):
+    """探测抛异常时按「不可用」处理，不能把设置页搞崩。"""
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    def _boom():
+        raise RuntimeError("探测炸了")
+
+    monkeypatch.setattr("linglong_clip.platform.detect_backend", _boom, raising=False)
+    dialog = SettingsDialog(Config(home / "config.json"))
+    dialog._refresh_native_history_state()
+    assert dialog._native_import_button.isEnabled() is False
+
+
+def test_native_history_import_reports_result(qt_app, home, monkeypatch):
+    """点导入要真的跑一遍并把结论显示出来（含隐私拦截条数）。"""
+    from linglong_clip.platform.base import CaptureResult
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    class _Backend:
+        name = "windows"
+
+        def is_history_supported(self):
+            return True
+
+        def read_windows(self, limit=30):
+            return [
+                CaptureResult(kind="text", text="普通内容"),
+                CaptureResult(
+                    kind="text",
+                    text="-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----",
+                ),
+            ]
+
+    monkeypatch.setattr(
+        "linglong_clip.platform.detect_backend", lambda: _Backend(), raising=False
+    )
+    dialog = SettingsDialog(Config(home / "config.json"))
+    dialog._run_native_history_import()
+
+    status = dialog._native_import_status.text()
+    assert "导入 1" in status
+    # 被拦下的条数必须让用户看见，否则「为什么少了一条」无从解释
+    assert "1 条" in status
+
+
+def test_native_history_import_handles_unsupported(qt_app, home, monkeypatch):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    class _Backend:
+        name = "linux"
+
+        def is_history_supported(self):
+            return False
+
+    monkeypatch.setattr(
+        "linglong_clip.platform.detect_backend", lambda: _Backend(), raising=False
+    )
+    dialog = SettingsDialog(Config(home / "config.json"))
+    dialog._run_native_history_import()
+    assert dialog._native_import_status.text()
+
+
+def test_native_history_import_handles_storage_failure(qt_app, home, monkeypatch):
+    """打不开历史仓库时应显示原因，不是静默失败。"""
+    from linglong_clip.core import repository as repo_module
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    def _boom(config):
+        raise OSError("磁盘满了")
+
+    monkeypatch.setattr(repo_module, "open_repository", _boom)
+    dialog = SettingsDialog(Config(home / "config.json"))
+    dialog._run_native_history_import()
+    assert "磁盘满了" in dialog._native_import_status.text()

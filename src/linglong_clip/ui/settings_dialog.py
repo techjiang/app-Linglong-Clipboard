@@ -158,6 +158,8 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(self._build_ocr_group())
 
+        layout.addWidget(self._build_native_history_group())
+
         layout.addWidget(history_group)
         layout.addWidget(self._build_storage_group())
         layout.addStretch(1)
@@ -210,6 +212,84 @@ class SettingsDialog(QDialog):
                 self._ocr_status.setText("不可用 · 未找到 tesseract（截图将无法被文字搜索）")
         except Exception:  # noqa: BLE001 - 状态展示失败不该挡住设置页
             self._ocr_status.setText("无法探测（不影响其它功能）")
+
+    def _build_native_history_group(self) -> QGroupBox:
+        """系统剪贴板历史导入：补齐本工具启动之前复制的记录。
+
+        本工具只看得到自己启动之后的内容；装好之前、或者被退出期间
+        复制的东西，历史里就是缺的。Windows 10 1809+ 的系统剪贴板历史
+        正好覆盖这段空缺。
+        """
+        group = QGroupBox("系统剪贴板历史")
+        form = QFormLayout(group)
+
+        self._native_import_button = QPushButton("导入系统历史…")
+        self._native_import_button.clicked.connect(self._run_native_history_import)
+        form.addRow("", self._native_import_button)
+
+        self._native_import_status = QLabel()
+        self._native_import_status.setWordWrap(True)
+        form.addRow("状态", self._native_import_status)
+        self._refresh_native_history_state()
+
+        return group
+
+    def _refresh_native_history_state(self) -> None:
+        """探测当前平台到底能不能读系统历史，直白地写出来。"""
+        try:
+            from ..platform import detect_backend
+
+            backend = detect_backend()
+            supported = bool(getattr(backend, "is_history_supported", lambda: False)())
+        except Exception:  # noqa: BLE001 - 探测失败不该挡住设置页
+            supported = False
+
+        if supported:
+            self._native_import_status.setText(
+                "可用 · 导入的内容会与实时采集走同一套隐私判定"
+            )
+            self._native_import_button.setEnabled(True)
+        else:
+            self._native_import_status.setText(
+                "不可用 · 需要 Windows 10 1809+ 且在「设置 → 系统 → 剪贴板」"
+                "里打开历史（其它平台由系统决定，程序侧无法补齐）"
+            )
+            self._native_import_button.setEnabled(False)
+
+    def _run_native_history_import(self) -> None:
+        """真的执行一次导入，并把结果（含被拦下的条数）摊给用户看。"""
+        from ..core.collector import Collector
+        from ..core.native_history import import_native_history
+        from ..core.ocr import build_engine as build_ocr_engine
+        from ..core.privacy import PrivacyGuard
+        from ..platform import detect_backend
+
+        try:
+            from ..core.repository import open_repository
+
+            storage = open_repository(self._config)
+        except Exception as exc:  # noqa: BLE001
+            self._native_import_status.setText(f"打不开历史仓库：{exc}")
+            return
+
+        try:
+            collector = Collector(
+                storage,
+                self._config,
+                PrivacyGuard(self._config),
+                ocr=build_ocr_engine(self._config),
+            )
+            report = import_native_history(detect_backend(), collector)
+        finally:
+            storage.close()
+
+        if not report.supported:
+            self._native_import_status.setText(report.unsupported_reason)
+            return
+        text = report.summary()
+        if report.skipped_privacy:
+            text += "；被拦下的敏感内容已丢弃，未入库"
+        self._native_import_status.setText(text)
 
     def _build_privacy_tab(self) -> QWidget:
         page = QWidget()

@@ -90,7 +90,7 @@ GUI 线程：刷新列表 + 状态提示
 | 方法 | 用途 | 缺失时的表现 |
 | --- | --- | --- |
 | `read_primary_text()` | X11/Wayland 主选择区 | 返回空串，该功能不出现 |
-| `read_windows()` | 系统剪贴板历史 | 返回空列表 |
+| `read_windows()` | 系统剪贴板历史 | 返回空列表，导入入口提示不支持 |
 | `current_focus()` | 来源应用识别 | 来源显示「未知来源」 |
 | `set_transient_text()` | 安全粘贴（限时清除） | 返回 False，改由定时器清空 |
 
@@ -102,6 +102,15 @@ GUI 线程：刷新列表 + 状态提示
 - `AddClipboardFormatListener` 事件驱动，避免轮询空转
 - `OpenClipboard` 带重试，因为其它进程常短暂占用剪贴板
 - 写入时附加 `ExcludeClipboardContentFromMonitorProcessing`
+
+系统剪贴板历史（Windows 10 1809+）走 WinRT
+`Clipboard.GetHistoryItemsAsync()` 读取，补齐本工具启动前的记录。
+两个必须注意的点：
+
+- **开关要读注册表**：`HKCU\Software\Microsoft\Clipboard\EnableClipboardHistory`。
+  单看 API 能否调用是分不清「没开历史」和「历史是空的」的。
+- **导入走 `Collector.process()`**：与实时采集同一条管线。
+  若为了「快一点」直接写 storage，系统历史就成了绕过隐私判定的后门。
 
 **Linux** 区分 X11 与 Wayland：
 

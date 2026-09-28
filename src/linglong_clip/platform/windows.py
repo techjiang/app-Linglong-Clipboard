@@ -5,15 +5,18 @@
 - `GetForegroundWindow` + `QueryFullProcessImageNameW` 取来源进程；
 - `AddClipboardFormatListener` 支持事件驱动（由 Qt 层的 nativeEventFilter 调用）；
 - `OpenClipboard` 时用 `CF_CLIPBOARD_VIEWER_IGNORE` 防止成为剪贴板查看器；
-- 写入时附加 `ExcludeClipboardContentFromMonitorProcessing`，让安全内容不进历史。
+- 写入时附加 `ExcludeClipboardContentFromMonitorProcessing`，让安全内容不进历史；
+- 用 WinRT `Clipboard.GetHistoryItemsAsync()` 读系统剪贴板历史，
+  补齐本工具**启动之前**复制的内容。
 """
 
 from __future__ import annotations
 
 import ctypes
+import ntpath
 import os
 from ctypes import wintypes
-from typing import Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 
 from .base import ClipboardBackend, FocusInfo
 
@@ -27,6 +30,95 @@ HWND_MESSAGE = -3
 CF_CLIPBOARD_VIEWER_IGNORE = 0x03CB
 CLIPBOARD_FORMAT_EXCLUDE_MONITOR = "ExcludeClipboardContentFromMonitorProcessing"
 CLIPBOARD_FORMAT_CAN_INCLUDE = "CanIncludeInClipboardHistory"
+
+
+# ------------------------------------------------------------------ WinRT 历史读取
+
+#: WinRT 历史接口的注册表开关：系统设置里关掉历史后，API 能调但永远返回空，
+#: 必须读这个值才能区分「没开历史」与「历史是空的」。
+HISTORY_REG_PATH = r"Software\Microsoft\Clipboard"
+HISTORY_REG_VALUE = "EnableClipboardHistory"
+
+
+def _on_windows() -> bool:
+    """当前是否运行在 Windows 上。
+
+    抽成函数而不是内联 `os.name == "nt"`，是为了让测试能替换它 ——
+    CI 跑在 Linux 上，内联判断会让整个历史读取分支永远探不到。
+    """
+    return os.name == "nt"
+
+
+class _WinRtUnavailable(RuntimeError):
+    """WinRT 投影不可用（非 Windows、缺 `winrt`/`winsdk` 包、系统过旧）。"""
+
+
+def _load_winrt() -> Any:
+    """惰性加载 WinRT 投影。
+
+    依次尝试两个已知的包名：官方 `winrt` 与社区打包的 `winsdk`。
+    都不在时抛 `_WinRtUnavailable`，由调用方降级 —— 历史读取是增强能力，
+    不是启动依赖。
+    """
+    errors = []
+    for module_name in ("winrt.windows.applicationmodel.datatransfer",
+                        "winsdk.windows.applicationmodel.datatransfer"):
+        try:
+            return __import__(module_name, fromlist=["Clipboard"])
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{module_name}: {exc!r}")
+    raise _WinRtUnavailable("；".join(errors) or "未找到 WinRT 投影")
+
+
+def history_enabled() -> Optional[bool]:
+    """系统「剪贴板历史」开关状态。
+
+    返回 `True` / `False` / `None`（读不到，例如非 Windows 或无权限）。
+    """
+    if not _on_windows():
+        return None
+    try:
+        import winreg  # type: ignore
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, HISTORY_REG_PATH) as key:
+            value, _ = winreg.QueryValueEx(key, HISTORY_REG_VALUE)
+        return bool(value)
+    except Exception:  # noqa: BLE001 - 键不存在 = 从未开启过
+        return None
+
+
+def _iter_history_items(raw: Any) -> Sequence[Any]:
+    """把 WinRT 的异步结果摊平成可迭代列表。"""
+    if raw is None:
+        return []
+    items = getattr(raw, "items", None)
+    if items is None:
+        return []
+    try:
+        return list(items)
+    except TypeError:
+        return []
+
+
+def _history_item_to_result(item: Any) -> Optional["CaptureResult"]:
+    """把一条 WinRT 历史项转成 `CaptureResult`。
+
+    只取文本：历史里的图片/文件需要额外的 `DataPackageView` 解包，
+    且系统历史本身只缓存缩略图，拿不到原图 —— 与其给出半份数据，
+    不如明确只支持文本。取不到文本的项返回 `None` 由调用方跳过。
+    """
+    from .base import CaptureResult
+
+    content = getattr(item, "content", None)
+    if content is None:
+        return None
+    try:
+        text = content.get_text_async().get_results()
+    except Exception:  # noqa: BLE001 - 单项失败不该拖垮整批
+        return None
+    if not text:
+        return None
+    return CaptureResult(kind="text", text=str(text))
 
 
 class WindowsBackend(ClipboardBackend):
@@ -102,9 +194,13 @@ class WindowsBackend(ClipboardBackend):
         """其它进程常短暂占用剪贴板，需要重试。"""
         if user32 is None:
             return False
-        for _ in range(retries):
+        for attempt in range(retries):
             if user32.OpenClipboard(None):
                 return True
+            # 最后一次失败后直接放弃，不再白等一个间隔 ——
+            # 那一觉没有任何东西会因此变好。
+            if attempt == retries - 1:
+                break
             # 用 kernel32 已加载的句柄，不再走 `ctypes.windll`——
             # 后者只在 Windows 上存在，一旦缺失就会把「重试」变成抛异常。
             if kernel32 is not None:
@@ -164,7 +260,13 @@ class WindowsBackend(ClipboardBackend):
             buffer = ctypes.create_unicode_buffer(size.value)
             if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
                 path = buffer.value
-                return path, os.path.basename(path)
+                # 必须用 ntpath 而不是 os.path：这里处理的一定是 Windows 路径。
+                # `os.path.basename` 的行为随宿主平台变 —— 在非 Windows 上跑
+                # （例如 CI 里的单元测试）它不认反斜杠，会把整条路径原样返回，
+                # 于是 app_id 变成 `C:\\Program Files\\App\\app.exe`。
+                # 而 app_id 要喂给密码管理器判定，这种「只在别的平台上出错」的
+                # 解析正是最该避免的。
+                return path, ntpath.basename(path)
             return "", ""
         finally:
             kernel32.CloseHandle(handle)
@@ -214,11 +316,58 @@ class WindowsBackend(ClipboardBackend):
             return False, "GetClipboardSequenceNumber 返回 0"
         return True, f"Win32 剪贴板可访问（序列号 {int(watched)}）"
 
+    # ---- 系统剪贴板历史 ----
+
     def is_history_supported(self) -> bool:
-        """Win10 1809+ 起系统自带历史，此处仅探测可用性。"""
-        if user32 is None:
+        """系统剪贴板历史是否**真的**可读。
+
+        此前这里只判断 `GetClipboardSequenceNumber` 这个符号存不存在。
+        那个函数是 Win2000 就有的基础 API，和「历史」没有半点关系 ——
+        于是能力矩阵里 `native_history` 恒为「是」，而 `read_windows()`
+        一直返回空列表。声明了能力却没有实现，比不声明更糟。
+
+        现在改成按真实链路探测：WinRT 投影能否导入 + 系统开关是否打开。
+        """
+        if not _on_windows():
             return False
         try:
-            return bool(user32.GetClipboardSequenceNumber)
-        except Exception:  # noqa: BLE001
+            _load_winrt()
+        except _WinRtUnavailable:
             return False
+        # 开关明确关闭时不算支持；读不到开关（None）时按可读处理，
+        # 由 read_windows() 自己按空结果收敛。
+        return history_enabled() is not False
+
+    def read_windows(self, limit: int = 30) -> List[CaptureResult]:
+        """读系统剪贴板历史，补齐本工具启动前复制的内容。
+
+        Windows 10 1809+ 才提供该接口。返回项按系统给出的顺序（新到旧），
+        只含**文本**条目 —— 系统历史对图片只存缩略图，转成我们的图片记录
+        会失真，不如不收。
+
+        任何一步失败都返回空列表，不抛异常：历史导入是增强能力，
+        不该让主流程启动不了。
+        """
+        from .base import CaptureResult
+
+        if not _on_windows() or limit <= 0:
+            return []
+        if history_enabled() is False:
+            # 系统设置里关掉了历史。此时 API 可调但必然为空，
+            # 直接返回，省掉一次无意义的跨进程调用。
+            return []
+        try:
+            winrt = _load_winrt()
+            clipboard = winrt.Clipboard
+            raw = clipboard.get_history_items_async().get_results()
+        except Exception:  # noqa: BLE001 - WinRT 缺失/系统过旧/权限被拒
+            return []
+
+        results: List[CaptureResult] = []
+        for item in _iter_history_items(raw):
+            if len(results) >= limit:
+                break
+            converted = _history_item_to_result(item)
+            if converted is not None:
+                results.append(converted)
+        return results

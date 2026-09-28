@@ -245,6 +245,7 @@ linglong-clipboard --merge-duplicates  # 重算 + 合并（含历史里的存量
 | 原生剪贴板读写 | ✅ Win32 | ✅ Xlib/xclip | ✅ wl-paste | ✅ pbpaste/pbcopy |
 | 来源应用识别 | ✅ Win32 | ✅ Xlib/xdotool | ⚠️ 受限 | ✅ osascript |
 | 主选择区（PRIMARY） | — | ✅ | ✅ wl-paste | — |
+| 系统剪贴板历史导入 | ✅ Win10 1809+ 文本 | — | — | — |
 | 安全粘贴标记 | ✅ 系统级 | — | — | ⚠️ 定时清空（有条件） |
 | 全局快捷键 | ✅ RegisterHotKey | ✅ XGrabKey | ⚠️ 需桌面环境绑定 | ✅ Quartz 事件 tap |
 
@@ -253,11 +254,50 @@ linglong-clipboard --merge-duplicates  # 重算 + 合并（含历史里的存量
 
 - **Windows**：走 `AddClipboardFormatListener` 事件驱动，避免轮询空转；
   写入时附加 `ExcludeClipboardContentFromMonitorProcessing`，
-  让敏感内容不进系统剪贴板历史
+  让敏感内容不进系统剪贴板历史；可把系统剪贴板历史读回来，
+  补齐本工具启动前的记录（见下）
 - **macOS**：全局快捷键用 Quartz 事件 tap，需要辅助功能权限，
   未授权时降级并给出可执行的授权路径
 - **Linux/Wayland**：协议不允许抓全局按键，需在桌面环境自行绑定
   `linglong-clipboard --quick`
+
+#### 系统剪贴板历史导入（Windows）
+
+本工具只看得到**自己启动之后**复制的内容。装好之前、或者被退出期间复制的东西，
+历史里就是缺的 —— 这不是 bug，是「进程只能监听运行时事件」的必然结果。
+
+Windows 10 1809+ 的系统剪贴板历史正好覆盖这段空缺：
+
+```bash
+linglong-clipboard --import-native-history
+```
+
+```
+共扫描 42 条，新导入 38 条，已存在 2 条，隐私拦截 2 条
+（被隐私策略拦下的内容已丢弃，示例预览：-----BEGIN RSA PRIVATE KEY-----、password=S）
+```
+
+三条设计约束：
+
+- **走同一条管线**。导入的每一条都经过 `Collector.process()`，
+  与实时采集完全一致：隐私判定、去重、类型识别、OCR 一个都不跳过。
+  系统历史因此不是「绕过风控的后门」—— 从里面捞回的私钥会和实时复制的私钥
+  一样被丢弃（有专门用例守着这条）。
+- **只取文本**。系统历史对图片只缓存缩略图，拿不到原图。
+  与其给出半份失真的数据，不如明确只支持文本。
+- **默认关闭且需显式触发**。不会在你不知情时把系统里攒了很久的内容灌进历史库。
+
+前置条件与降级：
+
+| 条件 | 不满足时 |
+| --- | --- |
+| Windows 10 1809 及以上 | 提示「需要 Win10 1809+ 并打开系统历史」 |
+| 「设置 → 系统 → 剪贴板」里打开历史 | 直接跳过，不做无意义的跨进程调用 |
+| 安装 WinRT 投影（`winrt` 或 `winsdk`） | 提示缺少投影，其余功能不受影响 |
+
+判定靠读注册表 `HKCU\Software\Microsoft\Clipboard\EnableClipboardHistory` ——
+单看 API 能否调用是分不清「没开历史」和「历史是空的」的。
+设置页「采集 → 系统剪贴板历史」里也能一键导入，并显示被拦下的条数。
 
 **别猜，直接问文档没用 —— 让程序自己说。** 换机器或报障时先跑：
 
@@ -425,6 +465,7 @@ linglong-clipboard --storage-status          # 历史存在哪（SQLite 还是 J
 linglong-clipboard --where                   # 只输出数据目录路径
 linglong-clipboard --storage json            # 切换存储方式
 linglong-clipboard --storage-migrate         # 把记录搬到另一种存储（原数据保留）
+linglong-clipboard --import-native-history   # 导入系统剪贴板历史（Windows 10 1809+）
 linglong-clipboard --sync-status             # 同步模式、对端与游标进度
 linglong-clipboard --sync-cursor             # 各来源同步到哪个时间点
 linglong-clipboard --sync-cursor-reset       # 清空游标，下次全量重扫
@@ -566,6 +607,24 @@ QT_QPA_PLATFORM=offscreen pytest tests/test_ui.py   # 无头环境跑界面测�
 局域网同步的测试**用真实 socket 在 `127.0.0.1` 上起服务**（端口用 0 让系统分配，
 避免互相抢端口），验证的是端到端链路而不是对 mock 的断言。
 
+平台层同样用**仿真原生层**，而不是「断言假对象被调用过」：
+Linux 侧塞一个假 `Xlib` 模块，走完 `_read_x11_selection` 与 `_focus_via_xlib`
+的真实解析逻辑；Windows 侧用假 `user32` / `kernel32` 把
+`current_focus` → `GetForegroundWindow` → `pid` → `QueryFullProcessImageNameW`
+整条链路跑一遍，并检查进程句柄有没有漏关。
+
+这两块此前覆盖率只有 35% / 46%，因为 CI 容器里装不上 Xlib、也跑不了 Win32。
+补上之后 `linux.py` 99%、`windows.py` 98% —— 补的过程中**用例抓出三个真 bug**：
+
+| 问题 | 影响 |
+| --- | --- |
+| `_process_info()` 用 `os.path.basename()` 解析 Windows 路径 | 非 Windows 宿主上不认反斜杠，`app_id` 变成整条路径（改用 `ntpath`） |
+| `_window_property()` 把 `WM_CLASS` 的 `\0` 换成空格，调用方却还按 `\0` 切分 | `app_id` 变成「实例名 类名」整串，而它要喂给密码管理器判定 |
+| `is_available()` 用 `self._xlib is not None` 判断 | `False`（试过但失败）也被算成可用，Wayland 下会谎报可用 |
+
+三个都是「在 Linux 上看着对、到目标平台上就变样」的类型 —— 正是覆盖率补之前
+没人跑过的那几行。
+
 ### 打包
 
 ```bash
@@ -594,7 +653,8 @@ src/linglong_clip/
 │   ├── ocr.py               #   截图文字识别（tesseract 后端 + 降级）
 │   ├── sync.py              #   共享文件夹同步与加密
 │   ├── lan_sync.py          #   局域网直连同步（拉取模型 + 鉴权）
-│   └── sync_cursor.py       #   同步增量游标（每来源只拉新记录）
+│   ├── sync_cursor.py       #   同步增量游标（每来源只拉新记录）
+│   └── native_history.py    #   系统剪贴板历史导入（走同一条采集管线）
 ├── platform/                # 平台差异收敛在这里
 │   ├── base.py              #   后端接口与能力矩阵
 │   ├── windows.py           #   Win32 ctypes（零第三方依赖）

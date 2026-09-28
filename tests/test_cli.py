@@ -572,3 +572,132 @@ def test_selfcheck_skips_gui_dispatch(cli_env, monkeypatch):
 
     monkeypatch.setattr(sc_module, "run_self_check", lambda **kw: _fake_report())
     assert main(["--selfcheck"]) == 0
+
+
+# ------------------------------------------- 系统剪贴板历史导入（CLI）
+
+
+def test_import_native_history_registered_in_dispatch(cli_env, monkeypatch, capsys):
+    """新标志必须登记进 `main()` 的分发表。
+
+    回归用例：`--merge-duplicates` 当初漏了这一步，于是标志静默落到
+    GUI 分支 —— 不报错，直接挂住，靠测试超时才发现。
+    """
+    from linglong_clip.ui import application as app_module
+
+    def boom(*args, **kwargs):
+        raise AssertionError("不该启动 GUI")
+
+    monkeypatch.setattr(app_module, "Application", boom)
+    assert main(["--import-native-history"]) == 0
+
+
+def test_import_native_history_unsupported_message(cli_env, capsys, monkeypatch):
+    """平台不支持时给一句可读解释，退出码仍是 0（不影响其它功能）。"""
+    import linglong_clip.platform as platform_module
+
+    class _Unsupported:
+        name = "linux"
+
+        def is_history_supported(self):
+            return False
+
+        def read_windows(self, limit=30):
+            raise AssertionError("能力探测已判定不支持，不该再去读")
+
+    monkeypatch.setattr(platform_module, "detect_backend", lambda: _Unsupported())
+
+    assert main(["--import-native-history"]) == 0
+    out = capsys.readouterr().out
+    assert "不支持" in out or "不提供" in out
+
+
+def test_import_native_history_json_shape(cli_env, capsys, monkeypatch):
+    import linglong_clip.platform as platform_module
+
+    class _Unsupported:
+        name = "linux"
+
+        def is_history_supported(self):
+            return False
+
+        def read_windows(self, limit=30):
+            raise AssertionError("能力探测已判定不支持，不该再去读")
+
+    monkeypatch.setattr(platform_module, "detect_backend", lambda: _Unsupported())
+
+    assert main(["--import-native-history", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["supported"] is False
+    assert payload["backend"] == "linux"
+    assert set(payload) >= {
+        "backend",
+        "supported",
+        "scanned",
+        "captured",
+        "merged",
+        "skipped_privacy",
+        "skipped_other",
+        "reason",
+    }
+
+
+def test_import_native_history_imports_and_reports(cli_env, capsys, monkeypatch):
+    from linglong_clip.platform.base import CaptureResult
+
+    class _Backend:
+        name = "windows"
+
+        def is_history_supported(self):
+            return True
+
+        def read_windows(self, limit=30):
+            return [
+                CaptureResult(kind="text", text="系统历史里的内容"),
+                CaptureResult(
+                    kind="text",
+                    text="-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----",
+                ),
+            ]
+
+    import linglong_clip.platform as platform_module
+
+    monkeypatch.setattr(platform_module, "detect_backend", lambda: _Backend())
+
+    assert main(["--import-native-history"]) == 0
+    out = capsys.readouterr().out
+    assert "导入 1" in out
+    assert "隐私拦截 1" in out
+
+
+def test_import_native_history_blocked_content_not_stored(
+    cli_env, capsys, monkeypatch
+):
+    """被拦下的敏感内容绝不能进库 —— 这是本功能最关键的一条。"""
+    from linglong_clip.core.normalize import canonical_content
+    from linglong_clip.core.models import content_hash
+    from linglong_clip.platform.base import CaptureResult
+
+    pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----"
+
+    class _Backend:
+        name = "windows"
+
+        def is_history_supported(self):
+            return True
+
+        def read_windows(self, limit=30):
+            return [CaptureResult(kind="text", text=pem)]
+
+    import linglong_clip.platform as platform_module
+
+    monkeypatch.setattr(platform_module, "detect_backend", lambda: _Backend())
+
+    assert main(["--import-native-history"]) == 0
+    capsys.readouterr()
+
+    assert main(["--list", "--json"]) == 0
+    items = json.loads(capsys.readouterr().out)
+    contents = [item.get("content", "") for item in items]
+    assert pem not in contents
+    assert content_hash("text", canonical_content("text", pem)) != ""
