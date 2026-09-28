@@ -39,7 +39,13 @@ from ..utils.logger import get_logger
 from .models import ClipboardItem
 from .privacy import PrivacyGuard
 from .storage import Storage
-from .sync import MAX_SYNC_ENTRIES, FolderSync, SyncCipher, SyncRecord
+from .sync import (
+    MAX_SYNC_ENTRIES,
+    FolderSync,
+    SyncCipher,
+    SyncRecord,
+    apply_flags,
+)
 from .sync_cursor import SyncCursorStore
 from .tombstones import Tombstone, TombstoneStore, contains_hash
 
@@ -264,6 +270,8 @@ class LanSyncServer:
                 source_app=item.source_app,
                 device=self.device_name,
                 tags=list(item.tags),
+                pinned=item.pinned,
+                favorite=item.favorite,
                 created_at=item.created_at,
             )
             for item in items
@@ -372,6 +380,8 @@ class LanImportOutcome:
     imported: int = 0
     removed: int = 0
     tombstones: int = 0
+    #: 因对端带来了本地没有的标记（固定/收藏）而被更新的条数
+    flags_updated: int = 0
 
 
 class LanSyncClient:
@@ -503,6 +513,11 @@ class LanSyncClient:
             if record.is_tombstone:
                 continue
             if contains_hash(seen, record.hash):
+                # 内容本地已有 —— 但**标记可能还没有**。此前这里直接跳过，
+                # 于是对端后加的固定/收藏永远传不过来。与共享文件夹模式
+                # 共用同一份 apply_flags，两条路径不能各写一套规则。
+                if apply_flags(self._storage, record, seen):
+                    outcome.flags_updated += 1
                 continue
             if record.device == self.device_name:
                 continue
@@ -513,6 +528,7 @@ class LanSyncClient:
                     continue
             self._storage.add(item)
             seen.add(record.hash)
+            apply_flags(self._storage, record, seen)
             outcome.imported += 1
         return outcome
 
@@ -547,7 +563,13 @@ class LanSyncClient:
         return SyncCursorStore.key_for("lan", f"{peer.host}:{peer.port}")
 
     def sync_peer(self, peer: PeerInfo, *, since: Optional[float] = None) -> int:
-        """拉取并导入单个对端，返回导入条数（失败时 0）。
+        """拉取并导入单个对端，返回导入条数（失败时 0）。"""
+        return self.sync_peer_detailed(peer, since=since).imported
+
+    def sync_peer_detailed(
+        self, peer: PeerInfo, *, since: Optional[float] = None
+    ) -> "LanImportOutcome":
+        """同 `sync_peer`，但返回明细（含只更新标记的条数）。
 
         `since` 显式传入时按传入值拉取（并同步推进游标），为 `None` 时
         取自持久化游标——这是「每轮只拉新记录」的关键。
@@ -557,15 +579,15 @@ class LanSyncClient:
         records = self.fetch(peer, since=requested)
         if records is None:
             # 对端不可达或鉴权失败：不推进游标，下轮重试这一段
-            return 0
+            return LanImportOutcome()
         if not records:
-            return 0
+            return LanImportOutcome()
         outcome = self.import_records(records)
         # 只有成功拿到响应才推进；游标取本批记录的最大时间戳
         newest = max((float(getattr(r, "created_at", 0.0) or 0.0) for r in records), default=0.0)
         if newest > 0:
             self.cursors.advance(key, newest)
-        return outcome.imported
+        return outcome
 
 
 class DiscoveryService:
@@ -794,14 +816,29 @@ class LanSync:
         `since` 为 `None`（默认）时逐对端使用各自的持久化游标，
         即每轮只拉取上次同步之后的新记录；显式传入则对所有对端生效。
         """
+        return self.sync_all_detailed(since=since).imported
+
+    def sync_all_detailed(self, *, since: Optional[float] = None) -> "LanImportOutcome":
+        """同 `sync_all`，但返回明细。
+
+        保留 `sync_all` 的整数返回是刻意的：它是既有公开形状，改签名会
+        影响所有调用方与用例。新加的「标记更新数」不该让老调用点被迫改写，
+        但 CLI 需要看到它 —— 否则「同步了 0 条」既可能是「没什么可同步」，
+        也可能是「只更新了标记」，两者对用户意味着完全不同的事。
+        """
         assert self._client is not None
-        imported = 0
+        total = LanImportOutcome()
         for peer in self.discover():
             try:
-                imported += self._client.sync_peer(peer, since=since)
+                outcome = self._client.sync_peer_detailed(peer, since=since)
             except Exception as exc:  # noqa: BLE001 - 单个对端异常不影响其它对端
                 _log.debug("同步对端 %s 出错：%s", peer.host, exc)
-        return imported
+                continue
+            total.imported += outcome.imported
+            total.removed += outcome.removed
+            total.tombstones += outcome.tombstones
+            total.flags_updated += outcome.flags_updated
+        return total
 
     def probe(self, peer: PeerInfo) -> bool:
         """探测某对端是否在线（用 `/ping`，不需要口令）。"""

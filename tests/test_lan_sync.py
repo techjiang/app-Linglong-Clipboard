@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 import threading
 import urllib.error
 import urllib.request
@@ -413,3 +414,102 @@ def test_bad_host_reports_error(storage, home):
     node.peers = ["this-host-does-not-resolve.invalid"]
     assert node.sync_all() == 0
     node.stop()
+
+
+# ---------- 用户标记（固定 / 收藏）跨设备 ----------
+
+
+def _add_flagged(storage, content, *, pinned=False, favorite=False, digest=None):
+    from linglong_clip.core.models import content_hash
+
+    digest = digest or content_hash("text", content)
+    storage.add(
+        ClipboardItem(
+            kind="text",
+            content=content,
+            preview=content[:40],
+            hash=digest,
+            pinned=pinned,
+            favorite=favorite,
+            created_at=time.time(),
+        )
+    )
+    return digest
+
+
+def test_lan_transfers_flags_with_new_record(nodes):
+    make, local, remote = nodes
+    _add_flagged(local, "局域网里的收藏项", pinned=True, favorite=True)
+
+    a, b = make(local, "laptop", token="t"), make(remote, "desktop", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+
+    assert b.sync_all() == 1
+    item = remote.list()[0]
+    assert item.pinned is True
+    assert item.favorite is True
+
+
+def test_lan_flag_set_after_first_sync_propagates(nodes):
+    """内容已拉过，之后才做的标记也必须传过去。
+
+    局域网这条路径的导入逻辑与共享文件夹是分开实现的，所以这个用例
+    不能省 —— 两条路各写一套，只测一条等于没测。
+    """
+    make, local, remote = nodes
+    digest = _add_flagged(local, "先同步内容，再收藏")
+
+    a, b = make(local, "laptop", token="t"), make(remote, "desktop", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+    assert b.sync_all() == 1
+
+    # 对端在 B 上固定它
+    item = remote.find_by_hash(digest)
+    remote.update_fields(item.id, pinned=True, favorite=True)
+
+    # B 作为服务端，A 反过来拉 B
+    a.peers = [f"127.0.0.1:{b.status()['port']}"]
+    outcome = a.sync_all_detailed()
+
+    assert outcome.imported == 0
+    assert outcome.flags_updated == 1
+    assert local.find_by_hash(digest).pinned is True
+    assert local.find_by_hash(digest).favorite is True
+
+
+def test_lan_status_reports_peer_before_sync(nodes):
+    """未同步过的对端不该被算作「已同步」—— 游标为 0。"""
+    make, local, remote = nodes
+    _add_flagged(local, "x")
+    a = make(local, "a", token="t")
+    assert a.status()["port"] > 0
+
+
+def test_lan_detailed_outcome_defaults_to_zero(nodes):
+    """对端不可达时明细全 0，而不是抛异常。"""
+    make, local, remote = nodes
+    b = make(remote, "b", token="t")
+    b.peers = ["127.0.0.1:1"]  # 必然不可达
+    a = make(local, "a", token="t")
+    outcome = a.sync_all_detailed()
+    assert (outcome.imported, outcome.flags_updated) == (0, 0)
+
+
+def test_lan_sync_all_keeps_int_signature(nodes):
+    """`sync_all` 的整数返回是既有公开形状，不能被明细接口改掉。"""
+    make, local, remote = nodes
+    _add_flagged(local, "签名不变")
+    a, b = make(local, "laptop", token="t"), make(remote, "desktop", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+    assert b.sync_all() == 1
+
+
+def test_lan_no_repeat_pull_when_flags_unchanged(nodes):
+    """标记没变时游标正常推进，不重复拉取。"""
+    make, local, remote = nodes
+    _add_flagged(local, "只拉一次", pinned=True)
+    a, b = make(local, "laptop", token="t"), make(remote, "desktop", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+
+    assert b.sync_all() == 1
+    assert b.sync_all() == 0

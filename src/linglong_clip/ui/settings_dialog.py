@@ -453,10 +453,65 @@ class SettingsDialog(QDialog):
                 info_form.addRow("游标文件", label)
             layout.addWidget(info)
 
+        layout.addWidget(self._build_flag_group())
+
         layout.addWidget(self._build_tombstone_group())
 
         layout.addStretch(1)
         return page
+
+    def _count_pinned(self) -> int:
+        """统计本机固定项条数，失败时返回 0。
+
+        这个面板只是说明性质，不该因为它而在「历史文件损坏」时把设置页
+        也一起弄崩 —— 那时用户恰恰最需要进设置。所以任何异常都退化为 0。
+        """
+        try:
+            from ..core.repository import open_repository
+
+            storage = open_repository(self._config)
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("打开存储以统计固定项失败：%s", exc)
+            return 0
+        try:
+            return sum(1 for item in storage.list(pinned_only=True, limit=100_000))
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("统计固定项失败：%s", exc)
+            return 0
+        finally:
+            try:
+                storage.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _build_flag_group(self) -> QGroupBox:
+        """用户标记面板。
+
+        为什么需要它：固定/收藏跨设备是**取并集**的，不在这里说清楚，
+        用户会遇到「我在笔记本上取消了固定，怎么同步一轮又回来了」，
+        并且完全无从判断这是设计还是缺陷。这类「用户无法从界面推断出
+        的行为」必须写在界面上，而不是只留在 README 里。
+        """
+        group = QGroupBox("固定与收藏的同步")
+        form = QFormLayout(group)
+
+        pinned = self._count_pinned()
+        form.addRow(
+            "本机固定项",
+            QLabel(f"{pinned} 条" if pinned else "暂无固定项"),
+        )
+
+        # QLabel 不吃 Markdown，这里不要写 **强调** 之类的标记 ——
+        # 上一版写了，界面上直接显示成字面的星号，截图里一眼能看出来。
+        hint = QLabel(
+            "在一台设备上固定或收藏某条记录，其它设备下次同步也会带上这个标记。\n"
+            "标记取并集：一台设过就一直保留，因此在另一台取消后，\n"
+            "再同步一轮会重新出现 —— 因为无法区分「那边取消过」和「那边从没设过」。\n"
+            "想彻底取消，请在每台设备上分别取消。"
+        )
+        hint.setWordWrap(True)
+        form.addRow("", hint)
+        return group
 
     def _build_tombstone_group(self) -> QGroupBox:
         """删除标记面板：让「我在这台删了，那台却还在」有地方可查。"""

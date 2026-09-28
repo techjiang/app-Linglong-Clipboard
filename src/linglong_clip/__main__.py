@@ -158,6 +158,25 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def format_import_summary(outcome, *, source: str = "") -> str:
+    """把一次同步导入的结果写成一句话。
+
+    刻意把「只更新了标记」单独说出来：此前两种情况的输出是一模一样的
+    「导入 0 条」，用户无从判断到底是「没有新东西」还是「对端带来的
+    固定/收藏已经合并进来了」。这两件事对用户意味着完全不同的结果。
+
+    `source` 用来说明记录从哪来（「局域网对端」/「同步目录」）—— 这句话
+    出现在用户排查「同步怎么没生效」时最先看到的地方，省掉猜测。
+    """
+    where = source or "同步对端"
+    parts = [f"已从{where}导入 {outcome.imported} 条记录"]
+    if outcome.flags_updated:
+        parts.append(f"另有 {outcome.flags_updated} 条只更新了固定/收藏标记")
+    if outcome.removed:
+        parts.append(f"按对端删除标记清掉 {outcome.removed} 条")
+    return "，".join(parts)
+
+
 def _load_storage(config=None):
     """按配置打开历史仓库（SQLite 或 JSON 单文件）。"""
     from .core.repository import open_repository
@@ -646,7 +665,8 @@ def _run_cli(args: argparse.Namespace) -> int:
                 storage.close()
                 return 1
             try:
-                print(f"已从局域网对端导入 {node.sync_all()} 条记录")
+                outcome = node.sync_all_detailed()
+                print(format_import_summary(outcome, source="局域网对端"))
             finally:
                 node.stop()
             storage.close()
@@ -669,7 +689,7 @@ def _run_cli(args: argparse.Namespace) -> int:
         if args.export_sync:
             print(f"已导出 {sync.export(limit=args.limit)} 条记录")
         else:
-            print(f"已导入 {sync.import_all()} 条记录")
+            print(format_import_summary(sync.import_all_detailed(), source="同步目录"))
         storage.close()
         return 0
 

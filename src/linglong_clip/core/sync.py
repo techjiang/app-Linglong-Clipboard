@@ -44,6 +44,10 @@ class SyncRecord:
     source_app: str = ""
     device: str = ""
     tags: List[str] = field(default_factory=list)
+    #: 用户显式标记的「别动它 / 常看它」。此前只传内容与 tags，
+    #: 这两个标记跨设备就丢了 —— 详见 ``FlagSnapshot`` 的说明。
+    pinned: bool = False
+    favorite: bool = False
     created_at: float = field(default_factory=time.time)
     #: 图片等二进制内容不进同步（体积大且隐私风险高）
     payload_b64: str = ""
@@ -68,6 +72,11 @@ class SyncRecord:
             "created_at": self.created_at,
             "payload_b64": self.payload_b64,
         }
+        # 只有为真时才写：老版本读到缺字段即视为 False，向后兼容
+        if self.pinned:
+            payload["pinned"] = True
+        if self.favorite:
+            payload["favorite"] = True
         if self.deleted_at > 0:
             payload["deleted_at"] = self.deleted_at
         return payload
@@ -84,6 +93,8 @@ class SyncRecord:
             source_app=str(data.get("source_app", "")),
             device=str(data.get("device", "")),
             tags=list(data.get("tags") or []),
+            pinned=bool(data.get("pinned", False)),
+            favorite=bool(data.get("favorite", False)),
             created_at=float(data.get("created_at") or time.time()),
             payload_b64=str(data.get("payload_b64", "")),
             deleted_at=float(data.get("deleted_at") or 0.0),
@@ -97,10 +108,53 @@ class SyncRecord:
             source_app=self.source_app,
             device=self.device,
             tags=list(self.tags),
+            pinned=self.pinned,
+            favorite=self.favorite,
             hash=self.hash,
             created_at=self.created_at,
             metadata={"synced": True},
         )
+
+    def flags(self) -> "FlagSnapshot":
+        """本条记录携带的用户标记。"""
+        return FlagSnapshot(pinned=self.pinned, favorite=self.favorite)
+
+
+@dataclass
+class FlagSnapshot:
+    """一条记录上的用户标记（固定 / 收藏）。
+
+    为什么要单独成类型：这两个标记是**用户显式动作**的结果，
+    与内容本身同等重要 —— 内容丢了可以重新复制，标记丢了用户不知道，
+    只会发现「我明明收藏过，怎么另一台机器上没了」。
+
+    为什么同步此前会丢掉它们：导出侧只挑了内容相关字段
+    （``content`` / ``preview`` / ``tags``），标记不在其中；而导入侧
+    又按指纹跳过「已见过」的记录，于是**标记的后续变化永远传不出去**。
+    结果就是跨设备单向、且只对首次同步生效。
+    """
+
+    pinned: bool = False
+    favorite: bool = False
+
+    def any(self) -> bool:
+        return self.pinned or self.favorite
+
+    def merge(self, other: "FlagSnapshot") -> "FlagSnapshot":
+        """合并两份标记，取并集。
+
+        取并集而不是取「最后写入者」：这两个标记都是**加法式**的用户意图
+        （「我要它留着」/「我要常看它」），没有对应的主动取消动作能可靠跨设备表达 ——
+        因为无法区分「对端取消过」和「对端从未设过」。取并集是唯一不会
+        把用户的显式标记悄悄弄丢的选择。想真正取消，需要的是单独的
+        取消传播通道（与墓碑同性质），不是在这里猜。
+        """
+        return FlagSnapshot(
+            pinned=self.pinned or other.pinned,
+            favorite=self.favorite or other.favorite,
+        )
+
+
 
 
 @dataclass
@@ -110,6 +164,8 @@ class ImportOutcome:
     imported: int = 0
     removed: int = 0
     tombstones: int = 0
+    #: 因对端带来了本地没有的标记而被更新的条数
+    flags_updated: int = 0
 
 
 class SyncCipher:
@@ -201,14 +257,26 @@ class FolderSync:
             return 0
 
         already = self._local_hashes()
+        sent_flags = self._local_flag_state()
         records: List[SyncRecord] = []
         for item in self._storage.list(limit=limit):
-            if not item.hash or contains_hash(already, item.hash):
-                continue
             if item.sensitive and not self._allow_sensitive():
                 continue
             if item.kind == "image" and not include_images:
                 continue
+            if not item.hash:
+                continue
+
+            flags = FlagSnapshot(pinned=item.pinned, favorite=item.favorite)
+            if contains_hash(already, item.hash):
+                # 内容已经发过了。此前这里直接跳过，于是**标记的后续变化永远传不出去** ——
+                # 用户在设备 B 上收藏了某条，A 端永远不知道。
+                # 只有「本地标记比上次发出去的多」时才补发一条，避免每轮重传全部历史。
+                previous = sent_flags.get(item.hash, FlagSnapshot())
+                if flags.merge(previous) == previous:
+                    # 对端已知的标记已经覆盖了本地这些，没有新东西要传
+                    continue
+                _log.debug("补发标记变化：%s", item.hash)
             records.append(
                 SyncRecord(
                     hash=item.hash,
@@ -218,6 +286,8 @@ class FolderSync:
                     source_app=item.source_app,
                     device=self.device_name,
                     tags=list(item.tags),
+                    pinned=item.pinned,
+                    favorite=item.favorite,
                     created_at=item.created_at,
                 )
             )
@@ -269,6 +339,20 @@ class FolderSync:
             hashes.add(record.hash)
         return hashes
 
+    def _local_flag_state(self) -> Dict[str, FlagSnapshot]:
+        """日志里每个指纹**已经发出去过**的标记。
+
+        用于判断「本地标记是不是比对端已知的更多了」。同一指纹可能有多条
+        记录（后续补发的标记变化），取并集 —— 只要发出去过，就不必重发。
+        """
+        state: Dict[str, FlagSnapshot] = {}
+        for record in self._read_journal(self.journal_path):
+            if record.is_tombstone:
+                continue
+            current = state.get(record.hash, FlagSnapshot())
+            state[record.hash] = current.merge(record.flags())
+        return state
+
     def _allow_sensitive(self) -> bool:
         return False
 
@@ -279,28 +363,39 @@ class FolderSync:
         return SyncCursorStore.key_for("folder", path.name)
 
     def import_all(self) -> int:
-        """读取所有设备的日志，把本地没有的记录补进来。
+        """读取所有设备的日志，把本地没有的记录补进来。"""
+        return self.import_all_detailed().imported
+
+    def import_all_detailed(self) -> "ImportOutcome":
+        """同 `import_all`，但返回明细（含只更新标记的条数）。
 
         每份对端日志各自维护增量游标：只解析晚于游标的记录。
         游标未推进到位（例如首次同步）时退化为全量扫描，行为与旧版一致。
+
+        保留 `import_all` 的整数返回是刻意的：它是既有公开形状，
+        改签名会波及所有调用方与用例；而 CLI 需要看到「标记更新数」——
+        否则「导入 0 条」既可能是「没什么可同步」，也可能是「只更新了标记」。
         """
+        total = ImportOutcome()
         if not self.is_ready():
-            return 0
-        imported = 0
+            return total
         seen_local = {item.hash for item in self._storage.list(limit=MAX_SYNC_ENTRIES)}
         acked = False
         for path in sorted(self.folder.glob("*.llsync")):
             # 自己的日志也读，用于补齐「另一台机器先导入过」的场景
             outcome = self._import_journal(path, seen_local)
-            imported += outcome.imported
+            total.imported += outcome.imported
+            total.removed += outcome.removed
+            total.tombstones += outcome.tombstones
+            total.flags_updated += outcome.flags_updated
             acked = acked or bool(outcome.tombstones)
         if acked:
             # 对端确实接收过删除标记：把本机待发的那些标为已送达，之后不再复述。
             # 放在循环外统一做一次，避免每读一份日志就重写一遍墓碑文件。
             self._ack_sent_tombstones()
-        if imported:
-            _log.info("从同步目录导入 %d 条记录", imported)
-        return imported
+        if total.imported:
+            _log.info("从同步目录导入 %d 条记录", total.imported)
+        return total
 
     def _ack_sent_tombstones(self) -> int:
         """把「已经写进自己日志的」待发墓碑标为已送达。
@@ -354,6 +449,11 @@ class FolderSync:
                 # 同一批里它已被删除，别再写回来
                 continue
             if contains_hash(seen_local, record.hash):
+                # 内容本地已经有了。此前这里直接跳过，于是**对端后加的固定/收藏
+                # 永远传不过来**（导出侧虽补发了标记变化，导入侧却不看）。
+                # 标记是用户的显式动作，内容重复不代表这个动作可以丢。
+                if apply_flags(self._storage, record, seen_local):
+                    outcome.flags_updated += 1
                 continue
             if record.device == self.device_name:
                 continue
@@ -364,6 +464,7 @@ class FolderSync:
                     continue
             self._storage.add(item)
             seen_local.add(record.hash)
+            apply_flags(self._storage, record, seen_local)
             outcome.imported += 1
         # 只有在完整读完后才推进游标：解析中途出错不该跳过剩余记录
         if newest > since:
@@ -484,3 +585,40 @@ class FolderSync:
             "device": self.device_name,
             "cursor_file": str(self.cursors.path),
         }
+
+
+def apply_flags(
+    storage: Storage,
+    record: SyncRecord,
+    seen_local: Optional[set] = None,
+) -> bool:
+    """把对端记录上的用户标记合并到本地同指纹的记录上。
+
+    两条同步模式共用一个实现：``FolderSync._import_journal`` 与
+    ``LanSyncClient.import_records`` 若各写一套，迟早分叉
+    （此前的墓碑处理就踩过这个坑，所以那次专门抽了同一个规则）。
+
+    合并方向是**取并集**（见 ``FlagSnapshot.merge``）：固定与收藏都是
+    加法式的用户意图，取并集是唯一不会把用户的显式标记悄悄弄丢的选择。
+
+    返回是否真的改动了本地数据 —— 调用方用它统计「有多少条只更新了标记」，
+    这个数字要能被看到，否则又是「数据变了但没人知道」。
+    """
+    if record.is_tombstone or not record.flags().any():
+        return False
+    existing = storage.find_by_hash(record.hash)
+    if existing is None:
+        return False
+    merged = FlagSnapshot(pinned=existing.pinned, favorite=existing.favorite).merge(
+        record.flags()
+    )
+    if merged.pinned == existing.pinned and merged.favorite == existing.favorite:
+        return False
+    storage.update_fields(
+        existing.id,
+        pinned=merged.pinned,
+        favorite=merged.favorite,
+    )
+    if seen_local is not None:
+        seen_local.add(record.hash)
+    return True

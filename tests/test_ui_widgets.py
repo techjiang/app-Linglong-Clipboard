@@ -1117,3 +1117,58 @@ def test_settings_omits_peer_row_when_absent(qt_app, home):
     dialog = SettingsDialog(config, None, {"folder": "/tmp/x", "devices": []})
     texts = [child.text() for child in dialog.findChildren(QLabel) if child.text()]
     assert not any("台在线" in text for text in texts)
+
+
+def test_settings_has_flag_sync_panel(qt_app, home):
+    """设置页要说清「固定/收藏取并集」——否则用户无法从界面推断这个行为。"""
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    from PySide6.QtWidgets import QLabel
+
+    dialog = SettingsDialog(Config(home / "config.json"))
+    group = dialog._build_flag_group()
+    assert group.title() == "固定与收藏的同步"
+    joined = "\n".join(label.text() for label in group.findChildren(QLabel))
+    # 说明必须写在界面上，而不是只留在 README 里
+    assert "并集" in joined
+    assert "取消" in joined
+    # QLabel 不渲染 Markdown，混进 ** 会直接显示成星号
+    assert "**" not in joined
+
+
+def test_settings_flag_panel_counts_pinned(qt_app, home):
+    """面板要能读出本机固定项条数，而不是永远显示「暂无」。"""
+    from linglong_clip.core.models import ClipboardItem, content_hash
+    from linglong_clip.core.repository import open_repository
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    storage = open_repository(config)
+    storage.add(
+        ClipboardItem(
+            kind="text", content="固定项", preview="固定项",
+            hash=content_hash("text", "固定项"), pinned=True,
+        )
+    )
+    storage.close()
+
+    dialog = SettingsDialog(config)
+    assert dialog._count_pinned() == 1
+
+
+def test_settings_flag_panel_survives_broken_store(qt_app, home):
+    """历史文件损坏时设置页仍要能打开 —— 那时用户最需要它。"""
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+    from linglong_clip.utils.paths import json_path
+
+    config = Config(home / "config.json")
+    config.update({"storage.backend": "json"}, persist=True)
+    json_path().parent.mkdir(parents=True, exist_ok=True)
+    json_path().write_text("{ 这不是 JSON", encoding="utf-8")
+
+    dialog = SettingsDialog(config)
+    # 不抛异常即可，读数退化为 0
+    assert dialog._count_pinned() == 0

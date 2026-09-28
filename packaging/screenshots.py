@@ -118,6 +118,21 @@ def main() -> int:
     dialog.resize(760, 640)
     _render(dialog, OUT / "settings-ocr.png")
 
+    # 设置页「同步」页：固定/收藏的同步规则写在这里
+    sync_dialog = SettingsDialog(
+        _config({"sync.enabled": True, "sync.folder": "/tmp/sync"}),
+        automation,
+        device_status={"folder": "/tmp/sync", "devices": ["laptop", "desktop"]},
+    )
+    sync_dialog.resize(760, 780)
+    sync_tabs = sync_dialog.findChild(QTabWidget)
+    if sync_tabs is not None:
+        for index in range(sync_tabs.count()):
+            if "同步" in sync_tabs.tabText(index):
+                sync_tabs.setCurrentIndex(index)
+                break
+    _render(sync_dialog, OUT / "settings-sync-flags.png")
+
     # 设置页「界面」页：列表密度、关闭行为这些开关都在这里
     ui_dialog = SettingsDialog(_config({}), automation)
     ui_dialog.resize(760, 640)
