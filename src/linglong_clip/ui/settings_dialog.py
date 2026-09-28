@@ -193,23 +193,54 @@ class SettingsDialog(QDialog):
         form.addRow("状态", self._ocr_status)
         self._refresh_ocr_status()
         self._ocr_enabled.toggled.connect(self._refresh_ocr_status)
+        # 手填语言时立刻重算可用性：否则用户改完要等保存后才看得出没这语言
+        self._ocr_languages.textChanged.connect(self._refresh_ocr_status)
 
         return group
 
     def _refresh_ocr_status(self) -> None:
-        """探测当前环境是否真的能做 OCR，把结论直白地告诉用户。"""
+        """探测当前环境是否真的能做 OCR，把结论直白地告诉用户。
+
+        关键的一点：**不能只显示「已安装语言」**。此前正是这样做的，于是
+        界面写着「可用 · 已安装语言：chi_sim、eng」，而实际请求的是 locale
+        推断出的 `jpn` —— tesseract 遇到未安装的语言会整批失败，
+        每一张截图都识别不出东西，界面上却毫无异常。
+        所以这里要显示的是「实际会用哪个语言」，以及它与期望的差异。
+        """
         if not self._ocr_enabled.isChecked():
             self._ocr_status.setText("已关闭（截图只记录图片本身）")
             return
         try:
-            from ..core.ocr import TesseractBackend
+            from ..core.ocr import TesseractBackend, select_languages
 
             backend = TesseractBackend()
-            if backend.available():
-                langs = "、".join(backend.languages()) or "未知"
-                self._ocr_status.setText(f"可用 · 已安装语言：{langs}")
-            else:
+            if not backend.available():
                 self._ocr_status.setText("不可用 · 未找到 tesseract（截图将无法被文字搜索）")
+                return
+
+            installed = list(backend.languages())
+            requested = self._ocr_languages.text().strip()
+            locale_hint = str(self._config.get("ui.language", "zh_CN") or "zh_CN")
+            choice = select_languages(installed, locale_hint, requested)
+
+            if not choice.usable:
+                self._ocr_status.setText(
+                    "不可用 · tesseract 未安装任何语言数据，请先装语言包"
+                    "（如 tesseract-ocr-chi-sim）"
+                )
+                return
+
+            langs = "、".join(installed) or "未知"
+            if choice.degraded:
+                # 明确告知「能用但不是你要的」，别让用户以为是识别精度问题
+                self._ocr_status.setText(
+                    f"⚠ {choice.describe()} · 实际使用：{choice.languages} · "
+                    f"已安装语言：{langs}"
+                )
+            else:
+                self._ocr_status.setText(
+                    f"可用 · 识别语言：{choice.languages} · 已安装语言：{langs}"
+                )
         except Exception:  # noqa: BLE001 - 状态展示失败不该挡住设置页
             self._ocr_status.setText("无法探测（不影响其它功能）")
 

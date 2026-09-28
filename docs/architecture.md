@@ -393,11 +393,60 @@ FTS5 索引与排序，检索路径零改动。
    ▼
 OcrEngine.recognize_full()
    │  · 语言解析：ui.language → tesseract 语言串（chi_sim+eng）
+   │  · 语言挑选：与「已安装语言」取交集，缺则回退（见下）
    │  · 缓存：按「路径 + 大小 + mtime」命中，同一张图不重复识别
    │  · 降级：后端不可用 / 超时 / 识别为空 → 返回空结果，不抛异常
    ▼
 item.content = 识别文本；item.metadata['ocr'] = {置信度, 语言, 耗时}
+                识别失败时 metadata['ocr'] 带 error / error_detail
 ```
+
+### 两段式语言处理：想要的 vs 能用的
+
+语言处理刻意分成两步，混在一起就没法单独观察「用户配了什么」：
+
+| 函数 | 回答 | 是否查已装语言 |
+| --- | --- | --- |
+| `resolve_languages(locale, requested)` | 用户**想要**什么 | 否，纯字符串映射 |
+| `select_languages(installed, locale, requested)` | **能用**什么 | 是，取交集后回退 |
+
+为什么必须做第二步：**tesseract 只要有一个语言的数据文件不存在就整批失败**，
+不是忽略那一个语言。`chi_sim+jpn` 在只装了 `chi_sim` 的机器上，
+stdout 为空、退出码 1，**一个语言都用不上**。
+
+```
+想要 chi_sim+jpn，已装 chi_sim+eng
+   交集 → ['chi_sim']              → 用 chi_sim，标记 partial
+想要 jpn，已装 chi_sim+eng
+   交集为空 → 回退 eng              → 用 eng，标记 fallback
+想要 eng，已装 osd only
+   osd 不算正文语言 → 无可用语言     → 不调用 tesseract，报 no_language_data
+```
+
+回退后 `LanguageChoice` 带着 `wants` / `missing` / `degraded` / `reason`
+一起返回，设置页、`--stats`、`--selfcheck` 三处据此给出提示。
+**不提示等于没做**：日文用户会看到「OCR 可用」，却拿英文模型识别中文截图，
+只会以为是精度问题。
+
+### 失败与「图里本来没字」必须可区分
+
+两者在库里都是一条 `content=''` 的图片记录。不做区分的话，
+用户搜不到字却没有任何线索（这正是本模块此前的问题）。
+
+`OcrResult` 因此带 `error` / `error_detail`：
+
+| error | 含义 |
+| --- | --- |
+| `language_unavailable` | 语言数据加载失败（由退出码 + stderr 判定） |
+| `no_language_data` | 一个正文语言都没装，未调用 tesseract |
+| `timeout` | 识别超时 |
+| `invoke_failed` | 子进程调用失败 |
+| `executable_missing` | 找不到 tesseract 可执行文件 |
+
+判定依据是**退出码**，不是 stderr 文本 —— 空图与语言失败在 stdout 上
+完全一样（都是空），只有退出码（`0` vs `1`）能分开。
+关键的一点：结果在进入缓存、以及被「清空/截断」这两条路径上，
+`error` 字段都必须原样保留，否则失败会被洗回「正常的空结果」。
 
 **顺序很关键：OCR 必须排在 `PrivacyGuard.inspect()` 之前。**
 因为 `inspect()` 读的就是 `item.content`，先识别再判定，

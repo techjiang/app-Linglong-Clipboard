@@ -329,9 +329,20 @@ def _run_cli(args: argparse.Namespace) -> int:
                 print("常用来源：")
                 for source, count in stats["sources"]:
                     print(f"  {source:<20} {count}")
-            if ocr_status["enabled"]:
+            if ocr_status["usable"]:
                 langs = "、".join(ocr_status["available"]) or "未知"
-                print(f"截图 OCR：可用（{ocr_status['backend']} · 语言 {ocr_status['languages']} · 已装 {langs}）")
+                line = (
+                    f"截图 OCR：可用（{ocr_status['backend']} · "
+                    f"语言 {ocr_status['languages']} · 已装 {langs}）"
+                )
+                if ocr_status["degraded"]:
+                    # 「能用，但用的不是你要的语言」必须说出来：
+                    # 否则日文用户拿中文识别串跑，结果是能跑但认不准
+                    line += f"\n         注意：{ocr_status['detail']}"
+                print(line)
+            elif ocr_status["enabled"]:
+                # 装了 tesseract 但没有可用语言数据 —— 以前这里会报「可用」
+                print(f"截图 OCR：不可用（{ocr_status['detail']}，截图将无法被文字搜索）")
             else:
                 print("截图 OCR：不可用（未找到 tesseract，截图将无法被文字搜索）")
         storage.close()
@@ -572,9 +583,12 @@ def _run_selfcheck(args: argparse.Namespace) -> int:
     刻意不打开数据库：自检回答的是「这台机器上的原生能力能不能用」，
     不该被历史文件损坏之类的问题挡住 —— 否则最需要它的时候就恰好用不了。
     """
+    from .utils.config import Config
     from .utils.selfcheck import format_report, run_self_check
 
-    report = run_self_check()
+    # 带上配置：OCR 一项需要读「识别语言」与开关，用默认配置探测会得到
+    # 与实际运行不一致的结论
+    report = run_self_check(config=Config())
     if args.json:
         print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
     else:

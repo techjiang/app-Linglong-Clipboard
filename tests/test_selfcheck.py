@@ -281,3 +281,139 @@ def test_selfcheck_never_raises_on_broken_hotkeys():
     # 只要不抛到调用方就算通过
     report = _run(HealthBackend(), Exploding())
     assert report.results
+
+
+# ---------------------------------------------------------------- OCR
+
+
+class _Cfg:
+    """最小配置替身：自检只用到 get。"""
+
+    def __init__(self, values=None):
+        self._values = values or {}
+
+    def get(self, key, default=None):
+        return self._values.get(key, default)
+
+
+def _ocr_result(report):
+    return next(r for r in report.results if r.name == "截图 OCR")
+
+
+def test_ocr_check_present_in_report():
+    """OCR 是文档里承诺的能力，自检必须覆盖它。"""
+    report = _run(HealthBackend(), FakeHotkeys())
+    assert _ocr_result(report) is not None
+
+
+def test_ocr_check_degraded_when_disabled():
+    report = NativeSelfCheck(
+        backend=HealthBackend(),
+        hotkeys_factory=lambda: FakeHotkeys(),
+        config=_Cfg({"ocr.enabled": False}),
+    ).run()
+    entry = _ocr_result(report)
+    assert entry.status == DEGRADED
+    assert "未启用" in entry.detail
+
+
+def test_ocr_check_ok_with_installed_language(monkeypatch):
+    """用桩后端模拟「tesseract 在、语言也对得上」。"""
+    import linglong_clip.core.ocr as ocr
+
+    class Backend(ocr.TesseractBackend):
+        def path(self):
+            return "/usr/bin/tesseract"
+
+        def languages(self):
+            return ("chi_sim", "eng")
+
+    monkeypatch.setattr(ocr, "TesseractBackend", Backend)
+    report = NativeSelfCheck(
+        backend=HealthBackend(),
+        hotkeys_factory=lambda: FakeHotkeys(),
+        config=_Cfg({"ocr.enabled": True, "ui.language": "zh_CN"}),
+    ).run()
+    entry = _ocr_result(report)
+    assert entry.status == OK
+    assert "chi_sim" in entry.detail
+
+
+def test_ocr_check_degraded_when_language_missing(monkeypatch):
+    """核心回归：期望的语言没装时不能报「正常」。
+
+    此前设置页会显示「可用 · 已安装语言：chi_sim、eng」，而实际请求 jpn，
+    tesseract 整批失败 —— 每一项单看都正常，合起来一张图也识别不了。
+    """
+    import linglong_clip.core.ocr as ocr
+
+    class Backend(ocr.TesseractBackend):
+        def path(self):
+            return "/usr/bin/tesseract"
+
+        def languages(self):
+            return ("chi_sim", "eng")
+
+    monkeypatch.setattr(ocr, "TesseractBackend", Backend)
+    report = NativeSelfCheck(
+        backend=HealthBackend(),
+        hotkeys_factory=lambda: FakeHotkeys(),
+        config=_Cfg({"ocr.enabled": True, "ui.language": "ja_JP"}),
+    ).run()
+    entry = _ocr_result(report)
+    assert entry.status == DEGRADED
+    assert "jpn" in entry.detail
+    assert "eng" in entry.detail
+    assert entry.hint
+
+
+def test_ocr_check_fails_when_no_language_data(monkeypatch):
+    """装了 tesseract 但一个语言都没有 —— 这是明确要用户动手的，判为失败。"""
+    import linglong_clip.core.ocr as ocr
+
+    class Backend(ocr.TesseractBackend):
+        def path(self):
+            return "/usr/bin/tesseract"
+
+        def languages(self):
+            return ("osd",)
+
+    monkeypatch.setattr(ocr, "TesseractBackend", Backend)
+    report = NativeSelfCheck(
+        backend=HealthBackend(),
+        hotkeys_factory=lambda: FakeHotkeys(),
+        config=_Cfg({"ocr.enabled": True}),
+    ).run()
+    entry = _ocr_result(report)
+    assert entry.status == FAIL
+    assert report.healthy is False
+    assert "语言" in entry.hint
+
+
+def test_ocr_check_survives_engine_build_exception(monkeypatch):
+    """自检不能因为 OCR 探测抛异常就整体崩掉。"""
+    import linglong_clip.core.ocr as ocr
+
+    def boom(_config=None):
+        raise RuntimeError("构建炸了")
+
+    monkeypatch.setattr(ocr, "build_engine", boom)
+    report = NativeSelfCheck(
+        backend=HealthBackend(), hotkeys_factory=lambda: FakeHotkeys()
+    ).run()
+    entry = _ocr_result(report)
+    assert entry.status == FAIL
+    assert "构建" in entry.detail
+
+
+def test_ocr_check_defaults_to_real_config_when_none():
+    """不传配置时也要真的探测，而不是当成「未启用」。"""
+    report = _run(HealthBackend(), FakeHotkeys())
+    assert _ocr_result(report).status in (OK, DEGRADED, FAIL)
+
+
+def test_run_self_check_accepts_config():
+    report = run_self_check(
+        backend=HealthBackend(), hotkeys_factory=lambda: FakeHotkeys(), config=_Cfg()
+    )
+    assert _ocr_result(report) is not None

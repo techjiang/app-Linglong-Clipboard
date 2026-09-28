@@ -106,9 +106,11 @@ class NativeSelfCheck:
     也不会改写用户的剪贴板。
     """
 
-    def __init__(self, backend=None, hotkeys_factory=None) -> None:
+    def __init__(self, backend=None, hotkeys_factory=None, config=None) -> None:
         self._backend = backend
         self._hotkeys_factory = hotkeys_factory
+        #: OCR 检查需要读配置；为 None 时按默认配置探测
+        self._config = config
 
     # ---- 入口 ----
 
@@ -131,6 +133,7 @@ class NativeSelfCheck:
             lambda: self._check_focus(backend),
             self._check_hotkey_backend,
             self._check_hotkey_probe,
+            self._check_ocr,
         ]
         for check in checks:
             report.results.append(self._timed(check))
@@ -273,6 +276,60 @@ class NativeSelfCheck:
         finally:
             probe.unregister_all()
 
+    def _check_ocr(self) -> CheckResult:
+        """检查 OCR 是否**真的**能跑，而不只是「tesseract 在 PATH 里」。
+
+        这里的价值在于把「语言数据缺失」揪出来 —— 它单独看每一项都正常：
+        tesseract 装了、开关开了、设置页显示「已安装语言：chi_sim、eng」，
+        但实际请求的语言没装时 tesseract 会整批失败，一张截图都识别不了。
+        """
+        try:
+            from ..core.ocr import build_engine
+
+            config = self._config
+            if config is None:
+                # 不传配置时用默认配置探测，而不是 build_engine(None) ——
+                # 后者会返回「禁用」的引擎，把 OCR 报成未启用，与实际情况不符
+                from .config import Config
+
+                config = Config()
+            engine = build_engine(config)
+        except Exception as exc:  # noqa: BLE001 - 自检不能因探测失败而崩
+            return CheckResult("截图 OCR", FAIL, f"构建引擎失败：{exc!r}")
+
+        if not engine.enabled:
+            return CheckResult(
+                "截图 OCR",
+                DEGRADED,
+                "未启用或未找到 tesseract",
+                "截图照常记录，只是搜不到图里的文字；"
+                "需要时安装 tesseract 与对应语言包（如 tesseract-ocr-chi-sim）",
+            )
+
+        choice = engine.language_choice()
+        installed = "、".join(engine.status().get("available", [])) or "无"
+
+        if not choice.usable:
+            return CheckResult(
+                "截图 OCR",
+                FAIL,
+                f"tesseract 已安装，但没有任何语言数据（已安装：{installed}）",
+                "装语言包后即可用，例如 Debian/Ubuntu 的 tesseract-ocr-chi-sim / "
+                "tesseract-ocr-eng；macOS 用 brew install tesseract-lang",
+            )
+
+        if choice.degraded:
+            return CheckResult(
+                "截图 OCR",
+                DEGRADED,
+                f"实际使用 {choice.languages}（期望 {choice.wants}）· 已安装：{installed}",
+                f"{choice.describe()}。装齐语言包，或在设置页「识别语言」里手动指定已装的",
+            )
+
+        return CheckResult(
+            "截图 OCR", OK, f"{choice.languages} · 已安装：{installed}"
+        )
+
     # ---- 结论 ----
 
     @staticmethod
@@ -311,9 +368,11 @@ def format_report(report: SelfCheckReport) -> str:
     return "\n".join(lines)
 
 
-def run_self_check(backend=None, hotkeys_factory=None) -> SelfCheckReport:
+def run_self_check(backend=None, hotkeys_factory=None, config=None) -> SelfCheckReport:
     """便捷入口。"""
-    return NativeSelfCheck(backend=backend, hotkeys_factory=hotkeys_factory).run()
+    return NativeSelfCheck(
+        backend=backend, hotkeys_factory=hotkeys_factory, config=config
+    ).run()
 
 
 __all__ = [

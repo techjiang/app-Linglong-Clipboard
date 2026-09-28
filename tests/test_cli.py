@@ -701,3 +701,74 @@ def test_import_native_history_blocked_content_not_stored(
     contents = [item.get("content", "") for item in items]
     assert pem not in contents
     assert content_hash("text", canonical_content("text", pem)) != ""
+
+
+def test_stats_json_reports_language_degradation(cli_env, capsys):
+    """`--stats --json` 要能区分「想要的」与「实际用的」语言。
+
+    只报一个 `languages` 字段时，脚本无法判断这个串是否可用 ——
+    而不可用的语言串会让 tesseract 整批失败。
+    """
+    main(["--stats", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    ocr = payload["ocr"]
+    assert set(ocr) >= {"usable", "requested", "missing", "degraded", "reason", "detail"}
+
+
+def _write_config(home, **values):
+    """把配置写进隔离的数据目录，`main()` 里的 `Config()` 会读到它。"""
+    path = home / "config.json"
+    payload = json.loads(path.read_text()) if path.is_file() else {}
+    payload.update(values)
+    path.write_text(json.dumps(payload, ensure_ascii=False))
+
+
+class _FakeTesseract:
+    """假装装了 tesseract，但只带指定语言。"""
+
+    def __init__(self, langs):
+        self._langs = langs
+
+    def install(self, monkeypatch):
+        import linglong_clip.core.ocr as ocr
+
+        langs = self._langs
+
+        class Backend(ocr.TesseractBackend):
+            def path(self):
+                return "/usr/bin/tesseract"
+
+            def languages(self):
+                return langs
+
+        monkeypatch.setattr(ocr, "TesseractBackend", Backend)
+        return self
+
+
+def test_stats_warns_when_language_degraded(cli_env, capsys, monkeypatch):
+    """降级必须在 `--stats` 里说出来，而不是显示成「可用」。"""
+    _FakeTesseract(("chi_sim", "eng")).install(monkeypatch)
+    _write_config(cli_env, ui={"language": "ja_JP"})
+
+    assert main(["--stats"]) == 0
+    out = capsys.readouterr().out
+    assert "注意" in out
+    assert "jpn" in out
+    assert "eng" in out
+
+
+def test_stats_reports_unusable_when_no_language_data(cli_env, capsys, monkeypatch):
+    """装了 tesseract 但没有语言数据时不能报「可用」。"""
+    _FakeTesseract(("osd",)).install(monkeypatch)
+
+    assert main(["--stats"]) == 0
+    out = capsys.readouterr().out
+    assert "截图 OCR：不可用" in out
+    assert "语言数据" in out
+
+
+def test_stats_json_usable_flag_reflects_language_data(cli_env, capsys, monkeypatch):
+    _FakeTesseract(("osd",)).install(monkeypatch)
+    main(["--stats", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ocr"]["usable"] is False

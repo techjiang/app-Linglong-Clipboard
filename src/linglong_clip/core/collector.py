@@ -180,10 +180,23 @@ class Collector:
             result = engine.recognize_full(item.image_path)
         except Exception as exc:  # noqa: BLE001 - OCR 是增强能力，不能影响采集
             _log.debug("OCR 失败，跳过图片文字识别：%s", exc)
+            item.metadata.setdefault(
+                "ocr",
+                {"text": "", "backend": "", "error": "exception", "error_detail": str(exc)},
+            )
             return
 
         if result.is_empty:
-            item.metadata.setdefault("ocr", {"text": "", "backend": result.backend})
+            # 记下 error 字段：没有它，「图里本来没字」和「识别根本没跑起来」
+            # 在库里是两条一模一样的记录，用户搜不到也没有任何线索。
+            entry: dict = {"text": "", "backend": result.backend}
+            if result.error:
+                entry["error"] = result.error
+                entry["error_detail"] = result.error_detail
+                _log.warning(
+                    "截图文字识别未成功（%s）：%s", result.error, result.error_detail
+                )
+            item.metadata.setdefault("ocr", entry)
             return
 
         item.content = result.text

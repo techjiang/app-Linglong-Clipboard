@@ -139,6 +139,88 @@ def test_ocr_status_reflects_environment(dialog):
     assert ("可用" in text) or ("不可用" in text)
 
 
+class _FakeTesseract:
+    def __init__(self, langs):
+        self._langs = langs
+
+    def install(self, monkeypatch):
+        import linglong_clip.core.ocr as ocr
+
+        langs = self._langs
+
+        class Backend(ocr.TesseractBackend):
+            def path(self):
+                return "/usr/bin/tesseract"
+
+            def languages(self):
+                return langs
+
+        monkeypatch.setattr(ocr, "TesseractBackend", Backend)
+        return self
+
+
+def test_ocr_status_shows_actual_language(dialog, config, monkeypatch):
+    """状态里必须出现「实际会用哪个语言」，而不只是已安装列表。
+
+    此前只显示「可用 · 已安装语言：chi_sim、eng」，用户从界面上看不出
+    实际请求的是另一个没装的串。
+    """
+    _FakeTesseract(("chi_sim", "eng")).install(monkeypatch)
+    dialog._ocr_enabled.setChecked(True)
+    dialog._refresh_ocr_status()
+    text = dialog._ocr_status.text()
+    assert "chi_sim" in text
+    assert "识别语言" in text or "实际使用" in text
+
+
+def test_ocr_status_warns_on_degraded_language(dialog, config, monkeypatch):
+    """核心回归：期望语言没装时要显式警告，而不是报「可用」。"""
+    _FakeTesseract(("chi_sim", "eng")).install(monkeypatch)
+    dialog._ocr_enabled.setChecked(True)
+    dialog._refresh_ocr_status()
+
+    dialog._ocr_languages.setText("jpn")
+    text = dialog._ocr_status.text()
+    assert "⚠" in text
+    assert "jpn" in text
+    assert "eng" in text
+
+
+def test_ocr_status_recomputes_on_language_edit(dialog, config, monkeypatch):
+    """手填语言后立刻重算：不然用户改完要等保存才看得出没这个语言。"""
+    _FakeTesseract(("chi_sim", "eng")).install(monkeypatch)
+    dialog._ocr_enabled.setChecked(True)
+    dialog._refresh_ocr_status()
+
+    dialog._ocr_languages.setText("jpn")
+    assert "⚠" in dialog._ocr_status.text()
+
+    dialog._ocr_languages.setText("chi_sim")
+    assert "⚠" not in dialog._ocr_status.text()
+
+
+def test_ocr_status_reports_no_language_data(dialog, config, monkeypatch):
+    _FakeTesseract(("osd",)).install(monkeypatch)
+    dialog._ocr_enabled.setChecked(True)  # 已是 True，需显式触发刷新
+    dialog._refresh_ocr_status()
+    text = dialog._ocr_status.text()
+    assert "不可用" in text
+    assert "语言" in text
+
+
+def test_ocr_status_survives_probe_failure(dialog, config, monkeypatch):
+    """探测失败不能把设置页搞崩。"""
+    import linglong_clip.core.ocr as ocr
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("探测炸了")
+
+    monkeypatch.setattr(ocr, "TesseractBackend", boom)
+    dialog._ocr_enabled.setChecked(True)
+    dialog._refresh_ocr_status()
+    assert "无法探测" in dialog._ocr_status.text()
+
+
 # ---- 设置对话框：局域网同步 ----
 
 
