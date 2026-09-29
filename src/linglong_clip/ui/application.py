@@ -12,6 +12,7 @@ import os
 import signal
 import sys
 import threading
+from dataclasses import replace
 from typing import List, Optional
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QTimer, Qt, Signal
@@ -39,7 +40,7 @@ from ..platform import detect_backend
 from ..utils.config import Config
 from ..utils.logger import get_logger, setup_logging
 from ..utils.paths import is_linux
-from .clipboard_qt import QtClipboardAdapter
+from .clipboard_qt import QtClipboardAdapter, clipboard_payload
 from .hotkeys import HotkeyManager, expand_hotkey_range
 from .main_window import MainWindow
 from .quick_paste import QuickPasteOverlay
@@ -139,6 +140,9 @@ class Application(QObject):
         self._monitor_primary_explicit = monitor_primary
         #: 实际注册成功的快速粘贴快捷键（注册失败时为空）
         self._quick_hotkey_sequences: List[str] = []
+        #: 出站规则的临时产物。为 None 时 `copy_item` 写原记录；
+        #: 有值时写它 —— 出站加工的结果只进剪贴板，不写回历史。
+        self._outbound_override: Optional[ClipboardItem] = None
         self._shutting_down = False
         self._sync_signature_cache: Optional[tuple] = None
 
@@ -365,6 +369,7 @@ class Application(QObject):
 
         self.window.close_requested.connect(self._on_window_close_requested)
         self.window.copy_requested.connect(self.copy_item)
+        self.window.outbound_requested.connect(self.apply_outbound_rules)
         self.window.paste_requested.connect(self.paste_item)
         self.window.delete_requested.connect(self.delete_item)
         self.window.flag_toggled.connect(self.toggle_flag)
@@ -671,12 +676,62 @@ class Application(QObject):
 
     # ---- 剪贴板操作 ----
 
+    def apply_outbound_rules(self, item_id: int, plain_text_only: bool = False) -> str:
+        """把这条记录按 `trigger = outbound` 的规则加工后写进剪贴板。
+
+        这是「复制前清理链接跟踪参数」这类规则的落点。规则此前只能在界面上
+        配、在文档里写，**没有任何执行时机** —— 配了也没人生效。
+
+        一段刻意的顺序：**规则产物不落库**。加工的产物只进这一次的剪贴板，
+        历史里留的仍是原始内容。理由是出站加工常常是「为了这次粘贴顺手清理一下」，
+        把结果写回历史会让用户在历史里找不到自己原本复制的东西，
+        而那种「我明明复制的是官网链接，怎么变成别的了」的困惑比便利更贵。
+
+        隐私与出站防护没有被绕开：内容先按原记录算出敏感性（原记录才是
+        用户真正保留的那份），再交给 `copy_item` 走它既有的脱敏、
+        排除系统历史、限时清空这套流程。
+        """
+        item = self.storage.get(item_id)
+        if item is None:
+            return ""
+
+        data = self.automation.outbound_data(item)
+        if not data.modified and not data.errors:
+            return ""
+
+        described = data.describe()
+        if not data.modified:
+            # 命中了规则但没跑成（比如内容不适用该转换）：照原样复制，
+            # 但要说出来，否则用户无从判断「为什么这次没加工」
+            self.window.notify(described)
+            return described
+
+        # 只本次有效：`copy_item` 收的是一份临时记录，不写回存储。
+        # 指纹交给 `_mark_own_write` 按读取侧同一口径重算 —— 这里先算一个
+        # 只会多出第二个口径，而两处口径不一致正是自我写入标记失效的原因。
+        patched = replace(item)
+        patched.content = data.text
+        patched.html = ""
+        patched.hash = ""
+
+        self._outbound_override = patched
+        try:
+            self.copy_item(item_id, plain_text_only=plain_text_only)
+        finally:
+            self._outbound_override = None
+
+        self.window.notify(described)
+        return described
+
     def copy_item(self, item_id: int, plain_text_only: bool = False) -> None:
         item = self.storage.get(item_id)
         if item is None:
             return
 
-        text = item.content
+        # 出站规则的产物优先：它只影响这次写入剪贴板，历史里仍是原记录
+        outbound = self._outbound_override
+
+        text = outbound.content if outbound is not None else item.content
         redacted = item.sensitive and bool(
             self.config.get("privacy.redact_on_copy_out", False)
         )
@@ -698,14 +753,15 @@ class Application(QObject):
             )
         else:
             self.clipboard.write_item(
-                item,
+                outbound if outbound is not None else item,
                 plain_text_only=plain_text_only,
                 exclude_from_history=plan.exclude_from_history,
             )
 
-        # 记下指纹，避免自己的写入又被采集一遍
-        payload = item.hash if item.kind == "image" else text
-        self.monitor.mark_self_write(payload or text, item.kind)
+        # 记下指纹，避免自己的写入又被采集一遍。
+        # 有出站产物时按产物算：历史里留下的那条仍是原记录，
+        # 而剪贴板里现在装的是加工后的内容，采集线程看到的正是后者。
+        self._mark_own_write(outbound if outbound is not None else item, text)
         self.storage.touch(item_id)
         self.window.reload()
 
@@ -720,9 +776,27 @@ class Application(QObject):
             auto_clear_seconds=self._auto_clear_seconds(),
         )
         self.clipboard.set_text(text, exclude_from_history=plan.exclude_from_history)
-        self.monitor.mark_self_write(text, "text")
+        self._mark_own_write(None, text)
         note = self._schedule_outbound_release(plan, text, "text")
         self.window.notify(f"已复制转换结果{note}")
+
+    def _mark_own_write(self, item: Optional[ClipboardItem], text: str) -> None:
+        """告诉采集线程「剪贴板里这份是我们自己写的」，别又记一遍。
+
+        两件事必须与读取侧完全一致，缺一个标记就失效（历史里会凭空多出
+        一条自己操作产生、来源不明的记录）：
+
+        - **载荷**：向 `QtClipboardAdapter` 要口径（`clipboard_payload()`），
+          而不是自己再挑一个字段。`mark_self_write()` 内部会拿它去算指纹，
+          所以这里传的是**载荷**而不是算好的指纹 —— 传指纹会被再哈希一次，
+          又是一处对不上的口径。
+        - **类型**：一律 `text`。写进系统剪贴板的是纯文本，
+          读取侧也是按 `text` 算指纹 —— 这里若沿用记录自己的类型
+          （从历史里复制 `link` 时就是 `link`），两边算出的指纹不同，
+          比对立刻失败。
+        """
+        html = item.html if item is not None and item.kind == "rich" else ""
+        self.monitor.mark_self_write(clipboard_payload(text, html), "text")
 
     # ---- 出站防护 ----
 

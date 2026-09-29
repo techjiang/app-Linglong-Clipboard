@@ -151,11 +151,9 @@ class QtClipboardAdapter:
             content=text,
             html=html if has_html else "",
             rtf="(rtf)" if has_rtf else "",
-            hash=content_hash("text", text or html),
+            hash=_text_fingerprint(text, html),
             size=len((text or html).encode("utf-8")),
         )
-        if html and not text:
-            item.hash = content_hash("rich", html)
         return item
 
     def _notify_image_saved(self, *, relative: str, data: bytes) -> None:
@@ -304,3 +302,31 @@ class QtClipboardAdapter:
                     return image
         _log.debug("图片文件缺失：%s", relative)
         return None
+
+
+def _text_fingerprint(text: str, html: str) -> str:
+    """纯文本/富文本的指纹口径，唯一的定义处。
+
+    对外的门面是模块级的 `clipboard_payload()`：`ui/application.py` 写入剪贴板时
+    要用同一个载荷口径算「自我写入」指纹（避免自己写出去的内容又被采集回来）。
+    两处只要差一个字节标记就失效，表现是历史里凭空多出一条自己刚复制的内容 ——
+    很容易被当成「采集正常」而放过。
+
+    规则只有一条：**有纯文本就用纯文本，没有才退回整段 HTML**，
+    类型随之取 `text` 或 `rich`。此前这两件事在 `_from_text` 里写成
+    「先按 text 算，再在 `html and not text` 时覆盖成 rich」，
+    结果与 `mark_self_write` 的口径对不上 —— 自我写入标记形同虚设。
+    """
+    payload = text or html
+    if text:
+        return content_hash("text", payload)
+    return content_hash("rich", payload)
+
+
+def clipboard_payload(text: str, html: str = "") -> str:
+    """写入剪贴板时该拿什么去算指纹 —— 供 `mark_self_write` 复用同一口径。
+
+    返回的是**载荷**而不是指纹：`mark_self_write()` 会拿它再算一次哈希
+    （那边还要拼上类型），所以这里给指纹的话会被哈希两遍。
+    """
+    return text or html

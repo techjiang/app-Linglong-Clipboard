@@ -11,6 +11,7 @@ Qt `offscreen` 渲染路径，因此 CI 里也能跑，代码改了重新执行�
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -205,6 +206,47 @@ def main() -> int:
         "可用 · 选中文字即进历史，与剪贴板记录走同一套隐私判定"
     )
     _render(capture_dialog, OUT / "settings-capture-primary.png")
+
+    # 设置页「自动化」：体现「每条规则的时机」与「不会生效的当场标出来」
+    rules_dialog = SettingsDialog(_config({}), automation)
+    rules_dialog.resize(760, 640)
+    rules_dialog._rules_editor.setPlainText(
+        json.dumps(
+            [
+                {
+                    "name": "自动压缩 JSON",
+                    "kinds": ["text", "code"],
+                    "pattern": r"^\s*[\{\[]",
+                    "actions": ["json.minify"],
+                    "trigger": "auto",
+                },
+                {
+                    "name": "复制时清理链接跟踪参数",
+                    "kinds": ["link"],
+                    "contains": "utm_",
+                    "actions": ["url.strip_tracking"],
+                    "trigger": "outbound",
+                },
+                {
+                    "name": "粘贴前转成表格",
+                    "kinds": ["text"],
+                    "actions": ["csv.to_markdown"],
+                },
+                {
+                    "name": "写错触发方式的规则",
+                    "kinds": ["link"],
+                    "actions": ["url.strip_tracking"],
+                    "trigger": "on_copy",
+                },
+            ],
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    rules_tabs = rules_dialog.findChild(QTabWidget)
+    if rules_tabs is not None:
+        rules_tabs.setCurrentIndex(4)  # 「自动化」在采集/隐私/同步/外观之后
+    _render(rules_dialog, OUT / "settings-automation.png")
 
     # 设置页「关于」：体现原生能力自检面板
     from linglong_clip.utils.selfcheck import run_self_check

@@ -1329,3 +1329,76 @@ def test_settings_survives_probe_failure(qt_app, home, monkeypatch):
 
     dialog = SettingsDialog(Config(home / "config.json"))
     assert dialog._monitor_primary.isEnabled() is False
+
+
+# ---- 设置页：规则状态（哪些规则真的会跑） ----
+
+
+def _dialog_with_rules(config, rules):
+    import json
+
+    from linglong_clip.core.automation import AutomationEngine
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+
+    automation = AutomationEngine()
+    dialog = SettingsDialog(config, automation)
+    dialog._rules_editor.setPlainText(json.dumps(rules, ensure_ascii=False))
+    return dialog
+
+
+def test_rules_state_summarizes_triggers(config, qt_app):
+    """三种触发方式各有多少条，必须在界面上说清。
+
+    「什么时候跑」是用户配完规则最想知道的一件事，而 JSON 里只有
+    一个英文常量。不写出来的话，规则看起来配好了却什么也不做时，
+    用户没有任何线索。
+    """
+    dialog = _dialog_with_rules(
+        config,
+        [
+            {"name": "a", "kinds": ["text"], "actions": ["json.minify"], "trigger": "auto"},
+            {"name": "b", "kinds": ["link"], "actions": ["url.strip_tracking"],
+             "trigger": "outbound"},
+            {"name": "c", "kinds": ["text"], "actions": ["lines.unique"]},
+        ],
+    )
+    text = dialog._rules_state.text()
+    assert text.startswith("✓")
+    assert "采集时 1 条" in text
+    assert "复制出去时 1 条" in text
+    assert "仅手动 1 条" in text
+
+
+def test_rules_state_flags_bad_trigger(config, qt_app):
+    """写错的触发方式要当场标出来，而不是等用户去命令行才发现。"""
+    dialog = _dialog_with_rules(
+        config,
+        [{"name": "写错了", "kinds": ["link"], "actions": ["url.strip_tracking"],
+          "trigger": "paste"}],
+    )
+    text = dialog._rules_state.text()
+    assert text.startswith("✗")
+    assert "写错了" in text
+    assert "不会生效" in text
+
+
+def test_rules_state_flags_unknown_action(config, qt_app):
+    dialog = _dialog_with_rules(
+        config, [{"name": "未知动作", "actions": ["nope"], "trigger": "auto"}]
+    )
+    assert "未知动作" in dialog._rules_state.text()
+
+
+def test_rules_state_flags_broken_json_with_line_number(config, qt_app):
+    dialog = _dialog_with_rules(config, [])
+    dialog._rules_editor.setPlainText('[{"name": "坏",')
+    text = dialog._rules_state.text()
+    assert text.startswith("✗")
+    assert "JSON 无法解析" in text
+    assert "行" in text
+
+
+def test_rules_state_rejects_non_array(config, qt_app):
+    dialog = _dialog_with_rules(config, [])
+    dialog._rules_editor.setPlainText('{"name": "不是数组"}')
+    assert "数组" in dialog._rules_state.text()

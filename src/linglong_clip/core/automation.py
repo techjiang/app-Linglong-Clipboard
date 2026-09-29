@@ -19,14 +19,21 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from ..utils.logger import get_logger
-from .models import CODE, FILE, LINK, TEXT, ClipboardItem
+from .models import CODE, FILE, KIND_LABELS, LINK, TEXT, ClipboardItem
 from .normalize import is_tracking_param, normalize_path, normalize_url
 
 _log = get_logger("automation")
 
 #: 触发方式
 TRIGGER_MANUAL = "manual"
+#: 采集到匹配内容时自动加工（入库前，产物成为这条记录的内容）
 TRIGGER_AUTO = "auto"
+#: 从历史里把内容复制/粘贴出去时自动加工（出站，产物进剪贴板）
+TRIGGER_OUTBOUND = "outbound"
+
+#: 全部触发方式。写错的值（如 `"paste"`）会被 `normalize_trigger()` 判为无效，
+#: 而不是被当成 `manual` 悄悄收下 —— 后者会让规则看起来配好了却永不执行。
+TRIGGERS = (TRIGGER_MANUAL, TRIGGER_AUTO, TRIGGER_OUTBOUND)
 
 #: 加工器的返回约定：返回 None 表示「这条不适合该转换」，跳过
 Transformer = Callable[..., Optional[str]]
@@ -442,6 +449,21 @@ def list_actions(kind: Optional[str] = None) -> List[Action]:
 # ---- 规则引擎 ----
 
 
+def normalize_trigger(value: Any) -> str:
+    """把配置里的触发方式收敛成合法值。
+
+    非法值一律落到 `manual`（什么都不做），但会记一条警告 ——
+    直接静默替换成 `manual` 的话，用户把 `trigger` 写成 `"paste"`、
+    `"on_copy"` 这类自造名字时，规则看起来配好了却永不执行，
+    而这恰恰是最难查的一类问题。日志里留一行，至少查得到。
+    """
+    text = str(value or TRIGGER_MANUAL).strip().lower()
+    if text in TRIGGERS:
+        return text
+    _log.warning("未知的规则触发方式 %r，按 manual 处理（可选：%s）", value, "、".join(TRIGGERS))
+    return TRIGGER_MANUAL
+
+
 @dataclass
 class Rule:
     """自动加工规则。
@@ -463,8 +485,12 @@ class Rule:
     min_length: int = 0
     actions: List[str] = field(default_factory=list)
     action_params: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    #: 触发方式：auto 表示采集时自动执行
+    #: 触发方式：manual / auto / outbound，见 `TRIGGERS`
     trigger: str = TRIGGER_MANUAL
+    #: 配置里原本写的值。与 `trigger` 不同就说明写法非法被纠正过 ——
+    #: 保留它是为了让「规则为什么没自动跑」查得出来：
+    #: 单看 `trigger = manual` 是分不清「用户就要手动」和「用户写错了」的。
+    raw_trigger: str = TRIGGER_MANUAL
 
     def matches(self, item: ClipboardItem) -> bool:
         if not self.enabled:
@@ -492,6 +518,7 @@ class Rule:
         return cls(
             name=str(data.get("name", "")),
             enabled=bool(data.get("enabled", True)),
+            raw_trigger=str(data.get("trigger", TRIGGER_MANUAL)),
             kinds=list(data.get("kinds") or []),
             pattern=str(data.get("pattern", "")),
             contains=str(data.get("contains", "")),
@@ -499,7 +526,7 @@ class Rule:
             min_length=int(data.get("min_length", 0) or 0),
             actions=list(data.get("actions") or []),
             action_params=dict(data.get("action_params") or {}),
-            trigger=str(data.get("trigger", TRIGGER_MANUAL)),
+            trigger=normalize_trigger(data.get("trigger")),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -528,6 +555,34 @@ class AppliedResult:
     @property
     def ok(self) -> bool:
         return not self.error
+
+
+@dataclass
+class OutboundData:
+    """一条内容复制出去时，该往剪贴板里放什么。
+
+    `text` 是最终产物：没有出站规则命中时就是原始内容。
+    `applied` / `errors` 只用于向用户解释「这次加工到底发生没发生」——
+    出站加工是就地改变用户接下来粘贴到的东西，看不见过程就等于不可信。
+    """
+
+    text: str
+    #: 生效的规则名，按执行顺序
+    applied: List[str] = field(default_factory=list)
+    #: 命中但没跑成的规则与原因
+    errors: List[str] = field(default_factory=list)
+
+    @property
+    def modified(self) -> bool:
+        return bool(self.applied)
+
+    def describe(self) -> str:
+        """给通知栏/状态栏用的一句话，没有加工时返回空串。"""
+        if self.applied:
+            return "已按规则加工：" + "、".join(self.applied)
+        if self.errors:
+            return "出站规则未生效：" + self.errors[0]
+        return ""
 
 
 class AutomationEngine:
@@ -611,11 +666,18 @@ class AutomationEngine:
             current = result.output
         return AppliedResult("+".join(action_keys), current)
 
-    def auto_actions_for(self, item: ClipboardItem) -> List[AppliedResult]:
-        """找出所有 `auto` 规则并执行，用于采集后自动加工。"""
+    def actions_for_trigger(
+        self, item: ClipboardItem, trigger: str
+    ) -> List[AppliedResult]:
+        """执行所有匹配的、指定触发方式的规则。
+
+        `auto` 与 `outbound` 共用这一段：两者的差别只在**什么时候被调用**，
+        执行语义完全一致。写成两份的话，参数传递、链式执行、错误收集
+        这三处迟早会分叉，用户会看到「同样的规则在采集时对、在复制时不对」。
+        """
         results: List[AppliedResult] = []
         for rule in self.rules():
-            if rule.trigger != TRIGGER_AUTO or not rule.matches(item):
+            if rule.trigger != trigger or not rule.matches(item):
                 continue
             if len(rule.actions) == 1:
                 params = rule.action_params.get(rule.actions[0], {})
@@ -623,6 +685,42 @@ class AutomationEngine:
             else:
                 results.append(self.apply_chain(rule.actions, item))
         return results
+
+    def auto_actions_for(self, item: ClipboardItem) -> List[AppliedResult]:
+        """采集后自动加工（`trigger = auto`）。"""
+        return self.actions_for_trigger(item, TRIGGER_AUTO)
+
+    def outbound_data(self, item: ClipboardItem) -> "OutboundData":
+        """复制/粘贴出去之前自动加工（`trigger = outbound`）。
+
+        与 `auto` 的关键差别是**产物不落库**：出站加工的产物只在这次
+        写入剪贴板时有效，历史里留的仍是原始内容。所以这里不返回
+        「要写回记录的值」，而是返回「这次该把什么写进剪贴板」。
+
+        失败与不适用一律忽略：出站规则是便利功能，任何一步出错都应该
+        照原样复制，而不是让用户点「复制」之后什么都没有 ——
+        那比「没加工」严重得多。失败的规则名收在 `errors` 里，
+        便于界面/CLI 说明「为什么这次没加工」。
+        """
+        data = OutboundData(text=item.content)
+        for rule in self.rules():
+            if rule.trigger != TRIGGER_OUTBOUND or not rule.matches(item):
+                continue
+            if len(rule.actions) == 1:
+                params = rule.action_params.get(rule.actions[0], {})
+                results = [self.apply(rule.actions[0], item, **params)]
+            else:
+                results = [self.apply_chain(rule.actions, item)]
+
+            failure = next((result for result in results if not result.ok), None)
+            if failure is not None:
+                _log.debug("出站规则「%s」未生效：%s", rule.name, failure.error)
+                data.errors.append(f"{rule.name}：{failure.error}")
+                continue
+
+            data.text = results[-1].output
+            data.applied.append(rule.name)
+        return data
 
     def suggest_for(self, item: ClipboardItem) -> List[Action]:
         """给一条内容推荐可用动作：先看类型适配，再看规则偏好。"""
@@ -640,3 +738,113 @@ class AutomationEngine:
             return (0 if action.key in preferred else 1, action.category, action.name)
 
         return sorted(candidates, key=sort_key)
+
+# ---- 规则体检 ----
+
+
+@dataclass
+class RuleReport:
+    """一条规则的「会不会生效」结论。"""
+
+    name: str
+    trigger: str
+    #: 执行时机的人话说明
+    when: str
+    actions: List[str]
+    #: 不会生效的原因，空表示正常
+    problems: List[str] = field(default_factory=list)
+
+    @property
+    def will_run(self) -> bool:
+        return not self.problems
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "trigger": self.trigger,
+            "when": self.when,
+            "actions": self.actions,
+            "will_run": self.will_run,
+            "problems": list(self.problems),
+        }
+
+
+#: 触发方式 -> 人话。写清「什么时候执行」比只报一个英文常量有用得多：
+#: 用户配完规则最想知道的就是「我这条到底什么时候跑」。
+_TRIGGER_WHEN = {
+    TRIGGER_AUTO: "采集入库时自动执行（产物成为这条记录的内容）",
+    TRIGGER_OUTBOUND: "复制/粘贴出去时自动执行（产物只进剪贴板，不改历史）",
+    TRIGGER_MANUAL: "不自动执行，只在右键菜单「转换为…」里手动选用",
+}
+
+
+def describe_rules(rules: List[Rule]) -> List[RuleReport]:
+    """体检每条规则，指出**不会生效**的那些。
+
+    为什么值得单独做一件事：规则是纯 JSON，写错一个字不会报错，只会静默地
+    什么都不做 —— 用户以为配好了，实测没反应，而界面上一切正常。
+    常见的三种写法错误这里都能查出来：
+
+    - `trigger` 写成自造的名字（`paste` / `on_copy`），落在 `manual` 上；
+    - `actions` 是空数组或全是未知动作名；
+    - `kinds` 里有拼错的类型名。
+    """
+    reports: List[RuleReport] = []
+    for rule in rules:
+        problems: List[str] = []
+        if not rule.enabled:
+            problems.append("规则已禁用（enabled = false）")
+        if not rule.actions:
+            problems.append("没有配置任何动作（actions 为空）")
+        unknown = [key for key in rule.actions if REGISTRY.get(key) is None]
+        if unknown:
+            problems.append("未知动作：" + "、".join(unknown))
+        bad_kinds = [kind for kind in rule.kinds if kind not in KIND_LABELS]
+        if bad_kinds:
+            problems.append("未知内容类型：" + "、".join(bad_kinds))
+        if rule.pattern:
+            try:
+                re.compile(rule.pattern)
+            except re.error as exc:
+                problems.append(f"正则表达式无法编译：{exc}")
+        if rule.raw_trigger.strip().lower() not in TRIGGERS:
+            problems.append(
+                f"触发方式 {rule.raw_trigger!r} 不是有效值（可选：{'、'.join(TRIGGERS)}），"
+                "已按 manual 处理，不会自动执行"
+            )
+        if rule.trigger == TRIGGER_OUTBOUND and rule.kinds == ["image"]:
+            # 图片在剪贴板里是位图，转换器都吃文本，配了也不会产出任何东西
+            problems.append("图片类型没有可用的文本转换，这条出站规则不会产出结果")
+
+        reports.append(
+            RuleReport(
+                name=rule.name or "（未命名规则）",
+                trigger=rule.trigger,
+                when=_TRIGGER_WHEN.get(rule.trigger, "未知时机"),
+                actions=list(rule.actions),
+                problems=problems,
+            )
+        )
+    return reports
+
+
+def format_rules(reports: List[RuleReport]) -> str:
+    """人类可读输出。"""
+    if not reports:
+        return "没有配置任何自动化规则（automation.workflows 为空）"
+
+    lines = ["玲珑剪切板 · 自动化规则", ""]
+    for report in reports:
+        mark = "✓" if report.will_run else "✗"
+        lines.append(f"{mark} {report.name}")
+        lines.append(f"    时机：{report.when}")
+        lines.append(f"    动作：{' → '.join(report.actions) or '（无）'}")
+        for problem in report.problems:
+            lines.append(f"    ！{problem}")
+        lines.append("")
+
+    bad = [report for report in reports if not report.will_run]
+    lines.append(f"共 {len(reports)} 条规则，其中 {len(bad)} 条不会生效")
+    if bad:
+        lines.append("不会生效的规则在界面上看不出异常，会静默地什么都不做 —— 按上面的原因修。")
+    return "\n".join(lines)

@@ -123,3 +123,4 @@ def test_unhealthy_report_lists_keys():
     text = config_audit.format_audit(report)
     assert "ui.fake" in text
     assert "✗" in text
+

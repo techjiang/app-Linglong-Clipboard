@@ -173,6 +173,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="审计配置项：找出「声明了但没有读取方」的空转配置（改了不生效的那些）",
     )
+    diagnose.add_argument(
+        "--rules",
+        action="store_true",
+        help="列出自动化规则及其触发时机，并标出不会生效的那些",
+    )
 
     output = parser.add_argument_group("输出")
     output.add_argument("--json", action="store_true", help="以 JSON 输出，便于脚本处理")
@@ -685,6 +690,19 @@ def _run_cli(args: argparse.Namespace) -> int:
         storage.close()
         return 0 if report.healthy else 1
 
+    if args.rules:
+        from .core.automation import AutomationEngine, describe_rules, format_rules
+
+        engine = AutomationEngine()
+        engine.load_from_config(config.get("automation.workflows", []) or [])
+        report = describe_rules(engine.rules())
+        if args.json:
+            print(json.dumps([item.to_dict() for item in report], ensure_ascii=False, indent=2))
+        else:
+            print(format_rules(report))
+        storage.close()
+        return 0 if all(item.will_run for item in report) else 1
+
     if args.import_native_history:
         return _run_native_history_import(args, storage, config)
 
@@ -999,6 +1017,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.where,
             args.selfcheck,
             args.config_audit,
+            args.rules,
         ]
     ):
         return _run_cli(args)

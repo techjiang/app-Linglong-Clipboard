@@ -193,6 +193,13 @@ class MainWindow(QWidget):
 
     copy_requested = Signal(int, bool)  # (item_id, plain_text_only)
     paste_requested = Signal(int)
+    #: 「这条内容要出站了，请按 `trigger = outbound` 的规则加工一次」。
+    #:
+    #: 为什么单开一个信号：同一次「复制」，右键菜单、双击、回车、Ctrl+1..9
+    #: 四条路径的实现此前各写一遍，而**出站加工只在部分路径上生效**
+    #: 是最难查的一类不一致。这里不新增实现，所有出站路径共用
+    #: `copy_requested` 与这个信号，由 Application 按同一份规则加工。
+    outbound_requested = Signal(int, bool)  # (item_id, plain_text_only)
     delete_requested = Signal(int)
     #: 切换固定/收藏：(item_id, 字段名, 目标值)。
     #: 界面只发意图，真正的写入交给 Application —— 写入要顺带记「固定是谁设的」
@@ -528,7 +535,9 @@ class MainWindow(QWidget):
 
         for item in self._items:
             card = ItemCard(item, self._palette_theme, density=self._density)
-            card.double_clicked.connect(lambda item_id: self.copy_requested.emit(item_id, False))
+            card.double_clicked.connect(
+                lambda item_id: self._emit_copy(item_id, plain_text_only=False)
+            )
             card.context_requested.connect(self._show_context_menu)
             self._list_layout.insertWidget(self._list_layout.count() - 1, card)
             if item.id is not None:
@@ -604,11 +613,22 @@ class MainWindow(QWidget):
         if self._items:
             first = self._items[0]
             if first.id is not None:
-                self.copy_requested.emit(first.id, False)
+                self._emit_copy(first.id, plain_text_only=False)
 
     def _copy_selected_plain(self) -> None:
         if self._selected_id is not None:
-            self.copy_requested.emit(self._selected_id, True)
+            self._emit_copy(self._selected_id, plain_text_only=True)
+
+    def _emit_copy(self, item_id: int, *, plain_text_only: bool) -> None:
+        """统一的「复制这一条」出口。
+
+        所有复制路径都从这里走，是为了让出站规则、出站防护、自我写入标记
+        **只有一条实现**。此前右键菜单直接发 `copy_requested`，而浮层走
+        `paste_requested`，两条路会随改动慢慢分叉 —— 用户看到的现象是
+        「同样的操作，有时加工了有时没加工」，且无从判断哪个才对。
+        """
+        self.copy_requested.emit(item_id, plain_text_only)
+        self.outbound_requested.emit(item_id, plain_text_only)
 
     def _delete_selected(self) -> None:
         if self._selected_id is not None:
@@ -634,11 +654,17 @@ class MainWindow(QWidget):
         self._status_label.setText(f"已{'取消' if not new_value else ''}{label}")
         self.reload()
 
+    def _emit_paste(self, item_id: int) -> None:
+        """「直接粘贴到上次的窗口」：同样是出站，同样要过一遍规则。"""
+        self.paste_requested.emit(item_id)
+        self.outbound_requested.emit(item_id, False)
+
     def _paste_nth(self, index: int) -> None:
         if 1 <= index <= len(self._items):
             item = self._items[index - 1]
             if item.id is not None:
                 self.paste_requested.emit(item.id)
+                self.outbound_requested.emit(item.id, False)
 
     # ---- 右键菜单 ----
 
@@ -651,13 +677,13 @@ class MainWindow(QWidget):
         menu = QMenu(self)
 
         copy_action = menu.addAction("复制")
-        copy_action.triggered.connect(lambda: self.copy_requested.emit(item_id, False))
+        copy_action.triggered.connect(lambda: self._emit_copy(item_id, plain_text_only=False))
 
         plain_action = menu.addAction("复制为纯文本")
-        plain_action.triggered.connect(lambda: self.copy_requested.emit(item_id, True))
+        plain_action.triggered.connect(lambda: self._emit_copy(item_id, plain_text_only=True))
 
         paste_action = menu.addAction("直接粘贴到上次的窗口")
-        paste_action.triggered.connect(lambda: self.paste_requested.emit(item_id))
+        paste_action.triggered.connect(lambda: self._emit_paste(item_id))
 
         menu.addSeparator()
 

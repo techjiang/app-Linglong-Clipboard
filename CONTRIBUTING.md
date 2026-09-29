@@ -82,6 +82,43 @@ def _my_transform(text: str, option: str = "default") -> Optional[str]:
 
 同时补 `tests/test_automation.py` 里 `test_builtin_transforms` 的参数化用例。
 
+### 新增规则触发时机
+
+`Rule.trigger` 目前是 `auto` / `outbound` / `manual`。
+加第四种之前先确认它真的不是前三种的组合 —— 每种时机都意味着
+**一个新的调用点**，而调用点就是「配了不生效」最常见的产地。
+
+要加的话，四件事必须一起做：
+
+1. `TRIGGERS` 里加值，并补 `_TRIGGER_WHEN` 的人话说明（用户在界面上要看到
+   「什么时候跑」，光有个英文常量等于没说）
+2. 复用 `actions_for_trigger()`，不要另写一遍执行逻辑
+3. 在 `describe_rules()` 里补这个时机特有的「写了也不会生效」检查
+4. 补一条测试，断言**其余的时机不会被这条规则误触发** ——
+   规则引擎最容易错的地方不是「该跑没跑」，而是「不该跑的时候跑了」
+
+触发方式写错（自造名字）时 `normalize_trigger()` 会落到 `manual` 并记警告，
+同时把原值留在 `raw_trigger` 里。别把这一步省成「直接当 manual」：
+单看 `trigger = manual` 是分不清「用户就要手动」和「用户写错了」的。
+
+### 改动「复制/粘贴」路径
+
+历史里的内容出站（复制、直接粘贴、快速粘贴第 N 条）统一经过
+`Application.apply_outbound_rules()`。界面上有**五条**入口：右键菜单「复制」、
+右键菜单「直接粘贴」、双击、回车 / `Ctrl+C`、`Ctrl+1..9`。
+
+新增入口时不要自己拼 `copy_item()`，走 `MainWindow._emit_copy()` /
+`_emit_paste()` —— 它们同时发 `copy_requested` 与 `outbound_requested`。
+少发后者，这条路径就会绕开出站规则，用户看到的是
+「同样的操作，有时加工了有时没加工」，且无从判断哪个才对。
+`test_window_copy_paths_all_route_through_outbound` 守着这件事。
+
+另外，改动写入剪贴板的内容时留意**自我写入指纹**：它由
+`_mark_own_write()` 与 `QtClipboardAdapter` 两侧共同决定，
+口径必须完全一致（载荷取 `fingerprint_payload()`，类型一律 `text`）。
+不一致的表现不是报错，而是历史里多出一条你自己刚复制的内容 ——
+很容易被当成「采集正常」而放过。
+
 ### 修改判重规则
 
 「两条内容算不算同一条」由 `core/collector.py` 的 `_canonical_payload()`

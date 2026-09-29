@@ -727,3 +727,188 @@ def test_toggle_flag_survives_flag_change_write_failure(app_instance, monkeypatc
     )
     app_instance.toggle_flag(item.id, "pinned", True)
     assert app_instance.storage.get(item.id).pinned is True
+
+
+# ---- 出站规则：复制/粘贴出去时加工 ----
+
+
+def _outbound_rule(name="去跟踪参数", trigger="outbound"):
+    return {
+        "name": name,
+        "kinds": ["link"],
+        "contains": "utm_",
+        "actions": ["url.strip_tracking"],
+        "trigger": trigger,
+    }
+
+
+def _add_link(app_instance, content="https://a.com/p?utm_source=x&id=1", hash_="ol1"):
+    # 剪贴板是整个测试会话共用的（Qt 只允许一个 QApplication），
+    # 上一个用例留下的内容会让「复制后剪贴板里是什么」变成假绿
+    app_instance.qt_app.clipboard().clear()
+    return app_instance.storage.add(
+        ClipboardItem(kind="link", content=content, preview=content, hash=hash_)
+    )
+
+
+def _load_rules(app_instance, rules):
+    app_instance.config.set("automation.workflows", rules, persist=False)
+    app_instance.automation.load_from_config(rules)
+
+
+def test_outbound_rule_rewrites_clipboard(app_instance):
+    """复制前清理跟踪参数：界面配了规则，剪贴板里就必须是清理后的内容。"""
+    _load_rules(app_instance, [_outbound_rule()])
+    item = _add_link(app_instance)
+
+    note = app_instance.apply_outbound_rules(item.id, False)
+
+    assert app_instance.qt_app.clipboard().text() == "https://a.com/p?id=1"
+    assert "去跟踪参数" in note
+
+
+def test_outbound_rule_does_not_touch_history(app_instance):
+    """加工的产物只进剪贴板：历史里留下的必须还是用户原本复制的那条。"""
+    _load_rules(app_instance, [_outbound_rule()])
+    item = _add_link(app_instance)
+
+    app_instance.apply_outbound_rules(item.id, False)
+
+    assert app_instance.storage.get(item.id).content == "https://a.com/p?utm_source=x&id=1"
+    assert app_instance.storage.count() == 1
+
+
+def test_outbound_rule_output_is_marked_as_self_write(app_instance):
+    """加工产物不能被采集线程当成新内容记一遍。
+
+    这里比对的是「标记的指纹」与「读取侧算出的指纹」—— 两边口径差一个字节，
+    历史里就会凭空多出一条内容不同、来源不明的记录。
+    """
+    _load_rules(app_instance, [_outbound_rule()])
+    item = _add_link(app_instance)
+    app_instance.apply_outbound_rules(item.id, False)
+
+    read = app_instance.clipboard.read_clipboard()
+    assert read is not None
+    assert app_instance.monitor._last_hash == read.hash
+
+    app_instance.monitor._poll_once()
+    assert app_instance.storage.count() == 1
+
+
+def test_outbound_mark_uses_text_kind_like_reader(app_instance):
+    """记录类型是 link，写进剪贴板的却是纯文本 —— 指纹必须按 text 算。
+
+    这正是此前自我写入标记长期失效的原因：写的时候用记录自己的类型，
+    读的时候按 text，两边永远对不上。
+    """
+    item = _add_link(app_instance)
+    app_instance.qt_app.clipboard().setText(item.content)
+    app_instance._mark_own_write(item, item.content)
+
+    read = app_instance.clipboard.read_clipboard()
+    assert read is not None
+    assert app_instance.monitor._last_hash == read.hash
+
+
+def test_no_outbound_rule_keeps_clipboard_unchanged(app_instance):
+    item = _add_link(app_instance, content="https://a.com/clean", hash_="ol2")
+    app_instance.copy_item(item.id)
+    assert app_instance.apply_outbound_rules(item.id, False) == ""
+    assert app_instance.qt_app.clipboard().text() == "https://a.com/clean"
+
+
+def test_auto_rule_does_not_apply_on_copy(app_instance):
+    """采集规则写的产物已经进历史了，复制时不该再加工一遍。"""
+    _load_rules(app_instance, [_outbound_rule(trigger="auto")])
+    item = _add_link(app_instance)
+    app_instance.copy_item(item.id)
+
+    assert app_instance.apply_outbound_rules(item.id, False) == ""
+    assert app_instance.qt_app.clipboard().text() == "https://a.com/p?utm_source=x&id=1"
+
+
+def test_outbound_rule_failure_still_copies(app_instance):
+    """规则没跑成也要照原样复制 —— 点「复制」什么都没发生比不加工严重得多。"""
+    _load_rules(
+        app_instance,
+        [{"name": "压缩 JSON", "kinds": ["text"], "actions": ["json.minify"],
+          "trigger": "outbound"}],
+    )
+    app_instance.qt_app.clipboard().clear()
+    item = app_instance.storage.add(
+        ClipboardItem(kind="text", content="不是 JSON", preview="p", hash="oj1")
+    )
+    app_instance.copy_item(item.id)
+
+    note = app_instance.apply_outbound_rules(item.id, False)
+
+    assert app_instance.qt_app.clipboard().text() == "不是 JSON"
+    assert "未生效" in note
+
+
+def test_outbound_rules_ignore_missing_item(app_instance):
+    assert app_instance.apply_outbound_rules(9999, False) == ""
+
+
+def test_window_copy_paths_all_route_through_outbound(app_instance):
+    """四条复制路径必须都发同一个出站信号。
+
+    右键菜单、双击、回车/Ctrl+C、Ctrl+1..9 此前各写一遍，任何一条漏掉都会
+    变成「同样的操作，有时加工了有时没加工」。
+    """
+    received = []
+    app_instance.window.outbound_requested.connect(
+        lambda item_id, plain: received.append((item_id, plain))
+    )
+    item = _add_link(app_instance, hash_="ol9")
+    app_instance.window.reload()
+    app_instance.window._select(item.id)
+
+    app_instance.window._emit_copy(item.id, plain_text_only=True)
+    app_instance.window._emit_paste(item.id)
+
+    assert received == [(item.id, True), (item.id, False)]
+
+
+def test_paste_item_applies_outbound_rule(app_instance, monkeypatch):
+    """「直接粘贴到上次的窗口」也要走规则 —— 它同样是出站。"""
+    _load_rules(app_instance, [_outbound_rule()])
+    item = _add_link(app_instance, hash_="ol10")
+    monkeypatch.setattr(app_instance, "_paste_to_previous_window", lambda: True)
+
+    app_instance.apply_outbound_rules(item.id, False)
+
+    assert app_instance.qt_app.clipboard().text() == "https://a.com/p?id=1"
+
+
+def test_mark_own_write_takes_payload_not_hash(app_instance):
+    """`mark_self_write()` 收的是载荷，不是算好的指纹。
+
+    它内部会拿载荷拼上类型再哈希一次。这里若传了指纹，就会被哈希两遍，
+    标记同样失效 —— 而现象与「口径不一致」一模一样（历史里多一条自己
+    刚复制的内容），排查时极易走进岔路，所以专门守一条。
+    """
+    from linglong_clip.ui.clipboard_qt import clipboard_payload
+
+    item = _add_link(app_instance)
+    app_instance.qt_app.clipboard().setText(item.content)
+    app_instance._mark_own_write(item, item.content)
+
+    import hashlib
+
+    expected = hashlib.blake2b(digest_size=16)
+    expected.update("text".encode("utf-8"))
+    expected.update(b"\x00")
+    expected.update(clipboard_payload(item.content, "").encode("utf-8", "replace"))
+
+    assert app_instance.monitor._last_hash == expected.hexdigest()
+
+
+def test_clipboard_payload_prefers_text_over_html():
+    """有纯文本时用纯文本，没有才退回 HTML —— 与读取侧完全一致。"""
+    from linglong_clip.ui.clipboard_qt import clipboard_payload
+
+    assert clipboard_payload("plain", "<b>rich</b>") == "plain"
+    assert clipboard_payload("", "<b>rich</b>") == "<b>rich</b>"
+    assert clipboard_payload("", "") == ""

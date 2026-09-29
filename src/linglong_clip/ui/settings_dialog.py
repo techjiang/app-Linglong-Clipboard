@@ -848,8 +848,11 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(page)
 
         hint = QLabel(
-            "规则用 JSON 描述。`trigger` 为 `auto` 时会在采集后自动执行转换；\n"
-            "`actions` 可写多个动作，会按顺序链式执行。"
+            "规则用 JSON 描述，`actions` 可写多个动作并按顺序链式执行。\n"
+            "`trigger` 决定什么时候跑：\n"
+            "  · `auto` —— 采集到匹配内容时自动加工，产物成为这条记录的内容；\n"
+            "  · `outbound` —— 复制/粘贴出去时自动加工，产物只进剪贴板，历史里留原始内容；\n"
+            "  · `manual` —— 不自动跑，只在右键菜单「转换为…」里手动选用。"
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -863,7 +866,13 @@ class SettingsDialog(QDialog):
             )
         else:
             self._rules_editor.setPlainText("[]")
+        self._rules_editor.textChanged.connect(self._refresh_rules_state)
         layout.addWidget(self._rules_editor, 1)
+
+        self._rules_state = QLabel()
+        self._rules_state.setWordWrap(True)
+        layout.addWidget(self._rules_state)
+        self._refresh_rules_state()
 
         row = QHBoxLayout()
         template_button = QPushButton("插入示例")
@@ -872,6 +881,62 @@ class SettingsDialog(QDialog):
         row.addStretch(1)
         layout.addLayout(row)
         return page
+
+    def _refresh_rules_state(self) -> None:
+        """边写边校验：把「不会生效的规则」当场指出来。
+
+        为什么要做：规则是纯 JSON，写错一个字不会报错，只会静默地什么都不做。
+        用户以为配好了、实测没反应，而界面上一切正常 —— 这跟本项目反复出现的
+        「声明了但没接上」是同一类毛病，只是这次「没接上」发生在用户自己的配置里。
+        所以校验必须在写的时候发生，而不是等用户去命令行跑 `--rules` 才发现。
+        """
+        import json
+
+        from ..core.automation import describe_rules
+
+        raw = self._rules_editor.toPlainText().strip() or "[]"
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            self._rules_state.setStyleSheet("color:#e5484d")
+            self._rules_state.setText(f"✗ JSON 无法解析：第 {exc.lineno} 行 {exc.msg}")
+            return
+
+        if not isinstance(parsed, list):
+            self._rules_state.setStyleSheet("color:#e5484d")
+            self._rules_state.setText("✗ 规则必须是一个 JSON 数组")
+            return
+
+        if self._automation is None:
+            self._rules_state.setText("")
+            return
+        from ..core.automation import AutomationEngine
+
+        engine = AutomationEngine()
+        engine.load_from_config(parsed)
+        reports = describe_rules(engine.rules())
+        broken = [report for report in reports if not report.will_run]
+
+        auto = sum(1 for report in reports if report.trigger == "auto")
+        outbound = sum(1 for report in reports if report.trigger == "outbound")
+        manual = sum(1 for report in reports if report.trigger == "manual")
+        summary = (
+            f"共 {len(reports)} 条规则：采集时 {auto} 条、复制出去时 {outbound} 条、"
+            f"仅手动 {manual} 条"
+        )
+        if not broken:
+            self._rules_state.setStyleSheet("")
+            self._rules_state.setText("✓ " + summary)
+            return
+
+        # QLabel 不吃 Markdown，逐行写而不是拼一行
+        lines = [
+            f"✗ {summary}，其中 {len(broken)} 条不会生效：",
+        ]
+        for report in broken:
+            lines.append(f"  · {report.name}：{report.problems[0]}")
+        self._rules_state.setStyleSheet("color:#e5a00d")
+        self._rules_state.setText("\n".join(lines))
 
     def _build_storage_group(self) -> QGroupBox:
         """历史存储方式：SQLite 数据库或 .clipboard/clipboard.json。

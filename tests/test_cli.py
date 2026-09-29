@@ -306,7 +306,7 @@ def test_parser_has_all_modes():
     options = {action.dest for action in parser._actions}
     for expected in ("quick", "minimized", "list", "search", "get", "stats", "clear",
                      "compact", "json", "plain", "sync_status", "selfcheck",
-                     "config_audit"):
+                     "config_audit", "rules"):
         assert expected in options
 
 
@@ -1135,3 +1135,75 @@ def test_flag_changes_flags_registered_in_dispatch_table():
     parser = build_parser()
     assert parser.parse_args(["--flag-changes"]).flag_changes is True
     assert parser.parse_args(["--flag-changes-reset"]).flag_changes_reset is True
+
+
+# ---- 自动化规则体检（--rules）----
+
+
+def _write_rules(home, rules):
+    import json
+
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    config.set("automation.workflows", rules, persist=True)
+
+
+def test_rules_reports_healthy(home, capsys):
+    from linglong_clip.__main__ import main
+
+    _write_rules(
+        home,
+        [
+            {"name": "压缩 JSON", "kinds": ["text"], "actions": ["json.minify"],
+             "trigger": "auto"},
+            {"name": "去跟踪参数", "kinds": ["link"], "actions": ["url.strip_tracking"],
+             "trigger": "outbound"},
+        ],
+    )
+    assert main(["--rules"]) == 0
+    out = capsys.readouterr().out
+    assert "去跟踪参数" in out
+    assert "复制/粘贴出去时自动执行" in out
+    assert "其中 0 条不会生效" in out
+
+
+def test_rules_flags_bad_trigger_with_exit_code(home, capsys):
+    """写错的触发方式必须报出来，而不是静默按手动处理。
+
+    这类错误在界面上看不出任何异常，规则只是「什么都不做」——
+    与「规则本来就要手动跑」在界面上完全一样。
+    """
+    from linglong_clip.__main__ import main
+
+    _write_rules(
+        home,
+        [{"name": "写错了", "kinds": ["link"], "actions": ["url.strip_tracking"],
+          "trigger": "paste"}],
+    )
+    assert main(["--rules"]) == 1
+    out = capsys.readouterr().out
+    assert "'paste' 不是有效值" in out
+
+
+def test_rules_json_output(home, capsys):
+    import json as jsonlib
+
+    from linglong_clip.__main__ import main
+
+    _write_rules(
+        home, [{"name": "r", "kinds": ["text"], "actions": ["json.minify"],
+                "trigger": "auto"}]
+    )
+    assert main(["--rules", "--json"]) == 0
+    payload = jsonlib.loads(capsys.readouterr().out)
+    assert payload[0]["name"] == "r"
+    assert payload[0]["will_run"] is True
+    assert "when" in payload[0]
+
+
+def test_rules_empty_is_fine(home, capsys):
+    from linglong_clip.__main__ import main
+
+    assert main(["--rules"]) == 0
+    assert "没有配置任何自动化规则" in capsys.readouterr().out

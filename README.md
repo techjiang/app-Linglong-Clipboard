@@ -33,6 +33,10 @@
 
 ![设置·外观](docs/screenshots/settings-interface.png)
 
+设置页「自动化」—— 每条规则什么时候跑写在上面，不会生效的当场标出来：
+
+![设置·自动化](docs/screenshots/settings-automation.png)
+
 设置页「同步」—— 固定与收藏怎么合、哪些删除已经传出去了，都在这：
 
 ![设置·同步](docs/screenshots/settings-sync-flags.png)
@@ -121,17 +125,50 @@
     "trigger": "auto"
   },
   {
-    "name": "粘贴前清理链接",
+    "name": "复制时清理链接",
     "kinds": ["link"],
     "contains": "utm_",
     "actions": ["url.strip_tracking"],
+    "trigger": "outbound"
+  },
+  {
+    "name": "粘贴前手动转成 Markdown 表格",
+    "kinds": ["text"],
+    "actions": ["csv.table"],
     "trigger": "manual"
   }
 ]
 ```
 
-`trigger` 为 `auto` 时，采集到匹配内容就自动加工；
-`actions` 写多个动作会按顺序链式执行。
+`trigger` 决定规则**什么时候跑**，三选一：
+
+| 取值 | 时机 | 产物去哪 |
+| --- | --- | --- |
+| `auto` | 采集到匹配内容时自动执行 | 成为这条记录的内容（写进历史） |
+| `outbound` | 从历史里复制/粘贴出去时自动执行 | 只进这次的剪贴板，**历史里的原始内容不变** |
+| `manual` | 不自动执行 | 只在右键菜单「转换为…」里手动选用 |
+
+`outbound` 与 `auto` 的分工值得说清：`auto` 改的是**历史里留下的东西**，
+`outbound` 改的是**你即将粘贴出去的东西**。前者适合「复制 JSON 顺手格式化」，
+后者适合「这张链接我粘到聊天窗口前先把 `utm_*` 去掉」——
+历史里仍存着原始链接，想找回来不会因为被加工过而找不到。
+
+所有出站路径都走同一条规则链：右键菜单、双击、回车 / `Ctrl+C`、
+`Ctrl+1..9`、以及「直接粘贴到上次的窗口」。任何一条漏掉都会变成
+「同样的操作，有时加工了有时没加工」，所以实现上只有一处。
+
+`actions` 写多个动作会按顺序链式执行；任一步失败则照原样复制，
+不会把内容变成半成品，也不会让「复制」什么都没发生。
+
+写完想确认规则到底会不会生效，用命令行体检：
+
+```bash
+linglong-clipboard --rules          # 列出每条规则的时机，并标出不会生效的
+linglong-clipboard --rules --json   # 机器可读，退出码 1 表示有规则不会生效
+```
+
+它会查出自造 `trigger` 名、未知 `actions`、拼错的 `kinds`、编译不了的
+正则这些「写错了但不会报错、只会静默什么都不做」的情况。
 
 ### 四、截图里写的字，也能被搜到
 
@@ -729,6 +766,8 @@ linglong-clipboard --selfcheck                # 自检原生能力是否真的�
 linglong-clipboard --selfcheck --json         # 同上，JSON 输出便于回帖
 linglong-clipboard --config-audit             # 找出「改了不生效」的空转配置
 linglong-clipboard --config-audit --json      # 同上，JSON 输出便于回帖
+linglong-clipboard --rules                    # 每条规则什么时候跑、哪条不会生效
+linglong-clipboard --rules --json             # 同上，JSON 输出；退出码 1 表示有规则不会生效
 linglong-clipboard --outbound                 # 复制敏感内容出去时实际生效的防护
 linglong-clipboard --outbound --json          # 同上，JSON 输出便于回帖
 ```
@@ -748,6 +787,11 @@ OCR 一项查的是「真的能识别吗」，而不是「tesseract 在不在 PA
 ~ 截图 OCR：实际使用 eng（期望 jpn）· 已安装：chi_sim、chi_tra、eng、osd
     提示：缺少 jpn 的数据，已回退到 eng。装齐语言包，或在设置页「识别语言」里手动指定已装的
 ```
+
+> `--outbound` 与 `--rules` 里的 `outbound` 是两件事，别混：
+> 前者查的是**隐私防护**（复制敏感内容出去时有什么在保护你），
+> 后者是**自动化规则的触发时机**（复制出去时自动加工内容）。
+> 名字撞车是巧合，字面上都指「出站」这个方向。
 
 `--outbound` 回答的是「我把密钥复制出去之后，到底有什么在保护我」——
 这件事没法靠读代码确认（README 曾写着「系统级安全粘贴标记」，
