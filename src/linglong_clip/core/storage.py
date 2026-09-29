@@ -87,6 +87,8 @@ class Storage:
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        #: 是否已 `close()`。关闭之后再来的调用一律当「空历史」处理，见 `_usable`。
+        self._closed = False
         self.fts_enabled = False
         self.fts_tokenizer = ""
         self._images_dir = self.path.parent / "images"
@@ -156,6 +158,8 @@ class Storage:
 
     def add(self, item: ClipboardItem) -> Optional[ClipboardItem]:
         """插入一条记录。命中「保留固定项」策略时置顶已有项而不是新增。"""
+        if not self._usable():
+            return None
         row = item.to_row()
         columns = ", ".join(row.keys())
         placeholders = ", ".join(f":{key}" for key in row)
@@ -169,6 +173,8 @@ class Storage:
 
     def touch(self, item_id: int) -> None:
         """记录一次使用，用于排序权重。"""
+        if not self._usable():
+            return
         with self._lock:
             self._conn.execute(
                 "UPDATE items SET used_at = ?, use_count = use_count + 1 WHERE id = ?",
@@ -179,7 +185,7 @@ class Storage:
     def update_fields(self, item_id: int, **fields: Any) -> None:
         allowed = {"pinned", "favorite", "sensitive", "tags", "metadata", "kind"}
         payload = {key: value for key, value in fields.items() if key in allowed}
-        if not payload:
+        if not payload or not self._usable():
             return
         import json as _json
 
@@ -198,6 +204,8 @@ class Storage:
             self._conn.commit()
 
     def delete(self, item_id: int) -> None:
+        if not self._usable():
+            return
         with self._lock:
             row = self._conn.execute(
                 "SELECT image_path FROM items WHERE id = ?", (item_id,)
@@ -209,7 +217,7 @@ class Storage:
 
     def delete_many(self, ids: Iterable[int]) -> int:
         ids = list(ids)
-        if not ids:
+        if not ids or not self._usable():
             return 0
         marks = ",".join("?" for _ in ids)
         with self._lock:
@@ -224,6 +232,8 @@ class Storage:
         return cursor.rowcount
 
     def clear(self, keep_pinned: bool = True) -> int:
+        if not self._usable():
+            return 0
         with self._lock:
             if keep_pinned:
                 rows = self._conn.execute(
@@ -248,11 +258,15 @@ class Storage:
     # ---- 查询 ----
 
     def get(self, item_id: int) -> Optional[ClipboardItem]:
+        if not self._usable():
+            return None
         with self._lock:
             row = self._conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
         return ClipboardItem.from_row(row) if row else None
 
     def find_by_hash(self, digest: str) -> Optional[ClipboardItem]:
+        if not self._usable():
+            return None
         with self._lock:
             row = self._conn.execute(
                 f"SELECT * FROM items WHERE hash = ? {_ORDER_SQL} LIMIT 1", (digest,)
@@ -260,6 +274,8 @@ class Storage:
         return ClipboardItem.from_row(row) if row else None
 
     def latest(self) -> Optional[ClipboardItem]:
+        if not self._usable():
+            return None
         with self._lock:
             row = self._conn.execute(
                 "SELECT * FROM items ORDER BY created_at DESC LIMIT 1"
@@ -293,6 +309,8 @@ class Storage:
             clauses.append("created_at >= ?")
             params.append(since)
 
+        if not self._usable():
+            return []
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.extend([limit, offset])
         sql = f"SELECT * FROM items {where} {_ORDER_SQL} LIMIT ? OFFSET ?"
@@ -313,6 +331,8 @@ class Storage:
         FTS 查询串会做转义：把用户输入按 token 拆开并加引号，
         避免 `AND`、`*`、`:` 等 FTS 语法字符引发解析错误。
         """
+        if not self._usable():
+            return []
         query = (query or "").strip()
         if not query:
             return self.list(kind=kind, limit=limit)
@@ -344,6 +364,8 @@ class Storage:
     def _search_like(
         self, query: str, *, kind: Optional[str], limit: int
     ) -> List[ClipboardItem]:
+        if not self._usable():
+            return []
         like = f"%{query}%"
         clauses = ["(content LIKE ? OR preview LIKE ? OR source_app LIKE ? OR tags LIKE ?)"]
         params: List[Any] = [like, like, like, like]
@@ -381,10 +403,14 @@ class Storage:
     # ---- 统计与维护 ----
 
     def count(self) -> int:
+        if not self._usable():
+            return 0
         with self._lock:
             return int(self._conn.execute("SELECT count(*) FROM items").fetchone()[0])
 
     def count_by_kind(self) -> Dict[str, int]:
+        if not self._usable():
+            return {}
         with self._lock:
             rows = self._conn.execute(
                 "SELECT kind, count(*) AS n FROM items GROUP BY kind"
@@ -392,6 +418,8 @@ class Storage:
         return {row["kind"]: int(row["n"]) for row in rows}
 
     def top_sources(self, limit: int = 10) -> List[Tuple[str, int]]:
+        if not self._usable():
+            return []
         with self._lock:
             rows = self._conn.execute(
                 "SELECT source_app, count(*) AS n FROM items "
@@ -413,6 +441,8 @@ class Storage:
         """
         options = options or {}
         changed = 0
+        if not self._usable():
+            return 0
         with self._lock:
             rows = self._conn.execute(
                 "SELECT id, kind, content, files, hash FROM items"
@@ -446,6 +476,8 @@ class Storage:
         变成「被复制了 1 次」——一个高频片段反而排在低频片段后面。
         所以删除前先把重复行的使用次数与最近使用时间折算到保留项上。
         """
+        if not self._usable():
+            return 0
         with self._lock:
             rows = self._conn.execute(
                 "SELECT hash, MIN(id) AS keep_id, COUNT(*) AS total_rows, "
@@ -494,6 +526,8 @@ class Storage:
         把上万条都标为固定就等于上限失效，而用户未必意识到自己绕过了它。
         """
         removed = 0
+        if not self._usable():
+            return 0
         with self._lock:
             if max_days > 0:
                 cutoff = time.time() - max_days * 86400
@@ -529,7 +563,7 @@ class Storage:
 
     def purge_expired_sensitive(self, ttl_seconds: int) -> int:
         """清除超期的敏感记录（不落库内容，直接从历史移除）。"""
-        if ttl_seconds <= 0:
+        if ttl_seconds <= 0 or not self._usable():
             return 0
         cutoff = time.time() - ttl_seconds
         with self._lock:
@@ -540,6 +574,8 @@ class Storage:
             return cursor.rowcount
 
     def set_meta(self, key: str, value: str) -> None:
+        if not self._usable():
+            return
         with self._lock:
             self._conn.execute(
                 "INSERT INTO meta(key, value) VALUES(?, ?) "
@@ -549,11 +585,15 @@ class Storage:
             self._conn.commit()
 
     def get_meta(self, key: str, default: str = "") -> str:
+        if not self._usable():
+            return default
         with self._lock:
             row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return row["value"] if row else default
 
     def optimize(self) -> None:
+        if not self._usable():
+            return
         with self._lock:
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             self._conn.execute("VACUUM")
@@ -561,6 +601,9 @@ class Storage:
 
     def stats(self) -> Dict[str, Any]:
         size = self.path.stat().st_size if self.path.exists() else 0
+        if not self._usable():
+            return {"items": 0, "kinds": {}, "sources": [], "db_size": size,
+                    "fts": False, "tokenizer": "", "closed": True}
         return {
             "items": self.count(),
             "kinds": self.count_by_kind(),
@@ -571,9 +614,28 @@ class Storage:
         }
 
     def close(self) -> None:
+        """关闭连接。可重复调用。"""
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             try:
                 self._conn.commit()
                 self._conn.close()
             except sqlite3.Error:
                 pass
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def _usable(self) -> bool:
+        """连接是否还能用。
+
+        关闭之后仍有调用方找上来是常态，而不是异常：界面上的防抖定时器、
+        采集线程、限时清空任务都可能晚一步。这些调用**不该抛异常** ——
+        它们跑在 Qt 事件循环里，抛出的异常会被 Qt 吞掉，表现是
+        「关窗时终端刷一屏 traceback」或「设置页莫名不刷新」，很难查回这里。
+        所以关闭之后一律按「空历史」回话，与刚建好的空库行为一致。
+        """
+        return not self._closed

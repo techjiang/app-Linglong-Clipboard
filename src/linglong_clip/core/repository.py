@@ -110,6 +110,10 @@ class JsonRepository:
         #: 图片相对路径 -> data URI，用于 `Storage.images_dir` 之外的第二来源
         self._images: Dict[str, str] = {}
         self._dirty = False
+        #: 是否已 `close()`。关闭后再来的写入一律忽略：`close()` 本身会落盘，
+        #: 之后再写只会凭空多出一次文件操作，而持久化任务（限时清空、退出
+        #: 收尾）本来就可能晚一步到达。
+        self._closed = False
         self._load()
 
     # ---- 落盘格式 ----
@@ -244,7 +248,9 @@ class JsonRepository:
         return item
 
     def save(self) -> None:
-        """把内存状态原子地写回文件。"""
+        """把内存状态原子地写回文件。关闭之后不做任何事。"""
+        if self._closed:
+            return
         with self._lock:
             self._write()
 
@@ -283,6 +289,8 @@ class JsonRepository:
             self._images[relative] = uri
 
     def add(self, item: ClipboardItem) -> Optional[ClipboardItem]:
+        if self._closed:
+            return None
         with self._lock:
             if item.id is None or item.id in self._items:
                 item.id = self._next_id
@@ -292,6 +300,8 @@ class JsonRepository:
         return item
 
     def touch(self, item_id: int) -> None:
+        if self._closed:
+            return
         with self._lock:
             item = self._items.get(item_id)
             if item is None:
@@ -303,7 +313,7 @@ class JsonRepository:
     def update_fields(self, item_id: int, **fields: Any) -> None:
         allowed = {"pinned", "favorite", "sensitive", "tags", "metadata", "kind"}
         payload = {key: value for key, value in fields.items() if key in allowed}
-        if not payload:
+        if not payload or self._closed:
             return
         with self._lock:
             item = self._items.get(item_id)
@@ -314,11 +324,15 @@ class JsonRepository:
             self._maybe_save()
 
     def delete(self, item_id: int) -> None:
+        if self._closed:
+            return
         with self._lock:
             if self._items.pop(item_id, None) is not None:
                 self._maybe_save()
 
     def delete_many(self, ids: Iterable[int]) -> int:
+        if self._closed:
+            return 0
         with self._lock:
             removed = 0
             for item_id in list(ids):
@@ -328,6 +342,8 @@ class JsonRepository:
             return removed
 
     def clear(self, keep_pinned: bool = True) -> int:
+        if self._closed:
+            return 0
         with self._lock:
             doomed = [
                 item_id
@@ -603,7 +619,16 @@ class JsonRepository:
         }
 
     def close(self) -> None:
+        """落盘并标记关闭。可重复调用，关闭后再写不再落盘。"""
+        if self._closed:
+            return
         self.save()
+        with self._lock:
+            self._closed = True
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     # ---- 图片 ----
 

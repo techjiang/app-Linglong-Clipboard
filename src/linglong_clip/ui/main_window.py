@@ -236,6 +236,8 @@ class MainWindow(QWidget):
         self._selected_id: Optional[int] = None
         self._filter = "all"
         self._kind_filter: Optional[str] = None
+        #: 已经连出去的对外信号，供 `shutdown` 断开（见 `connect_external`）
+        self._connected_external: List[Any] = []
         # 先定主题再建控件：卡片的类型色条在构造时就要用到色板
         self._palette_theme = palette_for(self._config.get("ui.theme", "system"))
         # 卡片密度：comfortable（三行）/ compact（两行、更矮）
@@ -255,6 +257,33 @@ class MainWindow(QWidget):
         self._build_ui()
         self.setStyleSheet(build_stylesheet(self._palette_theme))
         self.reload()
+
+    def connect_external(self, signal, slot) -> None:
+        """连接一个对外信号，并记下它，供 `shutdown` 断开。
+
+        Application 是窗口对外信号唯一的消费者。走这个入口连接，退出时就能
+        精确断掉「真的连过」的那些 —— 对没有接收者的信号直接 `disconnect()`
+        会在退出时打一串 `RuntimeWarning: Failed to disconnect`。
+        """
+        signal.connect(slot)
+        self._connected_external.append(signal)
+
+    def shutdown(self) -> None:
+        """停止窗口自己的定时器与信号，供销毁前调用。
+
+        主要防的是搜索防抖定时器：`setText` 之后 `textChanged` 会启动一个
+        120ms 单发定时器，若窗口恰在此之前被回收（退出、测试夹具结束），
+        定时器仍会在事件循环里到期并回调 `reload()` —— 而那时 storage
+        多半已经关了。异常抛出点因此落在「事件循环内部」，Qt 只会打一行
+        `Exceptions caught in Qt event loop`，追不到这里。
+
+        断开 storage 相关信号则保证窗口死后没有人再往已关的库里写。
+        """
+        self._search_timer.stop()
+        # 顺手断掉对外信号，避免窗口死后还有人往已关的存储上写
+        for signal in self._connected_external:
+            signal.disconnect()
+        self._connected_external.clear()
 
     # ---- 关闭 ----
 
@@ -481,6 +510,14 @@ class MainWindow(QWidget):
     # ---- 数据加载 ----
 
     def reload(self) -> None:
+        # 存储已关闭时直接返回空列表：关窗/退出过程中仍可能有排队的刷新，
+        # 让它们安静地什么都不做，好过在 Qt 事件循环里抛 sqlite3 异常。
+        if getattr(self._storage, "closed", False):
+            self._items = []
+            self._render_list()
+            self._status_label.setText("无匹配记录")
+            return
+
         query = self._search.text().strip()
         kind = self._kind_filter
         pinned = self._filter == "pinned"

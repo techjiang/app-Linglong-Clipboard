@@ -365,3 +365,51 @@ def test_enforce_limits_default_is_pin_immune(storage):
     storage.enforce_limits(max_items=1)
     remaining = {item.content for item in storage.list(limit=100)}
     assert remaining == {"pinned", "c4"}
+
+
+# ---- 关闭之后 ----
+
+def test_close_is_idempotent(storage):
+    """`close()` 可能被退出路径与测试夹具各调一次，第二次不该报错。"""
+    storage.close()
+    storage.close()
+    assert storage.closed is True
+
+
+def test_queries_after_close_return_empty_instead_of_raising(storage):
+    """关闭后仍有调用方找上来是常态，不能抛异常。
+
+    防抖定时器、采集线程、限时清空任务都可能晚一步。异常跑在 Qt 事件循环里
+    会被吞成一行 `Exceptions caught in Qt event loop`，很难追回这里。
+    """
+    _add(storage, content="hello", hash="h1")
+    storage.close()
+
+    assert storage.list(limit=10) == []
+    assert storage.search("hello") == []
+    assert storage.get(1) is None
+    assert storage.find_by_hash("h1") is None
+    assert storage.latest() is None
+    assert storage.count() == 0
+    assert storage.count_by_kind() == {}
+    assert storage.top_sources() == []
+    assert storage.stats()["closed"] is True
+    assert storage.get_meta("nope", "fallback") == "fallback"
+
+
+def test_writes_after_close_are_ignored(storage):
+    """关闭后的写入一律忽略，而不是写进一个已关闭的连接。"""
+    storage.close()
+
+    assert storage.add(ClipboardItem(kind="text", content="x", preview="x", hash="h")) is None
+    storage.touch(1)
+    storage.update_fields(1, pinned=True)
+    storage.delete(1)
+    assert storage.delete_many([1, 2]) == 0
+    assert storage.clear() == 0
+    assert storage.dedupe() == 0
+    assert storage.recanonicalize() == 0
+    assert storage.enforce_limits(max_items=1) == 0
+    assert storage.purge_expired_sensitive(ttl_seconds=60) == 0
+    storage.set_meta("k", "v")
+    storage.optimize()

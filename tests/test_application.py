@@ -912,3 +912,32 @@ def test_clipboard_payload_prefers_text_over_html():
     assert clipboard_payload("plain", "<b>rich</b>") == "plain"
     assert clipboard_payload("", "<b>rich</b>") == "<b>rich</b>"
     assert clipboard_payload("", "") == ""
+
+
+def test_quit_stops_window_timers_before_closing_storage(app_instance):
+    """退出时先停窗口定时器、再关存储，顺序不能反。
+
+    搜索防抖定时器可能已经排上队；它落在已关闭的存储上时会从 Qt 事件循环里
+    抛 `sqlite3.ProgrammingError`，而 Qt 只会打一行
+    `Exceptions caught in Qt event loop`，追不到源头。
+    """
+    window = app_instance.window
+    window._search.setText("会议纪要")
+    assert window._search_timer.isActive()
+
+    app_instance.quit()
+
+    assert not window._search_timer.isActive()
+    assert app_instance.storage.closed is True
+
+
+def test_quit_does_not_leave_window_signals_connected(app_instance):
+    """退出后窗口信号应已断开，避免死后还有人往已关的库上写。"""
+    window = app_instance.window
+    assert window._connected_external  # 装配后确实连过
+
+    app_instance.quit()
+
+    assert window._connected_external == []
+    window.reload()  # 不该抛异常
+    assert window._items == []

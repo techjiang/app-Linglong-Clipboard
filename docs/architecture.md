@@ -255,6 +255,34 @@ items_fts(content, preview, source_app, tags)   -- external content 表
 - **并发**：单把 `RLock` 保住「读-改-写」，因为每次写都基于内存态整体重写，
   分片锁换不来收益。
 
+### 关闭之后的行为（两个后端一致）
+
+`close()` 之后仍有调用方找上来是**常态**，不是异常：界面的搜索防抖定时器、
+采集线程、限时清空任务都可能晚一步到达。这些调用跑在 Qt 事件循环里，
+抛出的异常会被 Qt 吞成一行 `Exceptions caught in Qt event loop`，
+表现是「关窗时刷一屏 traceback」或「设置页莫名不刷新」，很难追回源头。
+
+所以两个后端的约定是：
+
+| 调用 | 关闭后的行为 |
+| --- | --- |
+| 查询（`list`/`search`/`get`/`count`/`stats`…） | 返回空结果，形状与空库一致 |
+| 写入（`add`/`touch`/`update_fields`/`delete`…） | 静默忽略 |
+| `close()` | 幂等，重复调用直接返回 |
+| `closed` | 只读属性，界面据此跳过刷新 |
+
+排查这类问题靠 `closed` 这个属性：它把「存储还能不能用」变成一次普通判断，
+而不是等异常从事件循环里冒出来。
+
+窗口侧配套两件事（`main_window.py`）：
+
+- `shutdown()` 停掉搜索防抖定时器，并断开对外信号 —— 定时器到期时窗口
+  可能已经回收，而那时存储多半也关了
+- `reload()` 先看 `storage.closed`，关了就只清空列表，不发起查询
+
+`Application.quit()` 在 `storage.close()` **之前**调 `window.shutdown()`，
+顺序不能反。
+
 ### 内容归一（判重的前置步骤）
 
 「相同内容只保留一条」需要一个判据，而这个判据不能是原始字节。

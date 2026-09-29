@@ -495,3 +495,48 @@ def test_kind_colors_cover_all_kinds():
 
     for kind in KIND_LABELS:
         assert kind in KIND_COLORS
+
+
+def test_window_shutdown_stops_search_debounce(window, storage):
+    """销毁窗口前停掉搜索防抖定时器。
+
+    这条守的是一个真实缺陷：`setText` 会启动 120ms 单发定时器，若窗口
+    在这之前被回收（退出、测试夹具结束），定时器仍会在事件循环里到期并
+    回调 `reload()` —— 而那时 storage 多半已经关了。异常从事件循环里抛出，
+    Qt 只会打一行 `Exceptions caught in Qt event loop`，追不到源头。
+    """
+    window._search.setText("会议纪要")
+    assert window._search_timer.isActive()
+
+    window.shutdown()
+    assert not window._search_timer.isActive()
+
+
+def test_window_reload_after_storage_close_is_noop(window, storage, seeded):
+    """存储关闭后窗口的刷新不该抛异常，只显示空列表。"""
+    window.reload()
+    assert len(window._items) == 5
+
+    storage.close()
+    window.reload()
+
+    assert window._items == []
+    assert window._cards == {}
+    assert window._status_label.text() == "无匹配记录"
+
+
+def test_window_reload_after_shutdown_does_not_touch_storage(storage, config, qt_app):
+    """「窗口已回收、定时器才到期」这条路径必须安静收场。
+
+    这是上面两条合起来的效果：定时器不再回调，即使回调也被存储层挡住。
+    """
+    from linglong_clip.ui.main_window import MainWindow
+
+    window = MainWindow(storage, config, SemanticEngine(storage))
+    window._search.setText("上周的截图")
+    window.shutdown()
+    storage.close()
+
+    # 定时器即使被强行触发（模拟事件循环晚一步），也不该炸
+    window._search_timer.timeout.emit()
+    assert window._items == []

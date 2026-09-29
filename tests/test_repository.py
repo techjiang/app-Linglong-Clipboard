@@ -591,3 +591,32 @@ def test_enforce_limits_default_is_pin_immune(repo):
 
     repo.enforce_limits(max_items=1)
     assert {item.content for item in repo.list(limit=100)} == {"pinned", "c4"}
+
+
+# ---- 关闭之后 ----
+
+def test_close_is_idempotent(repo, tmp_path):
+    """`close()` 会落盘；重复调用不该把文件再写一遍或报错。"""
+    repo.add(ClipboardItem(kind="text", content="hello", preview="hello", hash="h"))
+    repo.close()
+    stamp = repo.path.stat().st_mtime_ns
+    repo.close()
+    repo.close()
+    assert repo.closed is True
+    assert repo.path.stat().st_mtime_ns == stamp
+
+
+def test_writes_after_close_do_not_touch_disk(repo):
+    """关闭后再来的写入一律忽略。
+
+    持久化任务（限时清空、退出收尾）本来就可能晚一步到达，
+    让它们安静地什么都不做，好过对着一个已经落过盘的对象再写一次。
+    """
+    repo.add(ClipboardItem(kind="text", content="hello", preview="hello", hash="h"))
+    repo.close()
+    before = repo.path.read_text(encoding="utf-8")
+
+    repo.add(ClipboardItem(kind="text", content="late", preview="late", hash="h2"))
+    repo.delete(1)
+    repo.save()
+    assert repo.path.read_text(encoding="utf-8") == before

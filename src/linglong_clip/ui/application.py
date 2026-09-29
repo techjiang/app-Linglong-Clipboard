@@ -367,15 +367,17 @@ class Application(QObject):
     def _wire_signals(self) -> None:
         self.item_captured.connect(self._on_captured_ui)
 
-        self.window.close_requested.connect(self._on_window_close_requested)
-        self.window.copy_requested.connect(self.copy_item)
-        self.window.outbound_requested.connect(self.apply_outbound_rules)
-        self.window.paste_requested.connect(self.paste_item)
-        self.window.delete_requested.connect(self.delete_item)
-        self.window.flag_toggled.connect(self.toggle_flag)
-        self.window.clear_requested.connect(self.clear_unpinned)
-        self.window.compact_requested.connect(self.compact_storage)
-        self.window.transform_ready.connect(self._show_transform)
+        # 走 `connect_external`：它会记下这些连接，退出时窗口能干净地断开。
+        window = self.window
+        window.connect_external(window.close_requested, self._on_window_close_requested)
+        window.connect_external(window.copy_requested, self.copy_item)
+        window.connect_external(window.outbound_requested, self.apply_outbound_rules)
+        window.connect_external(window.paste_requested, self.paste_item)
+        window.connect_external(window.delete_requested, self.delete_item)
+        window.connect_external(window.flag_toggled, self.toggle_flag)
+        window.connect_external(window.clear_requested, self.clear_unpinned)
+        window.connect_external(window.compact_requested, self.compact_storage)
+        window.transform_ready.connect(self._show_transform)
         self.preview.item_chosen.connect(self._on_quick_chosen)
         self.preview.closed.connect(self._on_preview_closed)
         self.transformer.copy_result.connect(self.copy_text)
@@ -615,6 +617,9 @@ class Application(QObject):
         self.hotkeys.unregister_all()
         self._sync_timer.stop()
         self._sweep_timer.stop()
+        # 先停窗口自己的定时器再关库：搜索防抖定时器可能已经排上队，
+        # 让它落在已关闭的存储上会从事件循环里抛 sqlite3 异常。
+        self.window.shutdown()
         # 取消待执行的限时清空：进程都要退了，再清一次剪贴板没有意义，
         # 反而可能打断用户刚复制的内容。
         self.releaser.cancel_all()

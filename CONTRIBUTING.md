@@ -21,6 +21,24 @@ sudo apt-get install -y libegl1 libglib2.0-0 libxkbcommon-x11-0 libdbus-1-3
 | `ui/`、`core/` 里不出现 `sys.platform` 判断 | 平台差异必须收敛在 `platform/` |
 | `ui/` 不直接读写数据库 | 界面通过信号发意图，由 `Application` 统一处理 |
 | 历史仓库通过 `core/repository.py` 的 `open_repository()` 获取 | 存储有 SQLite 与 JSON 两种后端，调用方不该到处判分支 |
+| 新增的存储方法在 `close()` 之后必须安全返回 | 见下方「关闭之后仍有调用方」 |
+
+### 关闭之后仍有调用方
+
+`close()` 之后再来调用是**常态**，不是异常：搜索防抖定时器、采集线程、
+限时清空任务都可能晚一步。这些代码跑在 Qt 事件循环里，抛出的异常会被
+Qt 吞成一行 `Exceptions caught in Qt event loop`，很难定位。
+
+所以新增存储方法时：
+
+- 查询方法开头判 `if not self._usable(): return <空值>`
+- 写入方法开头同样判，直接 `return` / `return 0`
+- 空值的**形状**要与空库一致（`list` 返 `[]`、`count` 返 `0`、`get` 返 `None`）
+
+窗口侧的新定时器同样要在 `MainWindow.shutdown()` 里停掉；
+新增的对外信号加进 `_external_signals`，并用
+`window.connect_external(signal, slot)` 连接（直接 `connect` 会让
+退出时的 `disconnect()` 打一串 `RuntimeWarning`）。
 
 ### 新增原生能力
 
