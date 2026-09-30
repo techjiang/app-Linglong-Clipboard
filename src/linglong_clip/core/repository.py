@@ -310,7 +310,19 @@ class JsonRepository:
             item.use_count += 1
             self._maybe_save()
 
-    def update_fields(self, item_id: int, **fields: Any) -> None:
+    def update_fields(
+        self,
+        item_id: int,
+        *,
+        merge_metadata: bool = True,
+        **fields: Any,
+    ) -> None:
+        """更新指定字段，`metadata` 默认按键合并（语义与 `Storage` 一致）。
+
+        两个后端必须逐条对齐，否则「同一个动作在 SQLite 下不丢字段、
+        在 JSON 下丢字段」，而用户只是换了个存储方式就踩到 —— 这类
+        只在其中一个后端出现的不一致，是最难被发现的一种。
+        """
         allowed = {"pinned", "favorite", "sensitive", "tags", "metadata", "kind"}
         payload = {key: value for key, value in fields.items() if key in allowed}
         if not payload or self._closed:
@@ -319,6 +331,15 @@ class JsonRepository:
             item = self._items.get(item_id)
             if item is None:
                 return
+            if merge_metadata and isinstance(payload.get("metadata"), dict):
+                merged = dict(item.metadata)
+                for key, value in payload["metadata"].items():
+                    # 值为 None 表示「删掉这个键」，语义与 `Storage` 一致
+                    if value is None:
+                        merged.pop(key, None)
+                    else:
+                        merged[key] = value
+                payload["metadata"] = merged
             for key, value in payload.items():
                 setattr(item, key, value)
             self._maybe_save()

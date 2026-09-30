@@ -703,16 +703,14 @@ class FolderSync:
             and merged.pinned_by == existing.pinned_by
         ):
             return False
-        metadata = dict(existing.metadata)
-        if merged.pinned and merged.pinned_by:
-            metadata[PINNED_BY_KEY] = merged.pinned_by
-        else:
-            metadata.pop(PINNED_BY_KEY, None)
+        # `update_fields` 的 `metadata` 是**合并补丁**：传 `None` 表示删掉该键。
+        # 这里不能传整份拷出来的字典 —— 合并语义下那样做既删不掉旧键，
+        # 又会让「本来只想改 pinned_by」变成一次全量覆盖。
         self._storage.update_fields(
             existing.id,
             pinned=merged.pinned,
             favorite=merged.favorite,
-            metadata=metadata,
+            metadata=_pinned_by_patch(merged),
         )
         if seen_local is not None:
             seen_local.add(target_hash)
@@ -939,21 +937,29 @@ def apply_flags(
     ):
         return False
 
-    metadata = dict(existing.metadata)
-    if merged.pinned and merged.pinned_by:
-        metadata[PINNED_BY_KEY] = merged.pinned_by
-    else:
-        # 没有固定标记时不留来源，避免旧来源在后续取消/重设之间串味
-        metadata.pop(PINNED_BY_KEY, None)
     storage.update_fields(
         existing.id,
         pinned=merged.pinned,
         favorite=merged.favorite,
-        metadata=metadata,
+        metadata=_pinned_by_patch(merged),
     )
     if seen_local is not None:
         seen_local.add(record.hash)
     return True
+
+
+def _pinned_by_patch(merged: FlagSnapshot) -> dict:
+    """算出 `pinned_by` 这一个键该怎么改，作为 `metadata` 合并补丁。
+
+    两条规则：
+
+    - 有固定标记且来源已知 → 写成来源设备名（删除传播要据此判断固定是否已过期）
+    - 其余情况 → 传 `None` 删掉这个键。没有固定标记时不留来源，
+      避免旧来源在后续取消/重设之间串味。
+    """
+    if merged.pinned and merged.pinned_by:
+        return {PINNED_BY_KEY: merged.pinned_by}
+    return {PINNED_BY_KEY: None}
 
 
 def _resolved_flags(flag_changes: FlagChangeStore, digest: str) -> Optional[FlagSnapshot]:

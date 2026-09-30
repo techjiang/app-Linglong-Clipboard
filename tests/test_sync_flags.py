@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from linglong_clip.core.models import ClipboardItem, content_hash
+from linglong_clip.core.models import PINNED_BY_KEY, ClipboardItem, content_hash
 from linglong_clip.core.storage import Storage
 from linglong_clip.core.flag_changes import (
     FLAG_FAVORITE,
@@ -701,8 +701,17 @@ def test_unpin_clears_origin(tmp_path):
     a.update_fields(item.id, pinned=True, metadata={"pinned_by": "b"})
     assert a.find_by_hash(digest).pinned_by == "b"
 
-    a.update_fields(item.id, pinned=False, metadata={})
+    # `metadata` 现在是按键合并：`{}` 是「一个键都不改」，不是「清空 metadata」。
+    # 要删掉某个键得显式传 `None` —— 合并语义下，「传一份少了这个键的字典」
+    # 与「没提到这个键」在形状上无法区分，只能另立一个约定。
+    a.update_fields(item.id, pinned=False, metadata={PINNED_BY_KEY: None})
     assert a.find_by_hash(digest).pinned_by == ""
+
+    # 反过来说，只写无关的键不该把来源抹掉 —— 这正是合并要解决的丢失问题
+    a.update_fields(item.id, pinned=True, metadata={"pinned_by": "b"})
+    a.update_fields(item.id, metadata={"last_source": "code"})
+    again = a.find_by_hash(digest)
+    assert again.pinned_by == "b" and again.metadata["last_source"] == "code"
 
 
 def test_pinned_by_survives_json_roundtrip():
@@ -864,7 +873,7 @@ def test_cancel_propagates_when_only_source_device_acted(tmp_path):
     assert b.find_by_hash(digest).pinned is True
 
     # 用户在 A 上取消固定
-    a.update_fields(item.id, pinned=False)
+    a.update_fields(item.id, pinned=False, metadata={PINNED_BY_KEY: None})
     changes_a.record(digest, FLAG_PINNED, False, at=2000.0)
 
     sync_a.export()
@@ -888,12 +897,12 @@ def test_cancel_clears_origin_device(tmp_path):
 
     changes_a.record(digest, FLAG_PINNED, True, at=1000.0)
     item = a.find_by_hash(digest)
-    a.update_fields(item.id, pinned=True, metadata={})
+    a.update_fields(item.id, pinned=True, metadata={"pinned_by": "a"})
     sync_a.export()
     sync_b.import_all()
     assert b.find_by_hash(digest).pinned is True
 
-    a.update_fields(item.id, pinned=False)
+    a.update_fields(item.id, pinned=False, metadata={PINNED_BY_KEY: None})
     changes_a.record(digest, FLAG_PINNED, False, at=2000.0)
     sync_a.export()
     sync_b.import_all()
@@ -948,7 +957,7 @@ def test_cancel_is_idempotent_across_rounds(tmp_path):
     sync_a.export()
     sync_b.import_all()
 
-    a.update_fields(item.id, pinned=False)
+    a.update_fields(item.id, pinned=False, metadata={PINNED_BY_KEY: None})
     changes_a.record(digest, FLAG_PINNED, False, at=2000.0)
     sync_a.export()
     sync_b.import_all()
@@ -1000,7 +1009,7 @@ def test_flag_change_survives_encrypted_sync(tmp_path):
     sync_b.import_all()
     assert b.find_by_hash(digest).pinned is True
 
-    a.update_fields(item.id, pinned=False)
+    a.update_fields(item.id, pinned=False, metadata={PINNED_BY_KEY: None})
     changes_a.record(digest, FLAG_PINNED, False, at=2000.0)
     sync_a.export()
     sync_b.import_all()
@@ -1037,7 +1046,7 @@ def test_flag_changes_work_on_json_backend(tmp_path):
     assert b.find_by_hash(digest).pinned is True
 
     item = a.find_by_hash(digest)
-    a.update_fields(item.id, pinned=False)
+    a.update_fields(item.id, pinned=False, metadata={PINNED_BY_KEY: None})
     changes_a.record(digest, FLAG_PINNED, False, at=2000.0)
     sync_a.export()
     sync_b.import_all()

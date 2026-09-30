@@ -182,12 +182,39 @@ class Storage:
             )
             self._conn.commit()
 
-    def update_fields(self, item_id: int, **fields: Any) -> None:
+    def update_fields(
+        self,
+        item_id: int,
+        *,
+        merge_metadata: bool = True,
+        **fields: Any,
+    ) -> None:
+        """更新指定字段。
+
+        `metadata` 默认按**键合并**而不是整体替换。原因是它是个「共享的信封」：
+        采集路径往里写 `last_source`、表单取回往里写 `formats` / `text_bytes`、
+        同步往里写 `pinned_by`，各自只关心自己那一个键。整体替换意味着
+        「每多一个写方，其它写方的键就开始轮流消失」—— 而这种丢失是静默的：
+        没有报错、界面照常、只有等到某天发现某个字段莫名其妙没了。
+        """
         allowed = {"pinned", "favorite", "sensitive", "tags", "metadata", "kind"}
         payload = {key: value for key, value in fields.items() if key in allowed}
         if not payload or not self._usable():
             return
         import json as _json
+
+        if merge_metadata and isinstance(payload.get("metadata"), dict):
+            current = self.get(item_id)
+            merged = dict(current.metadata) if current is not None else {}
+            for key, value in payload["metadata"].items():
+                # 值为 None 表示「删掉这个键」。没有这条约定的话，
+                # `pinned_by` 这类字段一旦写上就再也清不掉 —— 而合并语义
+                # 又禁止调用方「传一份少了某个键的字典」来表达删除。
+                if value is None:
+                    merged.pop(key, None)
+                else:
+                    merged[key] = value
+            payload["metadata"] = merged
 
         normalized = {
             key: _json.dumps(value, ensure_ascii=False)

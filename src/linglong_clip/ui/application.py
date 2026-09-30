@@ -378,6 +378,7 @@ class Application(QObject):
         window.connect_external(window.clear_requested, self.clear_unpinned)
         window.connect_external(window.compact_requested, self.compact_storage)
         window.transform_ready.connect(self._show_transform)
+        window.form_ready.connect(self.copy_form)
         self.preview.item_chosen.connect(self._on_quick_chosen)
         self.preview.closed.connect(self._on_preview_closed)
         self.transformer.copy_result.connect(self.copy_text)
@@ -785,6 +786,33 @@ class Application(QObject):
         note = self._schedule_outbound_release(plan, text, "text")
         self.window.notify(f"已复制转换结果{note}")
 
+    def copy_form(self, item: ClipboardItem, form_key: str, text: str) -> None:
+        """把「取用某种形式」得到的内容写进剪贴板。
+
+        刻意和 `copy_text` 共用一条路径而不是各写一份：出站脱敏、敏感内容的
+        系统排除标记、限时清空、`_mark_own_write` 这四件事任何一处漏掉都会
+        变成「同样是从历史里取东西出去，有时防护了有时没防护」。
+        形式只是换了个取法，出去的还是记录里的内容，防护一条都不能少。
+
+        `_mark_own_write` 尤其重要：取用的内容通常与历史里那条**不一样**
+        （比如取 HTML 而记录里存的是纯文本），不当成「自己写的」就会立刻
+        被采集线程当成新内容记一遍，历史里凭空多出一条。
+        """
+        from ..core.clipboard_formats import FORMAT_ACTIONS
+
+        label = next(
+            (action.label for action in FORMAT_ACTIONS if action.key == form_key),
+            form_key,
+        )
+        plan = plan_outbound(
+            sensitive=self.guard.inspect(ClipboardItem(kind="text", content=text)).sensitive,
+            auto_clear_seconds=self._auto_clear_seconds(),
+        )
+        self.clipboard.set_text(text, exclude_from_history=plan.exclude_from_history)
+        self._mark_own_write(None, text)
+        note = self._schedule_outbound_release(plan, text, item.kind)
+        self.window.notify(f"已取用「{label}」{note}")
+
     def _mark_own_write(self, item: Optional[ClipboardItem], text: str) -> None:
         """告诉采集线程「剪贴板里这份是我们自己写的」，别又记一遍。
 
@@ -918,12 +946,16 @@ class Application(QObject):
         if item is None:
             return
 
-        metadata = dict(item.metadata)
+        metadata: dict = {}
         if field == "pinned":
             # 本机用户刚刚做了决定：固定就是本机设的，来源清空。
             # 空来源在 `pin_is_stale` 里表示「本机的意图」，永远不判为过期；
             # 写对端设备名反而会让本机的固定被误判成别的设备的残留。
-            metadata.pop(PINNED_BY_KEY, None)
+            #
+            # 这里写的是**合并补丁**而不是整份 `metadata`：`update_fields` 的
+            # `metadata` 按键合并，`None` 才表示「删掉这个键」。若照原样传整份
+            # 拷出来的字典，删除动作根本不会生效 —— 合并结果仍是那个旧值。
+            metadata[PINNED_BY_KEY] = None
         self.storage.update_fields(
             item_id,
             metadata=metadata,
