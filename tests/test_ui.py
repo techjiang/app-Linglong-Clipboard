@@ -540,3 +540,157 @@ def test_window_reload_after_shutdown_does_not_touch_storage(storage, config, qt
     # 定时器即使被强行触发（模拟事件循环晚一步），也不该炸
     window._search_timer.timeout.emit()
     assert window._items == []
+
+
+# ---- 采集时收下各种形式、复制时摆回去 ----
+
+
+def _set_clipboard_with_formats(qt_app, *, html, text, raw=None, extra=None):
+    from PySide6.QtCore import QByteArray, QMimeData
+
+    mime = QMimeData()
+    mime.setHtml(html)
+    mime.setText(text)
+    mime.setData("text/plain", QByteArray((raw if raw is not None else text).encode("utf-8")))
+    for name, value in (extra or {}).items():
+        mime.setData(name, QByteArray(value.encode("utf-8")))
+    qt_app.clipboard().setMimeData(mime)
+    return mime
+
+
+def test_adapter_collects_html_form(adapter, qt_app):
+    _set_clipboard_with_formats(
+        qt_app, html='<p>看这个 <a href="https://cnb.cool/x">链接</a></p>', text="看这个 链接"
+    )
+    item = adapter.read_clipboard()
+    stored = item.metadata["formats"]["data"]
+    assert "https://cnb.cool/x" in stored["text/html"]
+
+
+def test_adapter_keeps_exact_text_bytes(adapter, qt_app):
+    """块级复制最常见的毛病：末尾那个换行被 Qt 吃掉了。"""
+    _set_clipboard_with_formats(qt_app, html="<p>abc</p>", text="abc", raw="abc\n")
+    from linglong_clip.ui.clipboard_qt import decode_text_bytes
+
+    item = adapter.read_clipboard()
+    assert decode_text_bytes(item.metadata["text_bytes"]) == "abc\n"
+
+
+def test_adapter_bytes_check_is_strict_not_prefix(adapter, qt_app):
+    """「前缀撞上」不算一致：字节与文本差一点点也不该存。
+
+    只做前缀比较的话，某些平台下 `mime.text()` 拿到的是另一份内容
+    （比如应用把摘要贴在纯文本开头），前缀恰好相同就把不一致存进去了，
+    之后每一次粘贴都会带着这份不一致走出去。
+    """
+    from linglong_clip.ui.clipboard_qt import _without_trailing_newlines
+
+    assert _without_trailing_newlines("abc") != _without_trailing_newlines("abd")
+
+    # 行尾之外完全相同才算一致（`\n` 与 `\r\n` 视为同一份内容的不同行尾写法）
+    _set_clipboard_with_formats(qt_app, html="", text="abc", raw="abc\r\n")
+    item = adapter.read_clipboard()
+    assert "text_bytes" in item.metadata
+
+
+def test_adapter_ignores_qt_internal_formats(adapter, qt_app):
+    _set_clipboard_with_formats(
+        qt_app,
+        html="",
+        text="x",
+        extra={"application/x-qt-windows-mime;value=\"Foo\"": "y"},
+    )
+    item = adapter.read_clipboard()
+    names = (item.metadata.get("formats") or {}).get("names", [])
+    assert not any(name.startswith("application/x-qt-") for name in names)
+
+
+def test_write_item_restores_html_and_exact_bytes(adapter, qt_app):
+    """采集到写回，HTML 与精确字节都要回到剪贴板上。"""
+    _set_clipboard_with_formats(
+        qt_app, html='<p>看这个 <a href="https://cnb.cool/x">链接</a></p>', text="看这个 链接", raw="看这个 链接\n"
+    )
+    item = adapter.read_clipboard()
+    qt_app.clipboard().clear()
+
+    assert adapter.write_item(item) is True
+    mime = qt_app.clipboard().mimeData()
+    assert mime.hasHtml() is True
+    assert "https://cnb.cool/x" in mime.html()
+    assert bytes(mime.data("text/plain")).decode("utf-8") == "看这个 链接\n"
+
+
+def test_write_item_plain_only_skips_stored_formats(adapter, qt_app):
+    """`plain_text_only` 的语义就是「只要干净的一行文本」，不摆回 HTML。"""
+    _set_clipboard_with_formats(qt_app, html="<b>x</b>", text="x")
+    item = adapter.read_clipboard()
+    qt_app.clipboard().clear()
+
+    adapter.write_item(item, plain_text_only=True)
+    mime = qt_app.clipboard().mimeData()
+    assert mime.hasHtml() is False
+
+
+def test_write_item_without_formats_still_works(adapter, qt_app):
+    """升级前采集的记录没有 formats 字段，写回路径不能因此坏掉。"""
+    item = ClipboardItem(kind="text", content="老记录", html="")
+    qt_app.clipboard().clear()
+    assert adapter.write_item(item) is True
+    assert qt_app.clipboard().text() == "老记录"
+
+
+def test_copy_form_marks_own_write(qt_app, home, monkeypatch):
+    """取用一种形式写出去之后，采集线程不能把它当成新内容记一遍。
+
+    取到的内容通常与历史里那条**不一样**（取 HTML 而记录存的是纯文本），
+    不当成「自己写的」就会立刻多出一条记录。
+    """
+    from linglong_clip.ui.application import Application
+
+    monkeypatch.setenv("LINGLONG_CLIPBOARD_HOME", str(home))
+    app = Application(["test"])
+    item = app.storage.add(
+        ClipboardItem(
+            kind="text",
+            content="看这个 链接",
+            preview="看这个 链接",
+            hash=content_hash("text", "form-seed"),
+            metadata={"formats": {"data": {"text/html": '<p>看这个 <a href="u">链接</a></p>'}}},
+        )
+    )
+    before = app.storage.count()
+    payload = '<p>看这个 <a href="u">链接</a></p>'
+
+    app.copy_form(app.storage.get(item.id), "html", payload)
+
+    assert qt_app.clipboard().text() == payload
+    # 只该标记「这份是自己写的」，不该往历史里塞新行
+    assert app.storage.count() == before
+    assert app.monitor._last_hash == content_hash("text", payload)
+    app.monitor.stop()
+    app.storage.close()
+
+
+def test_preview_lists_other_forms(qt_app, home):
+    """预览面板要把「还有哪些形式」写出来，否则右键那两项像是凭空冒出来的。"""
+    from linglong_clip.core.semantic import SemanticEngine
+
+    from linglong_clip.core.storage import Storage
+    from linglong_clip.ui.main_window import MainWindow
+    from linglong_clip.utils.config import Config
+
+    storage = Storage(home / "history.db")
+    item = storage.add(
+        ClipboardItem(
+            kind="text",
+            content="看这个 链接",
+            preview="看这个 链接",
+            hash=content_hash("text", "preview-seed"),
+            metadata={"formats": {"data": {"text/html": '<p>看这个 <a href="u">链接</a></p>'}}},
+        )
+    )
+    window = MainWindow(storage, Config(home / "c.json"), SemanticEngine(storage))
+    window._preview.show_item(storage.get(item.id))
+    assert "text/html" in window._preview._meta.text()
+    window.shutdown()
+    storage.close()

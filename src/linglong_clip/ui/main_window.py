@@ -137,6 +137,12 @@ class PreviewPanel(QFrame):
             parts.append(" ".join(f"#{tag}" for tag in item.tags[:5]))
         if item.device:
             parts.append(f"来自 {item.device}")
+        # 「这条记录还能以什么形式取出来」直接写在预览标题下：
+        # 用户点右键之前就该知道里面有 HTML ／ 原始字节 可用，
+        # 否则那两条右键菜单项看起来像是凭空冒出来的。
+        summary = self._formats_summary(item)
+        if summary:
+            parts.append(f"其它形式：{summary}")
         self._meta.setText(" · ".join(parts))
 
         if item.kind == "image":
@@ -150,6 +156,18 @@ class PreviewPanel(QFrame):
 
         self._text.setPlainText(item.content or "(无内容)")
         self._stack.setCurrentIndex(1)
+
+    @staticmethod
+    def _formats_summary(item: ClipboardItem) -> str:
+        """这条记录除了「我们看到的那份文本」之外还有哪些形式。"""
+        from ..core.clipboard_formats import (
+            FORMATS_KEY,
+            ClipboardFormats,
+            format_summary,
+        )
+
+        formats = ClipboardFormats.from_metadata(item.metadata.get(FORMATS_KEY))
+        return format_summary(formats, item.content or "", files=item.files)
 
     def _show_image(self, item: ClipboardItem) -> None:
         from ..core.repository import is_data_uri
@@ -212,6 +230,8 @@ class MainWindow(QWidget):
     compact_requested = Signal()
     #: 转换完成：(原记录, 动作 key, 产物)
     transform_ready = Signal(object, str, str)
+    #: (记录, 形式 key, 取到的文本) —— 取用某种形式后要写进剪贴板
+    form_ready = Signal(object, str, str)
     #: 用户点了窗口关闭按钮。由 Application 决定「收进托盘」还是「退出」，
     #: 窗口自己不判断 —— 判断需要知道托盘是否可用、退出前要释放哪些资源，
     #: 那些只有 Application 有。
@@ -731,6 +751,7 @@ class MainWindow(QWidget):
         favorite_action.triggered.connect(lambda: self._toggle_flag("favorite"))
 
         menu.addSeparator()
+        menu.addMenu(self._build_form_menu(item))
         menu.addMenu(self._build_transform_menu(item))
 
         menu.addSeparator()
@@ -738,6 +759,60 @@ class MainWindow(QWidget):
         delete_action.triggered.connect(lambda: self.delete_requested.emit(item_id))
 
         menu.exec(position)
+
+    def _build_form_menu(self, item: ClipboardItem) -> QMenu:
+        """按「这条记录在剪贴板里有哪些形式」动态生成取用菜单。
+
+        菜单项只在「取出来和普通粘贴不一样」时才出现 —— 列一堆点了没反应的
+        条目比不列更让人困惑。所以判定逻辑收在 `core/clipboard_formats`，
+        界面只负责摆放。
+        """
+        from ..core.clipboard_formats import (
+            ClipboardFormats,
+            FORMATS_KEY,
+            available_actions,
+            format_summary,
+        )
+
+        content = item.content if isinstance(item.content, str) else str(item.content)
+        formats = ClipboardFormats.from_metadata(item.metadata.get(FORMATS_KEY))
+        actions = available_actions(
+            kind=item.kind,
+            content=content,
+            formats=formats,
+            files=item.files,
+        )
+        # 只剩「纯文本」一项且没有别的形式时，这个菜单没有存在意义
+        summary = format_summary(formats, content, files=item.files)
+        menu = QMenu("取用形式…", self)
+        if summary:
+            hint = menu.addAction(f"记录中的其它形式：{summary}")
+            hint.setEnabled(False)
+            menu.addSeparator()
+        for action in actions:
+            entry = menu.addAction(action.label)
+            if action.detail:
+                entry.setToolTip(action.detail)
+            entry.triggered.connect(
+                lambda _=False, key=action.key: self._run_form(item, key)
+            )
+        return menu
+
+    def _run_form(self, item: ClipboardItem, key: str) -> None:
+        from ..core.clipboard_formats import ClipboardFormats, FORMATS_KEY, resolve_action
+
+        formats = ClipboardFormats.from_metadata(item.metadata.get(FORMATS_KEY))
+        text, error = resolve_action(
+            key,
+            kind=item.kind,
+            content=item.content or "",
+            formats=formats,
+            files=item.files,
+        )
+        if error:
+            QMessageBox.information(self, "无法取用", error)
+            return
+        self.form_ready.emit(item, key, text)
 
     def _build_transform_menu(self, item: ClipboardItem) -> QMenu:
         """按内容类型动态生成「转换」子菜单。"""

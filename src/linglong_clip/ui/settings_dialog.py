@@ -208,6 +208,16 @@ class SettingsDialog(QDialog):
         )
         history_form.addRow("", self._canonical_path)
 
+        # 「收下各种写法」这一项必须自带说明，否则用户看不出「多存了什么」
+        self._keep_formats = QCheckBox("收下剪贴板里的各种写法（HTML、原始换行、Markdown…）")
+        self._keep_formats.setToolTip(
+            "从网页复制带链接的正文时，剪贴板里同时有纯文本和带 <a> 的 HTML。\n"
+            "勾选后两者都存下来，粘贴出去时链接还在、行尾也与原文一致。\n"
+            "关掉后记录更小，但粘贴结果只能是本工具保存的那份纯文本。"
+        )
+        self._keep_formats.setChecked(bool(self._config.get("history.keep_formats", True)))
+        history_form.addRow("", self._keep_formats)
+
         self._pin_immune = QCheckBox("固定项不受清理影响")
         self._pin_immune.setChecked(bool(self._config.get("history.pin_immune", True)))
         self._pin_immune.setToolTip(
@@ -1223,6 +1233,7 @@ class SettingsDialog(QDialog):
             "history.canonical_dedupe.url": self._canonical_url.isChecked(),
             "history.canonical_dedupe.path": self._canonical_path.isChecked(),
             "history.pin_immune": self._pin_immune.isChecked(),
+            "history.keep_formats": self._keep_formats.isChecked(),
             "privacy.exclude_password_managers": self._exclude_pm.isChecked(),
             "privacy.blocked_apps": [
                 entry.strip()

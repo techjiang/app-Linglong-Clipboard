@@ -1337,3 +1337,149 @@ def test_redact_skips_gui_dispatch(cli_env, monkeypatch):
 
     monkeypatch.setattr(app_module, "Application", boom)
     assert main(["--redact", "hello"]) == 0
+
+
+# ---- 命令行分发表：所有标志都得有归宿 ----
+
+#: 这些标志**故意**没有 CLI 分支：它们是给图形界面用的运行模式。
+#: 出现新名字时必须在这里显式登记 —— 让「漏登记」变成一个需要改两处的动作，
+#: 而不是一个不会报错的疏忽。
+GUI_ONLY_DESTS = {
+    "version",
+    "quick",
+    "minimized",
+    "monitor_primary",
+    "json",
+    "plain",
+    "limit",
+    "kind",
+    "help",
+}
+
+
+def test_every_cli_flag_is_dispatched():
+    """每个参数要么在 `CLI_DEST_NAMES` 里，要么是显式登记的 GUI 专用项。
+
+    守的是一类**不会报错、只会卡住**的缺陷：新加的标志忘记登记到分发表，
+    于是它静默地掉进 GUI 分支 —— 那里会去连显示器、起事件循环，
+    「本该立刻返回的命令」变成一直挂着。这个坑在 `--merge-duplicates`
+    和 `--formats` 上各踩过一次，第三次改成用表驱动 + 这条用例兜底。
+    """
+    import argparse
+
+    from linglong_clip.__main__ import CLI_DEST_NAMES, build_parser
+
+    parser = build_parser()
+    dests = set()
+    for action in parser._actions:
+        if isinstance(action, argparse._HelpAction):
+            continue
+        if action.dest:
+            dests.add(action.dest)
+
+    missing = dests - set(CLI_DEST_NAMES) - GUI_ONLY_DESTS
+    assert not missing, (
+        f"这些参数没有归宿：{sorted(missing)}。"
+        f"要么在 CLI_DEST_NAMES 里加上，要么在 GUI_ONLY_DESTS 里登记为 GUI 专用。"
+    )
+    unknown = set(CLI_DEST_NAMES) - dests
+    assert not unknown, f"CLI_DEST_NAMES 里有不存在的参数：{sorted(unknown)}"
+
+
+def test_formats_flag_skips_gui_dispatch(cli_env, monkeypatch):
+    from linglong_clip.ui import application as app_module
+
+    monkeypatch.setattr(
+        app_module, "Application", lambda *a, **k: (_ for _ in ()).throw(AssertionError("不该启动 GUI"))
+    )
+    assert main(["--formats"]) == 0
+
+
+# ---- 取用剪贴板里的其它形式（--formats / --get --form-key）----
+
+
+def _add_item_with_formats(home, *, body="看这个 链接\n", html='<p>看这个 <a href="https://a/b">链接</a></p>'):
+    from linglong_clip.core.models import ClipboardItem
+
+    from linglong_clip.core.storage import Storage
+
+    storage = Storage(home / "history.db")
+    metadata = {"formats": {"data": {"text/html": html}}}
+    if body.endswith("\n"):
+        import base64
+
+        metadata["text_bytes"] = base64.b64encode(body.encode()).decode()
+    item = storage.add(
+        ClipboardItem(
+            kind="text",
+            content=body,
+            preview="看这个 链接",
+            hash=content_hash("text", "formats-seed"),
+            metadata=metadata,
+        )
+    )
+    storage.close()
+    return item.id
+
+
+def test_form_formats_lists_stored_forms(cli_env, capsys):
+    _add_item_with_formats(cli_env)
+    assert main(["--formats"]) == 0
+    out = capsys.readouterr().out
+    assert "已存：text/html" in out
+    assert "可取用：" in out
+
+
+def test_form_formats_json(cli_env, capsys):
+    _add_item_with_formats(cli_env)
+    assert main(["--formats", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    row = next(item for item in payload if item["stored"])
+    assert "text/html" in row["stored"]
+    assert any(entry["key"] == "html" for entry in row["usable"])
+
+
+def test_form_formats_reports_empty_history(cli_env, capsys):
+    assert main(["--formats", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert all(not item["stored"] for item in payload)
+
+
+def test_form_key_returns_html(cli_env, capsys):
+    item_id = _add_item_with_formats(cli_env)
+    assert main(["--get", str(item_id), "--form-key", "html"]) == 0
+    assert "https://a/b" in capsys.readouterr().out
+
+
+def test_form_key_returns_exact_bytes(cli_env, capsys):
+    """`--form-key text` 给出的是存下来的精确字节，末尾换行不丢。"""
+    item_id = _add_item_with_formats(cli_env, body="abc\n")
+    assert main(["--get", str(item_id), "--form-key", "text"]) == 0
+    assert capsys.readouterr().out == "abc\n\n"
+
+
+def test_form_key_missing_form_reports_available(cli_env, capsys):
+    item_id = _add_item_with_formats(cli_env)
+    assert main(["--get", str(item_id), "--form-key", "markdown"]) == 1
+    err = capsys.readouterr().err
+    assert "可选用" in err or "可选形式" in err
+
+
+def test_form_key_shell_quotes_paths(cli_env, capsys):
+    from linglong_clip.core.models import ClipboardItem
+
+    from linglong_clip.core.storage import Storage
+
+    storage = Storage(cli_env / "history.db")
+    item = storage.add(
+        ClipboardItem(
+            kind="file",
+            content="/tmp/a b/c.txt",
+            preview="x",
+            hash=content_hash("file", "p1"),
+            files=["/tmp/a b/c.txt", "/tmp/d.txt"],
+        )
+    )
+    storage.close()
+    assert main(["--get", str(item.id), "--form-key", "shell"]) == 0
+    assert capsys.readouterr().out.strip() == "'/tmp/a b/c.txt' /tmp/d.txt"

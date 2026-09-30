@@ -62,6 +62,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     query.add_argument("--get", type=int, metavar="ID", help="输出指定 ID 的完整内容")
     query.add_argument(
+        "--form-key",
+        metavar="KEY",
+        help=(
+            "配合 --get：取用这条记录的某种形式而不是默认那份。"
+            "可选 text / html / markdown / rtf / urilist / shell / json / fenced"
+        ),
+    )
+    query.add_argument(
         "--kind",
         choices=["text", "rich", "image", "file", "link", "color", "code", "sensitive"],
         help="按类型过滤",
@@ -84,6 +92,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--recanonicalize",
         action="store_true",
         help="按归一规则重算历史指纹（不动数据，只让老记录能被正确判重）",
+    )
+    maintenance.add_argument(
+        "--formats",
+        nargs="?",
+        const="",
+        metavar="ID",
+        help=(
+            "看某条记录在剪贴板里有哪些形式、各自能不能取用；"
+            "不带 ID 时统计整个历史"
+        ),
     )
     maintenance.add_argument(
         "--normalize",
@@ -416,6 +434,117 @@ def _primary_status(config) -> dict:
         "detail": detail,
         "warning": warning,
     }
+
+
+def _run_form_key(args: argparse.Namespace, storage, item) -> int:
+    """`--get N --form-key KEY`：按指定形式取出来，直接打到 stdout。
+
+    存在的理由和 `--normalize` 一样：这条路径上的问题几乎都是「取出来的东西
+    和预期不一样」，而它没法靠读代码确认 —— 打开某个终端的粘贴行为、
+    看 CRLF 有没有被改、看 HTML 里有没有链接，都得真跑一次。
+    往 stdout 打是为了能直接管道给别的命令：
+
+        linglong-clipboard --get 12 --form-key html > page.html
+    """
+    from .core.clipboard_formats import (
+        ClipboardFormats,
+        FORMATS_KEY,
+        FORMAT_ACTIONS,
+        resolve_action,
+    )
+
+    formats = ClipboardFormats.from_metadata(item.metadata.get(FORMATS_KEY))
+    text, error = resolve_action(
+        args.form_key,
+        kind=item.kind,
+        content=item.content or "",
+        formats=formats,
+        files=item.files,
+    )
+    storage.close()
+    if error:
+        known = "、".join(action.key for action in FORMAT_ACTIONS)
+        print(error, file=sys.stderr)
+        print(f"可选形式：{known}", file=sys.stderr)
+        return 1
+    print(text)
+    return 0
+
+
+def _run_formats(args: argparse.Namespace, storage) -> int:
+    """`--formats [ID]`：这条记录（或整个历史）有哪些形式、哪些能取用。
+
+    回答的是「我为什么取不到 HTML」这类问题 —— 判定依据是**存下来的形式**，
+    而它是否存在取决于采集那一刻系统给了什么，事后无从推断。
+    """
+    from .core.clipboard_formats import (
+        FORMATS_KEY,
+        ClipboardFormats,
+        format_summary,
+        resolve_action,
+    )
+
+    def _describe(item) -> dict:
+        formats = ClipboardFormats.from_metadata(item.metadata.get(FORMATS_KEY))
+        stored = sorted(formats.data)
+        extra = sorted(formats.names)
+        usable = []
+        for key in ("text", "html", "markdown", "rtf", "urilist", "shell", "json", "fenced"):
+            text, error = resolve_action(
+                key,
+                kind=item.kind,
+                content=item.content or "",
+                formats=formats,
+                files=item.files,
+            )
+            if not error:
+                usable.append({"key": key, "chars": len(text)})
+        return {
+            "id": item.id,
+            "kind": item.kind,
+            "stored": stored,
+            "names_only": extra,
+            "summary": format_summary(formats, item.content or "", files=item.files),
+            "usable": usable,
+        }
+
+    if args.formats:
+        try:
+            item_id = int(args.formats)
+        except ValueError:
+            print(f"ID 必须是数字：{args.formats}", file=sys.stderr)
+            storage.close()
+            return 1
+        item = storage.get(item_id)
+        if item is None:
+            print(f"找不到 ID 为 {item_id} 的记录", file=sys.stderr)
+            storage.close()
+            return 1
+        rows = [_describe(item)]
+    else:
+        rows = [_describe(item) for item in storage.list(limit=args.limit)]
+
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        storage.close()
+        return 0
+
+    with_formats = [row for row in rows if row["stored"] or row["names_only"]]
+    print(f"扫描 {len(rows)} 条记录，其中 {len(with_formats)} 条带额外形式")
+    for row in with_formats:
+        print(f"#{row['id']}  {row['kind']}  {row['summary'] or '（无差异）'}")
+        if row["stored"]:
+            print(f"    已存：{'、'.join(row['stored'])}")
+        if row["names_only"]:
+            print(f"    仅留名：{'、'.join(row['names_only'])}")
+        print(f"    可取用：{'、'.join(entry['key'] for entry in row['usable'])}")
+    if not with_formats:
+        print(
+            "（没有记录带额外形式。历史里的记录若是在升级前采集的，"
+            "metadata 中没有 formats 字段，复制出站时只能给出纯文本）"
+        )
+    storage.close()
+    return 0
 
 
 def _run_redact(args: argparse.Namespace, config) -> int:
@@ -802,6 +931,8 @@ def _run_cli(args: argparse.Namespace) -> int:
             print(f"找不到 ID 为 {args.get} 的记录", file=sys.stderr)
             storage.close()
             return 1
+        if args.form_key:
+            return _run_form_key(args, storage, item)
         if args.json:
             print(
                 json.dumps(
@@ -822,6 +953,9 @@ def _run_cli(args: argparse.Namespace) -> int:
             print(item.content)
         storage.close()
         return 0
+
+    if args.formats is not None:
+        return _run_formats(args, storage)
 
     if args.sync_cursor or args.sync_cursor_reset:
         from .core.sync_cursor import build_cursor_store
@@ -1062,46 +1196,81 @@ def _print_pending_event_summary() -> None:
     )
 
 
+#: 交给 CLI 处理的参数名（`argparse` 的 `dest`）。
+#:
+#: 为什么要显式维护一张表，而不是像以前那样在 `main()` 里手写一长串
+#: `args.xxx` 判断：**漏登记一个标志不会报错，只会静默地掉进 GUI 分支**。
+#: 那个分支会去连显示器、起事件循环，于是「本来该立刻返回的命令」变成
+#: 一直挂着不返回 —— 这不是崩溃，是卡住，得等超时才发现。
+#: 这个坑在 `--merge-duplicates` 上踩过一次，在 `--formats` 上又踩了一次，
+#: 所以第三次不再靠记性：改成一张表，并补一条用例守着
+#: （`tests/test_cli.py::test_every_cli_flag_is_dispatched`）。
+CLI_DEST_NAMES = (
+    "stats",
+    "clear",
+    "compact",
+    "merge_duplicates",
+    "recanonicalize",
+    "normalize",
+    "formats",
+    "form_key",
+    "outbound",
+    "list",
+    "search",
+    "get",
+    "import_sync",
+    "export_sync",
+    "sync_status",
+    "import_native_history",
+    "sync_cursor",
+    "sync_cursor_reset",
+    "tombstones",
+    "tombstones_reset",
+    "purge_tombstones",
+    "flag_changes",
+    "flag_changes_reset",
+    "remove",
+    "storage_status",
+    "storage",
+    "storage_migrate",
+    "where",
+    "selfcheck",
+    "config_audit",
+    "rules",
+    "privacy_audit",
+    "redact",
+)
+
+
+def wants_cli(args: argparse.Namespace) -> bool:
+    """这些参数里有没有哪一个是「要跑命令行模式」的意思。
+
+    判定用「不是默认值」而不是「非空」：`--formats` 这类可选带值的标志
+    默认是 `None`，带值时可能是空串（合法值），不能靠真假判断。
+    """
+    for name in CLI_DEST_NAMES:
+        if not hasattr(args, name):
+            continue
+        value = getattr(args, name)
+        if name == "redact":
+            # `--redact` 可以接空串（试跑脱敏时给空输入），所以看 `is not None`
+            if value is not None:
+                return True
+            continue
+        if isinstance(value, bool):
+            if value:
+                return True
+        elif value is not None:
+            return True
+    return False
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if any(
-        [
-            args.stats,
-            args.clear,
-            args.compact,
-            args.merge_duplicates,
-            args.recanonicalize,
-            args.normalize is not None,
-            args.outbound,
-            args.list,
-            args.search,
-            args.get is not None,
-            args.import_sync,
-            args.export_sync,
-            args.sync_status,
-            args.import_native_history,
-            args.sync_cursor,
-            args.sync_cursor_reset,
-            args.tombstones,
-            args.tombstones_reset,
-            args.purge_tombstones,
-            args.flag_changes,
-            args.flag_changes_reset,
-            args.remove is not None,
-            args.storage_status,
-            args.storage is not None,
-            args.storage_migrate,
-            args.where,
-            args.selfcheck,
-            args.config_audit,
-            args.rules,
-            args.privacy_audit,
-            args.redact is not None,
-        ]
-    ):
+    if wants_cli(args):
         return _run_cli(args)
 
     try:
