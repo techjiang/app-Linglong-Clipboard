@@ -314,7 +314,23 @@ class FolderSync:
     # ---- 导出 ----
 
     def export(self, limit: int = 500, include_images: bool = False) -> int:
-        """把本地最近的记录追加到自己的日志文件。"""
+        """把本地尚未导出过的记录追加到自己的日志文件。
+
+        `limit` 是**每页扫描批量**，不是「最多导出多少条」—— 遍历会一直走到
+        历史末尾。这点与旧版不同，也是本轮修掉的一个静默丢数据的缺陷：
+
+        旧实现是 `self._storage.list(limit=limit)`，而 `list()` 只返回界面排序
+        下的**前 limit 条**。于是设备上历史超过 500 条时，第 501 条起的老记录
+        永远进不了日志。对端游标为 0（新设备首同步）时只会拿到最新的 500 条，
+        更老的**永久缺失**：没有报错、没有提示，`--sync-status` 也看不出异常，
+        因为「导出了 500 条」本身就是它以为的全部工作。
+
+        更糟的是它会自我固化：`_local_hashes()` 把那 500 条记为「已发送」，
+        下一轮仍然是「取最新 500 条 → 全部已发送 → 一条都不导出」，
+        于是那 300 条一辈子都在视野之外。加多少轮同步都不会补上。
+
+        改成按 `id DESC` 遍历整库（`Storage.iter_all`），不随界面排序漂移。
+        """
         if not self.is_ready():
             _log.warning("同步目录不可用：%s", self.folder)
             return 0
@@ -322,7 +338,7 @@ class FolderSync:
         already = self._local_hashes()
         sent_flags = self._local_flag_state()
         records: List[SyncRecord] = []
-        for item in self._storage.list(limit=limit):
+        for item in self._storage.iter_all(batch=limit):
             if item.sensitive and not self._allow_sensitive():
                 continue
             if item.kind == "image" and not include_images:
@@ -483,7 +499,12 @@ class FolderSync:
         total = ImportOutcome()
         if not self.is_ready():
             return total
-        seen_local = {item.hash for item in self._storage.list(limit=MAX_SYNC_ENTRIES)}
+        # 本地已有的指纹集合，用于「这条对端也发过，不用重复写」。
+        # 必须遍历**全部**历史：这里原先写的是 `list(limit=MAX_SYNC_ENTRIES)`，
+        # 而 `list()` 只返回界面排序下的前 N 条 —— 本地历史超过 5000 条时，
+        # 更老的那些不在集合里，于是对端每次重放这些记录都会被当成新记录写入，
+        # 一轮多一份重复。用 `iter_all()` 保证集合完整。
+        seen_local = {item.hash for item in self._storage.iter_all()}
         acked = False
         for path in sorted(self.folder.glob("*.llsync")):
             # 自己的日志也读，用于补齐「另一台机器先导入过」的场景

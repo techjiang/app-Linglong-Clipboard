@@ -324,6 +324,12 @@ pytest tests/test_storage.py -k fts -v               # 单个模块
   这类守卫用静态审计 + 「在假源码树上验证判据」的方式补，
   参考 `tests/test_config_audit.py`。
 - **新加 CLI 标志必须有用例守着它不会落到 GUI 分支** ——
+- **遍历历史必须看得到全库，且顺序稳定** —— 不要用 `list(limit=N)`
+  代表「全部历史」，它只是界面排序下的前 N 条；也不要依赖含 `used_at`
+  的排序，它随用户复制而变化。需要全量时用 `iter_all()`（`id DESC`），
+  需要按时间游标翻页时用 `iter_since()`。两条同步路径都曾因为只用一页
+  而静默丢失老记录，且错误会自我固化。参考 `tests/test_sync.py` 的
+  「全量导出」一组与 `tests/test_lan_sync.py` 的「整库传输」一组。
   曾经有个标志没登记到分发表，表现是静默挂起（卡到 10 分钟超时才发现），
   而不是报错。参考 `tests/test_cli.py::test_selfcheck_skips_gui_dispatch`。
 

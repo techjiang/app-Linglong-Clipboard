@@ -262,3 +262,135 @@ def test_encrypted_export_import_roundtrip(tmp_path):
     # 明文不应出现在日志里
     raw = FolderSync(source, shared, device_name="a").journal_path.read_bytes()
     assert b"secret-ish" not in raw
+
+
+# ---- 全量导出：历史超过 limit 时的完整性 ----
+#
+# 这一组守的是「设备历史比每页批量更大时，老记录不能丢」。
+# 旧实现拿 `storage.list(limit=N)` 当「全部历史」，而它只返回界面排序下的
+# 前 N 条；超过 N 的部分永远进不了日志，且会因为「已发送」集合而自我固化，
+# 后续任何轮次都不会补上 —— 静默的永久丢数据。
+
+
+def _seed_many(storage, total, *, prefix="h"):
+    """写入 `total` 条内容各异的记录（hash 依次递增）。"""
+    for index in range(total):
+        storage.add(
+            ClipboardItem(
+                kind="text",
+                content=f"item-{index}",
+                preview=f"item-{index}",
+                hash=f"{prefix}{index:05d}",
+                created_at=1000 + index,
+            )
+        )
+
+
+def test_export_covers_history_beyond_page_limit(tmp_path, home):
+    """历史 800 条、默认每页 500：导出的日志必须含全部 800 条。"""
+    shared = tmp_path / "shared"
+    source = Storage(tmp_path / "a.db")
+    _seed_many(source, 800)
+
+    sync = FolderSync(source, shared, device_name="a")
+    assert sync.export() == 800
+
+    exported = {record.hash for record in sync._read_journal(sync.journal_path)}
+    assert len(exported) == 800
+    assert {f"h{index:05d}" for index in range(800)} == exported
+
+
+def test_large_history_fully_transfers_to_fresh_peer(tmp_path, home):
+    """新设备首同步必须拿到全部历史，而不是只有最新一页。"""
+    shared = tmp_path / "shared"
+    source, target = Storage(tmp_path / "a.db"), Storage(tmp_path / "b.db")
+    _seed_many(source, 800)
+
+    FolderSync(source, shared, device_name="a").export()
+    importer = FolderSync(target, shared, device_name="b")
+    assert importer.import_all() == 800
+
+    have = {item.hash for item in target.list(limit=10_000)}
+    missing = {f"h{index:05d}" for index in range(800)} - have
+    assert missing == set(), f"这些记录永久拿不到：{sorted(missing)[:5]}"
+
+
+def test_export_is_still_incremental_for_new_records(tmp_path, home):
+    """修成全量遍历之后，重复导出仍不该重发已导出过的记录。"""
+    shared = tmp_path / "shared"
+    source = Storage(tmp_path / "a.db")
+    _seed_many(source, 600)
+    sync = FolderSync(source, shared, device_name="a")
+
+    assert sync.export() == 600
+    assert sync.export() == 0  # 没有新内容，一条都不该重复写
+
+    source.add(ClipboardItem(kind="text", content="new", preview="new", hash="brand-new"))
+    assert sync.export() == 1  # 只补新增的这一条
+
+
+def test_export_pages_are_not_affected_by_usage_order(tmp_path, home):
+    """界面排序会被「使用」改写；导出走 id 序，翻页期间不该漏读。
+
+    `used_at` 每次复制都会变，若导出依赖它排序，翻页时记录会上下移动，
+    出现同一批被读两遍或某条被跳过。这里对最老的一条做一次 `touch()`，
+    它在界面排序里会跳到最前，但导出结果必须仍是完整 800 条。
+    """
+    shared = tmp_path / "shared"
+    source = Storage(tmp_path / "a.db")
+    _seed_many(source, 800)
+
+    oldest = source.list(limit=10_000)[-1]
+    source.touch(oldest.id)
+
+    sync = FolderSync(source, shared, device_name="a")
+    assert sync.export() == 800
+    assert len(set(r.hash for r in sync._read_journal(sync.journal_path))) == 800
+
+
+def test_large_local_history_does_not_duplicate_peer_records(tmp_path, home):
+    """本地历史超过 MAX_SYNC_ENTRIES 时，重放对端日志不该写出重复行。
+
+    去重靠的 `seen_local` 以前也是 `list(limit=5000)`；本地 6000 条时，
+    最老的 1000 条不在集合里，对端每次重放都会把它们再写一遍。
+    这里用「清游标强制全量重放三次」把问题放大出来。
+    """
+    shared = tmp_path / "shared"
+    peer, local = Storage(tmp_path / "p.db"), Storage(tmp_path / "l.db")
+
+    _seed_many(peer, 600, prefix="p")
+    FolderSync(peer, shared, device_name="p").export()
+
+    _seed_many(local, 6000, prefix="l")
+
+    sync = FolderSync(local, shared, device_name="l")
+    sync.import_all()
+    assert local.count() == 6600
+
+    for _ in range(3):
+        sync.cursors.reset()
+        sync.import_all()
+
+    assert local.count() == 6600, "重放对端日志写入了重复记录"
+    counts: dict = {}
+    for item in local.list(limit=100_000):
+        counts[item.hash] = counts.get(item.hash, 0) + 1
+    assert [h for h, n in counts.items() if n > 1] == []
+
+
+def test_json_backend_export_covers_full_history(tmp_path, home):
+    """JSON 后端与 SQLite 语义一致：同样要导全，不能只看最新一批。"""
+    from linglong_clip.core.repository import JsonRepository
+
+    shared = tmp_path / "shared"
+    source = JsonRepository(tmp_path / "a.json")
+    _seed_many(source, 800)
+
+    sync = FolderSync(source, shared, device_name="a")
+    assert sync.export() == 800
+
+    target = JsonRepository(tmp_path / "b.json")
+    assert FolderSync(target, shared, device_name="b").import_all() == 800
+    assert {item.hash for item in target.list(limit=10_000)} == {
+        f"h{index:05d}" for index in range(800)
+    }

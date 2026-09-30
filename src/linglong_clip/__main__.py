@@ -64,7 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["text", "rich", "image", "file", "link", "color", "code", "sensitive"],
         help="按类型过滤",
     )
-    query.add_argument("-n", "--limit", type=int, default=20, help="返回条数上限（默认 20）")
+    query.add_argument(
+        "-n", "--limit", type=int, default=20,
+        help="查询返回条数上限（默认 20）；--export-sync 时作为每页扫描批量，不影响导出总量",
+    )
 
     maintenance = parser.add_argument_group("维护")
     maintenance.add_argument("--stats", action="store_true", help="显示统计信息")

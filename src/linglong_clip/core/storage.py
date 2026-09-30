@@ -13,7 +13,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from ..utils.logger import get_logger
 from ..utils.paths import data_dir
@@ -317,6 +317,81 @@ class Storage:
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
         return [ClipboardItem.from_row(row) for row in rows]
+
+    def iter_all(self, *, batch: int = 500) -> Iterator[ClipboardItem]:
+        """按 `id DESC` 遍历**全部**历史，供需要看完整库的调用方使用。
+
+        为什么不能拿 `list(limit=N)` 代替：`list()` 走的是「按界面排序取前 N 条」，
+        而界面排序含 `used_at`（每次复制都会变），既不稳定、又只看得到最新的 N 条。
+        同步导出原先就是这么写的，于是记录超过 N 条后，更老的那些**永远拿不到**——
+        没有报错、没有提示，只是那一段历史在别的设备上从不存在。
+
+        这里改用 `id DESC` 做键集分页（keyset）：`id` 严格递增、不随用户操作变动，
+        翻页期间记录被复制/固定也不会错位或漏读。游标条件用 `id < last_id`
+        而不是 `OFFSET`，避免边翻边写时 `OFFSET` 跳页漏记录。
+        """
+        if not self._usable():
+            return
+        size = max(1, int(batch or 1))
+        last_id: Optional[int] = None
+        while True:
+            where = "WHERE id < ?" if last_id is not None else ""
+            params: List[Any] = [last_id] if last_id is not None else []
+            params.append(size)
+            with self._lock:
+                rows = self._conn.execute(
+                    f"SELECT * FROM items {where} ORDER BY id DESC LIMIT ?", params
+                ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                yield ClipboardItem.from_row(row)
+            last_id = int(rows[-1]["id"])
+            if len(rows) < size:
+                return
+
+    def iter_since(self, since: float = 0.0, *, batch: int = 500) -> Iterator[ClipboardItem]:
+        """按 `(created_at, id)` 升序遍历 `created_at > since` 的记录。
+
+        与 `iter_all` 的区别是**排序维度**：同步对端用时间戳做游标，
+        所以这里必须按时间升序读，才能「读完一批就把游标推到这批的最大时间」。
+        用 `iter_all` 的 `id DESC` 做不到这件事 —— 它天然是倒序，
+        推到最大时间后剩余记录全被甩在游标之后。
+
+        `id` 作为次级排序键保证**同一时刻的多条记录顺序稳定**：
+        只按 `created_at` 排序时，同毫秒记录的相对次序由数据库决定，
+        翻页可能重复或漏读。加上 `id` 就有了确定的全序。
+        """
+        if not self._usable():
+            return
+        size = max(1, int(batch or 1))
+        # 首页是「严格晚于 since」；之后才用 (created_at, id) 做键集续读。
+        # 这一点不能省：若首页就带上 `created_at = since AND id > -1`，
+        # 恰好等于 `since` 的那条会被重新取出 —— 而 `since` 语义本就是排他的。
+        last_seen: Optional[float] = None
+        last_id = 0
+        while True:
+            if last_seen is None:
+                where = "created_at > ?"
+                params: List[Any] = [float(since or 0.0)]
+            else:
+                where = "created_at > ? OR (created_at = ? AND id > ?)"
+                params = [last_seen, last_seen, last_id]
+            params.append(size)
+            with self._lock:
+                rows = self._conn.execute(
+                    f"SELECT * FROM items WHERE {where} "
+                    "ORDER BY created_at ASC, id ASC LIMIT ?",
+                    params,
+                ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                yield ClipboardItem.from_row(row)
+            last_id = int(rows[-1]["id"])
+            last_seen = float(rows[-1]["created_at"] or 0.0)
+            if len(rows) < size:
+                return
 
     def search(
         self,

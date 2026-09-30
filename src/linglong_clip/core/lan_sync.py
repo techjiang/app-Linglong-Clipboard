@@ -395,10 +395,22 @@ class LanSyncServer:
             )
 
     def _eligible_items(self, *, since: float, limit: int) -> List[ClipboardItem]:
-        """挑选可外发的记录：过隐私、跳过图片与敏感项，且晚于 `since`。"""
+        """挑选可外发的记录：过隐私、跳过图片与敏感项，且晚于 `since`。
+
+        遍历用 `iter_since`（按时间升序、`id` 兜同刻），而不是
+        `list(limit=self._max_entries)`。后者有两个问题，都会导致对端拿不全：
+
+        1. **只看最新 `_max_entries` 条**。记录数超过这个上限时，更老的
+           永远不在候选里，对端怎么拉都拉不到。
+        2. **界面排序不稳定**。`list()` 按 `pinned/used_at` 排，用户复制一下
+           记录就会换位；对端按时间游标翻页时，翻着翻着就错位了。
+
+        客户端会带着推进后的 `since` 反复请求，直到某页不足 `limit`；
+        所以这里只要保证「给定 `since` 的下一条是确定的」即可。
+        """
         out: List[ClipboardItem] = []
-        for item in self._storage.list(limit=self._max_entries):
-            if not item.hash or item.created_at <= since:
+        for item in self._storage.iter_since(since, batch=max(limit * 2, 64)):
+            if not item.hash:
                 continue
             if item.kind == "image" or item.image_path:
                 continue  # 图片不进局域网，体积大且隐私风险高
@@ -498,6 +510,9 @@ class LanSyncClient:
         self.flag_changes = (
             flag_changes if flag_changes is not None else FlagChangeStore()
         )
+        #: 单次同步最多翻多少页。只是防呆保险丝：
+        #: 正常情况下服务端某页不满就会让循环退出。
+        self._max_pages = max(1, int((MAX_SYNC_ENTRIES // DEFAULT_PAGE_SIZE) + 2))
 
     def fetch(self, peer: PeerInfo, *, since: float = 0.0, limit: int = DEFAULT_PAGE_SIZE) -> Optional[List[SyncRecord]]:
         """拉取一个对端的记录；不可达或鉴权失败时返回 `None`。"""
@@ -586,7 +601,10 @@ class LanSyncClient:
         若顺序反了，刚被删除的指纹会被紧随其后的内容记录写回来。
         """
         records = [record for record in records if record.hash]
-        seen = {item.hash for item in self._storage.list(limit=MAX_SYNC_ENTRIES)}
+        # 本地已有指纹，用于「对端也发过这条，别重复写」。必须覆盖整库：
+        # 原先写的是 `list(limit=MAX_SYNC_ENTRIES)`，本地历史超过该上限时
+        # 更老的记录不在集合里，对端每轮重放都会把它们再写一遍，产生重复行。
+        seen = {item.hash for item in self._storage.iter_all()}
         # 注意：判「指纹是否已在本地」一律用 contains_hash()，
         # 不用 `in` —— 见 tombstones.contains_hash() 的说明
         outcome = LanImportOutcome()
@@ -743,21 +761,65 @@ class LanSyncClient:
 
         `since` 显式传入时按传入值拉取（并同步推进游标），为 `None` 时
         取自持久化游标——这是「每轮只拉新记录」的关键。
+
+        **翻页直到对端给完**。此前只拉一页：对端可外发记录超过
+        `DEFAULT_PAGE_SIZE` 时，第一页之后的部分**永远不会再来第二趟** ——
+        游标被推到第一页的最大时间戳，而剩余记录都比它旧，于是被永久跳过。
+        表现为「新设备首同步丢了一半历史」，且没有任何报错。
+
+        翻页用 `(created_at, id)` 全序（服务端 `iter_since` 保证），
+        所以同毫秒的多条记录不会因为次序不稳而漏读或死循环。
+        持久化游标只在**整轮翻页结束**后推进一次：中途失败保留旧值，
+        下轮从同一位置重来（重复由 hash 去重吃掉）。
         """
         key = self.cursor_key(peer)
         requested = self.cursors.since_for(key) if since is None else max(0.0, float(since))
-        records = self.fetch(peer, since=requested)
-        if records is None:
-            # 对端不可达或鉴权失败：不推进游标，下轮重试这一段
-            return LanImportOutcome()
-        if not records:
-            return LanImportOutcome()
-        outcome = self.import_records(records)
-        # 只有成功拿到响应才推进；游标取本批记录的最大时间戳
-        newest = max((float(getattr(r, "created_at", 0.0) or 0.0) for r in records), default=0.0)
+
+        total = LanImportOutcome()
+        newest = 0.0
+        pages = 0
+        #: 翻页上限，纯粹的保险丝：正常情况下「某页不满」就会退出。
+        #: 万一服务端行为异常（比如始终返回同一批），这里兜住不让进程空转。
+        max_pages = self._max_pages
+
+        while pages < max_pages:
+            records = self.fetch(peer, since=requested, limit=DEFAULT_PAGE_SIZE)
+            if records is None:
+                # 对端不可达或鉴权失败：不推进游标，下轮重试这一段。
+                # 已经导完的几页不会白做 —— 游标没动，但内容已按 hash 去重。
+                return total if pages else LanImportOutcome()
+            if not records:
+                break
+            pages += 1
+
+            page_outcome = self.import_records(records)
+            total.imported += page_outcome.imported
+            total.removed += page_outcome.removed
+            total.tombstones += page_outcome.tombstones
+            total.flags_updated += page_outcome.flags_updated
+            total.flag_changes += page_outcome.flag_changes
+
+            page_newest = max(
+                (float(getattr(r, "created_at", 0.0) or 0.0) for r in records), default=0.0
+            )
+            # 服务端 `since` 是排他语义（`created_at > since`），
+            # 直接把游标推到最后一条的时间即可，不会重读这一条。
+            if page_newest > requested:
+                requested = page_newest
+                newest = max(newest, page_newest)
+            else:
+                # 本页没有把时间往前推（同一时刻的记录堆满一页）。
+                # 继续问下去只会拿到同一批，靠剩下的记录下次再说，
+                # 否则这里会变成死循环。
+                break
+
+            # 不满一页说明对端已经给完了，不必再多发一次请求
+            if len(records) < DEFAULT_PAGE_SIZE:
+                break
+
         if newest > 0:
             self.cursors.advance(key, newest)
-        return outcome
+        return total
 
 
 class DiscoveryService:

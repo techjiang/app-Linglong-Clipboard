@@ -620,3 +620,45 @@ def test_writes_after_close_do_not_touch_disk(repo):
     repo.delete(1)
     repo.save()
     assert repo.path.read_text(encoding="utf-8") == before
+
+
+# ---- 全量遍历（iter_all）----
+
+
+def test_iter_all_returns_every_item(repo):
+    for index in range(40):
+        _add(repo, content=f"c{index}", hash=f"h{index}", created_at=1000 + index)
+
+    seen = [item.hash for item in repo.iter_all()]
+    assert len(seen) == 40
+    assert set(seen) == {f"h{index}" for index in range(40)}
+
+
+def test_iter_all_matches_storage_semantics(repo):
+    """与 `Storage.iter_all` 同语义：id 倒序、批量参数不影响结果。"""
+    for index in range(12):
+        _add(repo, content=f"c{index}", hash=f"h{index}", created_at=1000 + index)
+
+    assert [item.hash for item in repo.iter_all(batch=1)] == [
+        f"h{index}" for index in range(11, -1, -1)
+    ]
+    assert [item.hash for item in repo.iter_all(batch=1000)] == [
+        f"h{index}" for index in range(11, -1, -1)
+    ]
+
+
+def test_iter_all_on_empty_repo(repo):
+    assert list(repo.iter_all()) == []
+
+
+def test_iter_all_after_close_matches_list(repo):
+    """关闭后仍可读 —— 与 JSON 后端 `list()` 的既有语义保持一致。
+
+    这里刻意不写「关闭后返回空」：`JsonRepository` 的数据本就在内存里，
+    `close()` 只是停止落盘；`list()` 关闭后照样返回记录。
+    让 `iter_all` 单独变成空集会造成两个只读接口行为不一致。
+    """
+    _add(repo, content="x", hash="h")
+    repo.close()
+
+    assert len(list(repo.iter_all())) == len(repo.list())

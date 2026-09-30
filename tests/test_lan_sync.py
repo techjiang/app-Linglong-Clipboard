@@ -725,3 +725,183 @@ def test_lan_tombstones_are_acked_after_serve(lan_pair):
 
     assert b.sync_all() == 0  # 对方没有新内容，只有一条删除
     assert a.tombstones.pending() == [], "写出成功后不该还待发"
+
+
+# ---------- 整库传输：记录数超过一页时不能丢 ----------
+#
+# 与共享文件夹那条路径同一类缺陷：客户端原先只拉一页，服务端又只看
+# 最新 `_max_entries` 条。结果是「新设备首同步只拿到一部分历史」，
+# 游标被推到第一页的最大时间戳，剩下的因为都比它旧而永远不再被请求。
+
+
+def _add_series(st, total, *, prefix="h"):
+    """写入 `total` 条时间递增、内容各异的记录。"""
+    for index in range(total):
+        st.add(
+            ClipboardItem(
+                kind="text",
+                content=f"item-{index}",
+                preview=f"item-{index}",
+                created_at=1000 + index,
+                hash=f"{prefix}{index:05d}",
+            )
+        )
+
+
+def test_lan_sync_pages_through_whole_history(nodes):
+    """800 条 > 单页 500：一次同步必须把 800 条全拉过来。"""
+    make, local, remote = nodes
+    _add_series(local, 800)
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+
+    assert b.sync_all() == 800
+    assert remote.count() == 800
+    assert {item.hash for item in remote.list(limit=10_000)} == {
+        f"h{index:05d}" for index in range(800)
+    }
+
+
+def test_lan_sync_paging_is_idempotent(nodes):
+    """翻页修好之后，重复同步仍不该重复导入。"""
+    make, local, remote = nodes
+    _add_series(local, 800)
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+
+    assert b.sync_all() == 800
+    assert b.sync_all() == 0
+    assert remote.count() == 800
+
+
+def test_lan_sync_incremental_after_paging(nodes):
+    """翻页之后，增量语义不变：只补新增的那几条。"""
+    make, local, remote = nodes
+    _add_series(local, 800)
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+    b.sync_all()
+
+    _add_series(local, 805)  # index 800..804 是新出现的 5 条
+    assert b.sync_all() == 5
+    assert remote.count() == 805
+
+
+def test_lan_server_serves_records_beyond_one_page(nodes):
+    """服务端本身要能供出超过一页的记录，而不是只认最新一批。"""
+    make, local, remote = nodes
+    _add_series(local, 620)
+
+    server = LanSyncServer(local, device_name="a")
+    first = server.collect_records(limit=500)
+    assert len(first) == 500
+
+    # 用第一页最大时间戳继续问，必须还能拿到后面的。
+    # `since` 是排他语义，所以边界那一条会被再发一次 —— 这是刻意的：
+    # 宁可重复（hash 去重吃掉），也不能因为边界相等而漏掉。
+    page = [SyncRecord.from_json(json.loads(blob)) for blob in first]
+    newest = max(record.created_at for record in page if record is not None)
+    rest = server.collect_records(since=newest, limit=500)
+    assert 120 <= len(rest) <= 121
+    assert len(set(first) & set(rest)) <= 1  # 至多重复边界一条
+
+
+def test_lan_same_timestamp_records_are_not_lost(nodes):
+    """同一时刻的多条记录不能因为排序不稳而漏读。"""
+    make, local, remote = nodes
+    for index in range(30):
+        local.add(
+            ClipboardItem(
+                kind="text", content=f"same-{index}", preview=f"same-{index}",
+                created_at=2000.0, hash=f"s{index:03d}",
+            )
+        )
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+
+    # 30 条同刻记录 < 一页，应当一次全到
+    assert b.sync_all() == 30
+    assert remote.count() == 30
+
+
+def test_lan_paging_still_delivers_tombstone_in_first_page(nodes):
+    """翻页之后，删除标记仍要在同一轮里生效（它在第一页随内容一起发）。"""
+    make, local, remote = nodes
+    _add_series(local, 800)
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+    b.sync_all()
+
+    # A 删掉其中较早的一条，并把删除标记传给 B
+    victim = local.find_by_hash("h00100")
+    local.delete(victim.id)
+    a.tombstones.record("h00100")
+
+    assert b.sync_all() == 0  # 没有新内容，只有删除
+    assert remote.find_by_hash("h00100") is None
+    assert remote.count() == 799
+
+
+def test_lan_paging_with_deletes_and_new_records(nodes):
+    """一整轮：800 条历史 + 删除 + 新增，游标只推进一次且结果正确。"""
+    make, local, remote = nodes
+    _add_series(local, 800)
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+    assert b.sync_all() == 800
+
+    victim = local.find_by_hash("h00700")
+    local.delete(victim.id)
+    a.tombstones.record("h00700")
+    local.add(
+        ClipboardItem(
+            kind="text", content="after-delete", preview="after-delete",
+            created_at=9000.0, hash="hnew",
+        )
+    )
+
+    assert b.sync_all() == 1  # 只新增这一条
+    assert remote.find_by_hash("h00700") is None
+    assert remote.find_by_hash("hnew") is not None
+    assert remote.count() == 800  # 800 - 1 + 1
+
+
+def test_lan_partial_paging_failure_keeps_progress_and_retries(nodes, monkeypatch):
+    """翻到一半对端挂了：已导入的不丢，游标不越过已收到的位置，下轮补上。
+
+    这里把第二页的请求打掉，模拟对端中途不可达。关键是不能因为
+    「已经导了第一页」就把游标推到第一页的最大时间戳 —— 那样第二页起
+    的内容会永久跳过。正确行为是保留旧游标（或只推到已确认的位置），
+    下一轮从同一位置重来，重复由指纹去重吃掉。
+    """
+    make, local, remote = nodes
+    _add_series(local, 800)
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+
+    original_fetch = b._client.fetch
+    calls = {"n": 0}
+
+    def flaky_fetch(peer, *, since=0.0, limit=None, **kwargs):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            return None  # 第二页开始不可达
+        return original_fetch(peer, since=since, limit=limit or 500, **kwargs)
+
+    monkeypatch.setattr(b._client, "fetch", flaky_fetch)
+    first_round = b.sync_all()
+    assert first_round == 500, "第一页应当导入成功"
+    assert remote.count() == 500
+    assert b._client.cursors.snapshot() == {}, "中途失败不该推进游标"
+
+    # 恢复网络后重来，剩下的 300 条要能补齐
+    monkeypatch.setattr(b._client, "fetch", original_fetch)
+    assert b.sync_all() == 300
+    assert remote.count() == 800

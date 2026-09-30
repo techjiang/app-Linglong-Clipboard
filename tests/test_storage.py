@@ -413,3 +413,64 @@ def test_writes_after_close_are_ignored(storage):
     assert storage.purge_expired_sensitive(ttl_seconds=60) == 0
     storage.set_meta("k", "v")
     storage.optimize()
+
+
+# ---- 全量遍历（iter_all）----
+
+
+def test_iter_all_returns_every_record(storage):
+    """遍历要看到整库，不能像 `list()` 那样只给最新一批。"""
+    for index in range(50):
+        _add(storage, content=f"c{index}", hash=f"h{index}", created_at=1000 + index)
+
+    seen = [item.hash for item in storage.iter_all(batch=7)]
+    assert len(seen) == 50
+    assert set(seen) == {f"h{index}" for index in range(50)}
+
+
+def test_iter_all_is_newest_first(storage):
+    """按 id 倒序：最后写入的排最前，与界面的「最新在前」直觉一致。"""
+    for index in range(10):
+        _add(storage, content=f"c{index}", hash=f"h{index}", created_at=1000 + index)
+
+    assert [item.hash for item in storage.iter_all(batch=3)][:3] == ["h9", "h8", "h7"]
+
+
+def test_iter_all_batch_size_does_not_change_result(storage):
+    """批量只影响分页次数，不该改变结果集。"""
+    for index in range(25):
+        _add(storage, content=f"c{index}", hash=f"h{index}", created_at=1000 + index)
+
+    for batch in (1, 4, 25, 1000):
+        got = [item.hash for item in storage.iter_all(batch=batch)]
+        assert got == [f"h{index}" for index in range(24, -1, -1)], f"batch={batch}"
+
+
+def test_iter_all_is_immune_to_usage_order(storage):
+    """`touch()` 会改写界面排序，但遍历用 id 序，不受影响。
+
+    若遍历依赖 `used_at` 排序，翻页时被复制的记录会跳到最前，
+    出现漏读或重复读 —— 同步导出正是靠这个保证不漏。
+    """
+    for index in range(30):
+        _add(storage, content=f"c{index}", hash=f"h{index}", created_at=1000 + index)
+
+    items = storage.list(limit=100)
+    oldest = items[-1]
+    storage.touch(oldest.id)
+
+    seen = [item.hash for item in storage.iter_all(batch=4)]
+    assert len(seen) == 30
+    assert len(set(seen)) == 30
+    assert oldest.hash in seen
+
+
+def test_iter_all_on_empty_storage(storage):
+    assert list(storage.iter_all()) == []
+
+
+def test_iter_all_after_close_returns_nothing(storage):
+    """关闭之后遍历要安静返回，不能抛 —— 与其余只读接口一致。"""
+    _add(storage, content="x", hash="h")
+    storage.close()
+    assert list(storage.iter_all()) == []

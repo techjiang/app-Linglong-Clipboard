@@ -406,6 +406,38 @@ class JsonRepository:
         selected.sort(key=_sort_key, reverse=True)
         return selected[offset : offset + limit]
 
+    def iter_all(self, *, batch: int = 500):
+        """按 `id DESC` 遍历全部记录，与 `Storage.iter_all` 同语义。
+
+        `batch` 在这里只是接口对齐 —— JSON 后端整库都在内存里，
+        逐条产出即可。保留参数是为了让 `FolderSync.export` 不必区分后端。
+
+        存在的理由与 Storage 那边一致：`list(limit=N)` 只给最新 N 条，
+        同步导出拿它当「全部历史」会让更老的记录永远发不出去。
+        """
+        del batch  # 内存后端无需分批
+        with self._lock:
+            items = sorted(self._items.values(), key=lambda one: int(one.id or 0), reverse=True)
+            for item in items:
+                yield copy.deepcopy(item)
+
+    def iter_since(self, since: float = 0.0, *, batch: int = 500):
+        """按 `(created_at, id)` 升序遍历 `created_at > since` 的记录。
+
+        与 `Storage.iter_since` 同语义：局域网对端用时间戳做游标，
+        需要按时间升序读才能把游标稳步往前推。
+        """
+        del batch  # 内存后端无需分批
+        with self._lock:
+            items = [
+                item
+                for item in self._items.values()
+                if float(item.created_at or 0.0) > float(since or 0.0)
+            ]
+            items.sort(key=lambda one: (float(one.created_at or 0.0), int(one.id or 0)))
+            for item in items:
+                yield copy.deepcopy(item)
+
     def search(
         self,
         query: str,
