@@ -46,6 +46,11 @@
 
 ![设置·隐私](docs/screenshots/settings-privacy-outbound.png)
 
+设置页「隐私 → 自定义脱敏规则」—— 正则写错不会报错，只会被静默跳过，
+所以在这里边写边体检（下图第二条是故意写错的，看得出它被当场标出来）：
+
+![设置·自定义脱敏规则](docs/screenshots/settings-privacy-redact.png)
+
 列表密度两档，同一批记录：
 
 ![舒适](docs/screenshots/density-comfortable.png)
@@ -317,7 +322,8 @@ linglong-clipboard --merge-duplicates  # 重算 + 合并（含历史里的存量
   **默认直接丢弃**，连历史都不进（可在设置里改成限时保留）。
   PEM 私钥是硬拦截，不给配置机会。
 - **按需脱敏**：开启后，复制到外部时敏感片段替换为 `[已脱敏:密码字段]`，
-  字段名保留可读性。
+  字段名保留可读性。可在设置 → 隐私 里加自定义规则（`{"员工号": "EMP\\d{6}"}`），
+  写错的规则会被当场指出 —— 查当前哪些真的会生效：`linglong-clipboard --privacy-audit`。
 - **出站防护**：敏感内容复制出去时（这是唯一会把内容带出机器的动作），
   Windows 上附带系统级标记，让它**不进系统剪贴板历史**（`Win+V` 里找不到）；
   各平台都支持「N 秒后清空剪贴板」—— 只在内容未被替换时才清，不会误删你
@@ -798,6 +804,9 @@ linglong-clipboard --rules                    # 每条规则什么时候跑、�
 linglong-clipboard --rules --json             # 同上，JSON 输出；退出码 1 表示有规则不会生效
 linglong-clipboard --outbound                 # 复制敏感内容出去时实际生效的防护
 linglong-clipboard --outbound --json          # 同上，JSON 输出便于回帖
+linglong-clipboard --privacy-audit            # 脱敏规则里哪些真的会生效
+linglong-clipboard --privacy-audit --json     # 同上，JSON 输出；退出码 1 表示有规则写错了
+linglong-clipboard --redact 'token=abc12345'  # 拿真实内容试跑脱敏，看会被替换成什么
 ```
 
 `--selfcheck` 退出码：`0` 全部正常、`1` 有降级、`2` 有失败，
@@ -833,6 +842,46 @@ $ linglong-clipboard --outbound
   限时清空：30 秒后清空剪贴板（内容未被替换时）
   出站脱敏：关闭
 ```
+
+`--privacy-audit` 回答的是「我配的那些脱敏规则，到底哪些真的会生效」——
+这也是没法靠读代码确认的一类：正则写错一个字符，程序只会静默跳过那条规则，
+复制出去的密钥原样带走，界面上看不出任何异常。
+
+```
+$ linglong-clipboard --privacy-audit
+玲珑剪切板 · 隐私体检
+
+出站脱敏：已开启
+敏感内容：识别到直接丢弃（默认）
+生效规则：9 条（其中自定义 2 条）
+
+✓ 密码字段（内置）
+    正则：(?i)((?:pass(?:word|wd)?|pwd|secret|token|api[_-]?key|access[_-]?key)(?:\s*[:=]\s*))(\S{6,})
+    样本命中 1 次
+
+✓ 员工号（自定义）
+    正则：EMP\d{6}
+    样本命中 1 次
+
+✗ 内部工单（自定义）
+    正则：[unclosed
+    ！正则无法编译，这条规则已被静默跳过：unterminated character set at position 0
+
+共 9 条规则，其中 1 条需要处理
+```
+
+写错的正则会用内置样本试跑；自定义规则还能用真实内容当场验证，
+**不写历史、不碰剪贴板**：
+
+```
+$ linglong-clipboard --redact '负责人 EMP123456'
+输入：负责人 EMP123456
+输出：负责人 [已脱敏:员工号]
+
+命中规则：员工号×1
+```
+
+退出码：`0` 规则都正常、`1` 有规则不会生效（编译失败或试跑不命中）。
 
 `--config-audit` 退出码：`0` 没有空转配置、`1` 有。
 它拿 `config.DEFAULTS` 里的每个键去源码里找读取方：
@@ -1028,6 +1077,7 @@ src/linglong_clip/
 │   ├── classify.py          #   类型识别、敏感检测、标签抽取
 │   ├── normalize.py         #   内容归一：链接去跟踪参数、路径写法收敛
 │   ├── privacy.py           #   隐私策略与脱敏
+│   ├── privacy_audit.py     #   隐私体检：脱敏规则哪些真的会生效
 │   ├── copy_guard.py        #   出站防护：写入级系统排除 + 限时清空剪贴板
 │   ├── semantic.py          #   意图解析与多信号排序
 │   ├── collector.py         #   采集管线：识别→风控→去重→落库

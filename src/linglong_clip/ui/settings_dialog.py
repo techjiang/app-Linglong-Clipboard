@@ -38,6 +38,26 @@ _log = get_logger("settings")
 CAPTURE_TYPES = ["text", "rich", "image", "file", "link", "color", "code"]
 
 
+class _RedactProbeConfig:
+    """只带自定义脱敏规则的配置替身。
+
+    设置页要在**保存之前**就体检用户正在写的规则，而体检函数读的是配置对象。
+    直接改真配置会让「取消」也留下痕迹，所以拿一份只含待验规则的替身喂给它。
+    """
+
+    def __init__(self, rules: Dict[str, str]) -> None:
+        self._rules = dict(rules)
+
+    def get(self, key: str, default=None):
+        if key == "privacy.custom_redact_rules":
+            return dict(self._rules)
+        if key == "privacy.redact_on_copy_out":
+            return True  # 体检关注规则本身，总开关由界面另行提示
+        if key == "privacy.sensitive_retention_seconds":
+            return 0
+        return default
+
+
 class SettingsDialog(QDialog):
     """配置编辑器。`changes` 里是本次被改动的配置键。"""
 
@@ -449,11 +469,101 @@ class SettingsDialog(QDialog):
 
         self._redact = QCheckBox("复制到外部时对敏感片段脱敏")
         self._redact.setChecked(bool(self._config.get("privacy.redact_on_copy_out", False)))
+        self._redact.toggled.connect(self._refresh_redact_state)
         form2.addRow("", self._redact)
 
         layout.addWidget(group2)
-        layout.addStretch(1)
+
+        # 自定义脱敏规则此前只存在于配置文件里，文档却写着
+        # 「设置 → 隐私 里可填」—— 用户按文档来找，找不到。这里把它补上。
+        group3 = QGroupBox("自定义脱敏规则")
+        box3 = QVBoxLayout(group3)
+        rules_hint = QLabel(
+            "用 JSON 写「名称 → 正则」，命中的片段在复制出去时替换为 "
+            "[已脱敏:名称]。\n"
+            '例：{"员工号": "EMP\\d{6}"} —— 正则写错不会报错，只会被静默跳过，\n'
+            "所以下面会当场校验并试跑，看得出哪条不会生效。"
+        )
+        rules_hint.setWordWrap(True)
+        box3.addWidget(rules_hint)
+
+        self._redact_editor = QPlainTextEdit()
+        self._redact_editor.setPlaceholderText('{\n  "员工号": "EMP\\\\d{6}"\n}')
+        import json as _json
+
+        custom = self._config.get("privacy.custom_redact_rules", {}) or {}
+        self._redact_editor.setPlainText(
+            _json.dumps(custom, ensure_ascii=False, indent=2) if custom else "{}"
+        )
+        self._redact_editor.textChanged.connect(self._refresh_redact_state)
+        box3.addWidget(self._redact_editor, 1)
+
+        self._redact_state = QLabel()
+        self._redact_state.setWordWrap(True)
+        box3.addWidget(self._redact_state)
+        layout.addWidget(group3, 1)
+
+        self._refresh_redact_state()
         return page
+
+    def _redact_rules(self):
+        """把编辑器里的文本解析成规则字典。
+
+        返回 ``(rules, error)``。解析失败时 ``error`` 非空、``rules`` 为空 ——
+        这时**不覆盖**已有规则（保存逻辑会据此跳过），免得一个手滑清掉用户
+        全部自定义规则。
+        """
+        import json
+
+        raw = self._redact_editor.toPlainText().strip() or "{}"
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            return {}, f"JSON 无法解析：第 {exc.lineno} 行 {exc.msg}"
+        if not isinstance(parsed, dict):
+            return {}, "规则必须是一个 JSON 对象（名称 → 正则）"
+        return {str(k): str(v) for k, v in parsed.items()}, ""
+
+    def _refresh_redact_state(self) -> None:
+        """边写边体检：正则写错、规则不命中、总开关没开，都当场说清。
+
+        理由与自动化规则那片一致：写错的脱敏规则是**静默失效**的 ——
+        用户以为加了保护，复制出去的密钥原样带走，界面上毫无异常。
+        所以校验必须发生在用户还在看这一页的时候。
+        """
+        # 构造过程中勾选框可能先于编辑器建好就发出 toggled 信号，
+        # 此时控件还不存在 —— 直接返回，真正那次刷新在建完后会补上。
+        if not hasattr(self, "_redact_editor") or not hasattr(self, "_redact_state"):
+            return
+        rules, error = self._redact_rules()
+        if error:
+            self._redact_state.setStyleSheet("color:#e5484d")
+            self._redact_state.setText(f"✗ {error}")
+            return
+
+        from ..core.privacy import PrivacyGuard
+        from ..core.privacy_audit import audit_privacy
+
+        guard = PrivacyGuard(_RedactProbeConfig(rules))
+        report = audit_privacy(_RedactProbeConfig(rules), guard=guard)
+        custom = [check for check in report.checks if check.custom]
+        broken = [check for check in custom if not check.will_run]
+
+        lines = [f"共 {len(custom)} 条自定义规则"]
+        if broken:
+            lines.append(f"其中 {len(broken)} 条不会生效：")
+            for check in broken:
+                lines.append(f"  · {check.name}：{check.problems[0]}")
+        if not self._redact.isChecked() and custom:
+            lines.append(
+                "注意：上面的「复制到外部时脱敏」没勾选，这些规则不会执行。"
+            )
+
+        if broken:
+            self._redact_state.setStyleSheet("color:#e5a00d")
+        else:
+            self._redact_state.setStyleSheet("")
+        self._redact_state.setText(("✓ " if not broken else "✗ ") + "\n".join(lines))
 
     def _refresh_outbound_hint(self, *_args) -> None:
         """说清这台机器上「复制敏感内容」实际能做什么。
@@ -1149,6 +1259,12 @@ class SettingsDialog(QDialog):
             "ui.start_minimized": self._start_minimized.isChecked(),
             "ui.close_to_tray": self._close_to_tray.isChecked(),
         }
+
+        redact_rules, redact_error = self._redact_rules()
+        if redact_error:
+            QMessageBox.warning(self, "脱敏规则格式错误", redact_error)
+            return
+        values["privacy.custom_redact_rules"] = redact_rules
 
         if self._automation is not None:
             raw = self._rules_editor.toPlainText().strip() or "[]"

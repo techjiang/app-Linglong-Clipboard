@@ -306,7 +306,7 @@ def test_parser_has_all_modes():
     options = {action.dest for action in parser._actions}
     for expected in ("quick", "minimized", "list", "search", "get", "stats", "clear",
                      "compact", "json", "plain", "sync_status", "selfcheck",
-                     "config_audit", "rules"):
+                     "config_audit", "rules", "privacy_audit", "redact"):
         assert expected in options
 
 
@@ -1207,3 +1207,133 @@ def test_rules_empty_is_fine(home, capsys):
 
     assert main(["--rules"]) == 0
     assert "没有配置任何自动化规则" in capsys.readouterr().out
+
+
+# ---- 隐私体检（--privacy-audit / --redact）----
+
+
+def _write_redact_rules(home, rules):
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    config.set("privacy.custom_redact_rules", rules, persist=True)
+
+
+def test_privacy_audit_reports_healthy(home, capsys):
+    from linglong_clip.__main__ import main
+
+    _write_redact_rules(home, {"员工号": r"EMP\d{6}"})
+    assert main(["--privacy-audit"]) == 0
+    out = capsys.readouterr().out
+    assert "隐私体检" in out
+    assert "员工号" in out
+    assert "0 条需要处理" in out
+
+
+def test_privacy_audit_flags_uncompilable_rule(home, capsys):
+    """写错的脱敏正则必须报出来 —— 它会被静默跳过，界面上看不出异常。"""
+    from linglong_clip.__main__ import main
+
+    _write_redact_rules(home, {"写错的": "[unclosed"})
+    assert main(["--privacy-audit"]) == 1
+    out = capsys.readouterr().out
+    assert "写错的" in out
+    assert "无法编译" in out
+
+
+def test_privacy_audit_notes_disabled_switch(home, capsys):
+    from linglong_clip.__main__ import main
+    from linglong_clip.utils.config import Config
+
+    Config(home / "config.json").set("privacy.redact_on_copy_out", False, persist=True)
+    assert main(["--privacy-audit"]) == 0
+    out = capsys.readouterr().out
+    assert "未开启" in out
+    assert "一条都不会执行" in out
+
+
+def test_privacy_audit_json(home, capsys):
+    import json as jsonlib
+
+    from linglong_clip.__main__ import main
+
+    _write_redact_rules(home, {"写错的": "[unclosed"})
+    assert main(["--privacy-audit", "--json"]) == 1
+    payload = jsonlib.loads(capsys.readouterr().out)
+    assert payload["healthy"] is False
+    assert payload["custom_rules"] == 1
+
+
+def test_redact_replaces_sensitive_fragment(home, capsys):
+    from linglong_clip.__main__ import main
+
+    assert main(["--redact", "password: hunter2xyz"]) == 0
+    out = capsys.readouterr().out
+    assert "[已脱敏:密码字段]" in out
+    assert "hunter2xyz" in out  # 输入那一行仍会显示，方便对照
+
+
+def test_redact_plain_outputs_only_result(home, capsys):
+    from linglong_clip.__main__ import main
+
+    assert main(["--redact", "token=abcdefgh", "--plain"]) == 0
+    assert capsys.readouterr().out.strip() == "token=[已脱敏:密码字段]"
+
+
+def test_redact_reports_no_hit(home, capsys):
+    from linglong_clip.__main__ import main
+
+    assert main(["--redact", "just an ordinary sentence"]) == 0
+    out = capsys.readouterr().out
+    assert "不会被脱敏" in out
+
+
+def test_redact_json(home, capsys):
+    import json as jsonlib
+
+    from linglong_clip.__main__ import main
+
+    assert main(["--redact", "sk-abcdefghijklmnopqrstuvwx", "--json"]) == 0
+    payload = jsonlib.loads(capsys.readouterr().out)
+    assert payload["changed"] is True
+    assert payload["hits"] == {"API Key": 1}
+
+
+def test_redact_applies_custom_rule(home, capsys):
+    """自定义规则要真的参与脱敏 —— 这是这轮补上的那条路径。"""
+    from linglong_clip.__main__ import main
+
+    _write_redact_rules(home, {"员工号": r"EMP\d{6}"})
+    assert main(["--redact", "负责人 EMP123456", "--plain"]) == 0
+    assert capsys.readouterr().out.strip() == "负责人 [已脱敏:员工号]"
+
+
+def test_redact_does_not_touch_storage(home, capsys):
+    """试跑脱敏不该写历史、不该改剪贴板 —— 它只是个探针。"""
+    from linglong_clip.__main__ import main
+
+    main(["--redact", "token=abcdefgh"])
+    capsys.readouterr()  # 丢掉试跑本身的输出，只看历史里有没有
+    assert main(["--list"]) == 0
+    assert "abcdefgh" not in capsys.readouterr().out
+
+
+def test_privacy_audit_skips_gui_dispatch(cli_env, monkeypatch):
+    """新标志都要有这条用例守着它不会落到 GUI 分支把进程挂住。"""
+    from linglong_clip.ui import application as app_module
+
+    def boom(*args, **kwargs):
+        raise AssertionError("不该启动 GUI")
+
+    monkeypatch.setattr(app_module, "Application", boom)
+    assert main(["--privacy-audit"]) == 0
+
+
+def test_redact_skips_gui_dispatch(cli_env, monkeypatch):
+    from linglong_clip.ui import application as app_module
+
+    def boom(*args, **kwargs):
+        raise AssertionError("不该启动 GUI")
+
+    monkeypatch.setattr(app_module, "Application", boom)
+    assert main(["--redact", "hello"]) == 0

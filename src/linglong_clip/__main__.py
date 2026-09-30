@@ -36,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  linglong-clipboard --storage-status 查看历史文件的存放位置\n"
             "  linglong-clipboard --merge-duplicates 合并重复项（含归一后新出现的）\n"
             "  linglong-clipboard --outbound       复制敏感内容时实际生效的防护\n"
+            "  linglong-clipboard --privacy-audit  隐私体检：脱敏规则哪些真的会生效\n"
+            "  linglong-clipboard --redact 'token=abc12345'  试跑脱敏，看会被替换成什么\n"
             "  linglong-clipboard --remove 12      删除第 12 条（删除会同步到其它设备）\n"
             "  linglong-clipboard --tombstones     查看删除标记的同步进度\n"
         ),
@@ -180,6 +182,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--rules",
         action="store_true",
         help="列出自动化规则及其触发时机，并标出不会生效的那些",
+    )
+    diagnose.add_argument(
+        "--privacy-audit",
+        action="store_true",
+        help="隐私体检：列出脱敏规则并标出写错/不命中的那些（含自定义规则）",
+    )
+    diagnose.add_argument(
+        "--redact",
+        metavar="TEXT",
+        help="拿一段真实内容试跑脱敏规则，看会被替换成什么（不写历史、不碰剪贴板）",
     )
 
     output = parser.add_argument_group("输出")
@@ -404,6 +416,57 @@ def _primary_status(config) -> dict:
         "detail": detail,
         "warning": warning,
     }
+
+
+def _run_redact(args: argparse.Namespace, config) -> int:
+    """拿一段真实内容试跑脱敏规则。
+
+    存在的理由和 `--outbound` 一样：这件事没法靠读代码确认。用户加的
+    自定义正则写错一个字符，`PrivacyGuard` 只会静默跳过它 —— 复制出去的
+    密钥原样带走，界面上看不出任何异常。所以给一条能当场验的路径，
+    输入什么、出来什么一目了然，且**不写历史、不碰系统剪贴板**。
+    """
+    from .core.privacy import PrivacyGuard
+
+    guard = PrivacyGuard(config)
+    text = args.redact
+    hits = guard.scan(text)
+    redacted = guard.redact(text)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "input": text,
+                    "output": redacted,
+                    "changed": redacted != text,
+                    "hits": hits,
+                    "redact_on_copy_out": bool(
+                        config.get("privacy.redact_on_copy_out", False)
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    if args.plain:
+        print(redacted)
+        return 0
+
+    print(f"输入：{text}")
+    print(f"输出：{redacted}")
+    print()
+    if hits:
+        print("命中规则：" + "、".join(f"{name}×{count}" for name, count in hits.items()))
+    else:
+        print("命中规则：无 —— 这段内容不会被脱敏")
+    if not config.get("privacy.redact_on_copy_out", False):
+        print()
+        print("注意：「复制到外部时脱敏」当前是关闭的，上面的输出只是「如果打开会怎样」。")
+        print("      在设置 → 隐私 里打开后才会真的生效。")
+    return 0
 
 
 def _run_outbound(args: argparse.Namespace, config) -> int:
@@ -705,6 +768,20 @@ def _run_cli(args: argparse.Namespace) -> int:
             print(format_rules(report))
         storage.close()
         return 0 if all(item.will_run for item in report) else 1
+
+    if args.privacy_audit:
+        from .core.privacy_audit import audit_privacy, format_audit
+
+        report = audit_privacy(config)
+        if args.json:
+            print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+        else:
+            print(format_audit(report))
+        storage.close()
+        return 0 if report.healthy else 1
+
+    if args.redact is not None:
+        return _run_redact(args, config)
 
     if args.import_native_history:
         return _run_native_history_import(args, storage, config)
@@ -1021,6 +1098,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.selfcheck,
             args.config_audit,
             args.rules,
+            args.privacy_audit,
+            args.redact is not None,
         ]
     ):
         return _run_cli(args)

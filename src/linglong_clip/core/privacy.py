@@ -181,7 +181,3 @@ class PrivacyGuard:
         """敏感内容是否允许入库（入库后由 TTL 清除）。"""
         ttl = self._cfg("privacy.sensitive_retention_seconds", 0) or 0
         return int(ttl) > 0
-
-    @staticmethod
-    def describe_hits(reasons: List[str]) -> str:
-        return "、".join(reasons) if reasons else "无"

@@ -179,6 +179,29 @@ def main() -> int:
     privacy_dialog._refresh_outbound_hint()
     _render(privacy_dialog, OUT / "settings-privacy-outbound.png")
 
+    # 设置页「隐私 → 自定义脱敏规则」：边写边体检，写错的当场标出来。
+    # 刻意放一条能命中的 + 一条写错的，让这张图说明它到底在做什么。
+    rules_dialog = SettingsDialog(
+        _config(
+            {
+                "privacy.redact_on_copy_out": True,
+                "privacy.custom_redact_rules": {
+                    "员工号": r"EMP\d{6}",
+                    "内部工单": "[unclosed",
+                },
+            }
+        ),
+        automation,
+    )
+    rules_dialog.resize(760, 700)
+    rules_tabs = rules_dialog.findChild(QTabWidget)
+    if rules_tabs is not None:
+        for index in range(rules_tabs.count()):
+            if "隐私" in rules_tabs.tabText(index):
+                rules_tabs.setCurrentIndex(index)
+                break
+    _render(rules_dialog, OUT / "settings-privacy-redact.png")
+
     # 列表密度对比：同一批记录在两种密度下的行高差异
     from linglong_clip.ui.main_window import MainWindow as _Window
 

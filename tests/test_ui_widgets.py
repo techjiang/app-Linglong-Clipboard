@@ -1402,3 +1402,96 @@ def test_rules_state_rejects_non_array(config, qt_app):
     dialog = _dialog_with_rules(config, [])
     dialog._rules_editor.setPlainText('{"name": "不是数组"}')
     assert "数组" in dialog._rules_state.text()
+
+
+# ---- 设置页「隐私 → 自定义脱敏规则」----
+
+
+def test_settings_redact_editor_reflects_config(qt_app, home):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    config.set("privacy.custom_redact_rules", {"员工号": r"EMP\d{6}"})
+    dialog = SettingsDialog(config)
+    assert "员工号" in dialog._redact_editor.toPlainText()
+
+
+def test_settings_redact_editor_empty_by_default(qt_app, home):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    dialog = SettingsDialog(Config(home / "config.json"))
+    assert dialog._redact_editor.toPlainText().strip() == "{}"
+
+
+def test_settings_saves_custom_redact_rules(qt_app, home):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    dialog = SettingsDialog(config)
+    dialog._redact_editor.setPlainText('{"员工号": "EMP\\\\d{6}"}')
+    dialog._save()
+
+    assert config.get("privacy.custom_redact_rules") == {"员工号": r"EMP\d{6}"}
+    assert "privacy.custom_redact_rules" in dialog.changes
+
+
+def test_settings_redact_editor_flags_bad_json(qt_app, home):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    dialog = SettingsDialog(Config(home / "config.json"))
+    dialog._redact_editor.setPlainText("{not json")
+    assert "JSON 无法解析" in dialog._redact_state.text()
+
+
+def test_settings_redact_editor_flags_uncompilable_rule(qt_app, home):
+    """写错的正则要在界面上当场指出，而不是保存后静默失效。"""
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    dialog = SettingsDialog(Config(home / "config.json"))
+    dialog._redact_editor.setPlainText('{"写错的": "[unclosed"}')
+    state = dialog._redact_state.text()
+    assert "写错的" in state
+    assert "不会生效" in state
+
+
+def test_settings_redact_editor_ok_for_valid_rule(qt_app, home):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    dialog = SettingsDialog(Config(home / "config.json"))
+    dialog._redact_editor.setPlainText('{"员工号": "EMP\\\\d{6}"}')
+    assert "✓" in dialog._redact_state.text()
+
+
+def test_settings_warns_when_redact_switch_off(qt_app, home):
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    config.set("privacy.redact_on_copy_out", False)
+    dialog = SettingsDialog(config)
+    dialog._redact_editor.setPlainText('{"员工号": "EMP\\\\d{6}"}')
+    assert "没勾选" in dialog._redact_state.text()
+
+
+def test_settings_rejects_bad_rules_without_clearing(qt_app, home, monkeypatch):
+    """格式错误时不该保存，也不该把用户已有的规则清掉。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    config.set("privacy.custom_redact_rules", {"员工号": r"EMP\d{6}"})
+    dialog = SettingsDialog(config)
+
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: None))
+    dialog._redact_editor.setPlainText("{broken")
+    dialog._save()
+
+    assert config.get("privacy.custom_redact_rules") == {"员工号": r"EMP\d{6}"}
