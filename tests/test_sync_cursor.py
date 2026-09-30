@@ -41,20 +41,67 @@ def test_cursor_file_is_human_readable(tmp_path):
     store.set("folder:peer.llsync", 99.0)
 
     raw = json.loads(path.read_text(encoding="utf-8"))
-    assert raw["version"] == 1
-    assert raw["cursors"]["folder:peer.llsync"] == 99.0
+    assert raw["version"] == 2
+    # 每项是 `[时间戳, id]`：只记时间戳时，同刻记录塞满一页会让游标推不动
+    assert raw["cursors"]["folder:peer.llsync"] == [99.0, 0]
     assert "updated_at" in raw
 
 
 def test_advance_is_monotonic(tmp_path):
     store = SyncCursorStore(tmp_path / "c.json")
     store.load()
-    assert store.advance("k", 100.0) == 100.0
+    assert store.advance("k", 100.0) == (100.0, 0)
     # 反向推进被拒绝：多对端同步时不能被旧时间戳拖回去
-    assert store.advance("k", 50.0) == 100.0
+    assert store.advance("k", 50.0) == (100.0, 0)
     assert store.get("k") == 100.0
     # 向前推进正常生效
-    assert store.advance("k", 200.0) == 200.0
+    assert store.advance("k", 200.0) == (200.0, 0)
+
+
+def test_advance_compares_created_at_then_id(tmp_path):
+    """同一时刻内按 id 比较，而不是被当成「没有变化」。"""
+    store = SyncCursorStore(tmp_path / "c.json")
+    store.load()
+    assert store.advance("k", 100.0, since_id=10) == (100.0, 10)
+    # 时间相同、id 更大 -> 仍是向前推进
+    assert store.advance("k", 100.0, since_id=42) == (100.0, 42)
+    assert store.get_pair("k") == (100.0, 42)
+    # 时间相同、id 更小 -> 拒绝回退
+    assert store.advance("k", 100.0, since_id=7) == (100.0, 42)
+    # 时间更早 -> 一律拒绝，哪怕 id 很大
+    assert store.advance("k", 99.0, since_id=999) == (100.0, 42)
+
+
+def test_since_pair_resets_id_when_margin_shifts_time(tmp_path):
+    """回退安全窗口后必须把 id 归零。
+
+    否则「回到 T-1 时刻」却仍要求 id > 500，会漏掉 T-1 到 T 之间
+    id 较小的记录 —— 回退是为了多读，不能反而读漏。
+    """
+    store = SyncCursorStore(tmp_path / "c.json")
+    store.load()
+    store.set("k", 1000.0, since_id=500)
+    since, since_id = store.since_pair_for("k")
+    assert since == pytest.approx(1000.0 - SAFETY_MARGIN)
+    assert since_id == 0
+
+
+def test_since_pair_keeps_id_when_no_margin_applied(tmp_path):
+    """游标为 0 时不回退，id 也保持原样。"""
+    store = SyncCursorStore(tmp_path / "c.json")
+    store.load()
+    assert store.since_pair_for("missing") == (0.0, 0)
+
+
+def test_reads_legacy_scalar_cursor_file(tmp_path):
+    """旧的裸时间戳格式仍能读进来，按 id=0 处理。"""
+    path = tmp_path / "c.json"
+    path.write_text(
+        json.dumps({"version": 1, "cursors": {"lan:a:1": 1234.5}}), encoding="utf-8"
+    )
+    store = SyncCursorStore(path)
+    store.load()
+    assert store.get_pair("lan:a:1") == (1234.5, 0)
 
 
 def test_advance_skips_write_when_unchanged(tmp_path):
@@ -142,6 +189,7 @@ def test_status_reports_rows(tmp_path):
     assert status["count"] == 1
     assert status["cursors"][0]["key"] == "lan:a:1"
     assert status["cursors"][0]["since"] == 1700000000.0
+    assert status["cursors"][0]["since_id"] == 0
     assert status["cursors"][0]["since_text"] != "从未"
 
 
@@ -369,3 +417,75 @@ def test_lan_explicit_since_overrides_cursor(tmp_path, home):
         assert client._client.sync_peer(peer, since=101.5) == 1
     finally:
         server.stop()
+
+
+def test_status_exposes_id_part_of_cursor(tmp_path):
+    """状态输出要带上 `since_id`：只显示时间戳会让人以为同刻记录没在推进。"""
+    store = SyncCursorStore(tmp_path / "c.json")
+    store.set("lan:a:1", 1700000000.0, since_id=321)
+    row = store.status()["cursors"][0]
+    assert row["since"] == 1700000000.0
+    assert row["since_id"] == 321
+
+
+def test_snapshot_keeps_timestamp_only_shape(tmp_path):
+    """`snapshot()` 保持 `key -> 时间戳` 的既有形状，CLI 与旧用例都按它取用。"""
+    store = SyncCursorStore(tmp_path / "c.json")
+    store.set("k", 100.0, since_id=9)
+    assert store.snapshot() == {"k": 100.0}
+    assert store.snapshot_pairs() == {"k": (100.0, 9)}
+
+
+def test_pairs_round_trip_through_file(tmp_path):
+    """复合游标要能原样落盘再读回。"""
+    path = tmp_path / "c.json"
+    SyncCursorStore(path).set("lan:a:1", 1700000000.5, since_id=77)
+
+    reloaded = SyncCursorStore(path)
+    reloaded.load()
+    assert reloaded.get_pair("lan:a:1") == (1700000000.5, 77)
+
+
+def test_id_part_survives_reset_and_reload(tmp_path):
+    path = tmp_path / "c.json"
+    store = SyncCursorStore(path)
+    store.reset()
+    assert store.get_pair("k") == (0.0, 0)
+
+
+def test_multi_peer_cursors_advance_independently_with_ids(tmp_path):
+    """多个对端各自推进，`id` 部分互不干扰。"""
+    store = SyncCursorStore(tmp_path / "c.json")
+    store.advance("lan:a:1", 100.0, since_id=5)
+    store.advance("lan:b:2", 100.0, since_id=900)
+    assert store.get_pair("lan:a:1") == (100.0, 5)
+    assert store.get_pair("lan:b:2") == (100.0, 900)
+    # a 推进到同一时刻但 id 更大
+    store.advance("lan:a:1", 100.0, since_id=6)
+    assert store.get_pair("lan:a:1") == (100.0, 6)
+    assert store.get_pair("lan:b:2") == (100.0, 900)
+
+
+def test_malformed_pair_entries_are_dropped(tmp_path):
+    """`[ts, id]` 写坏时只丢这一项，不连累其它游标。"""
+    path = tmp_path / "c.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "cursors": {
+                    "good": [100.0, 5],
+                    "bad_short": [100.0],
+                    "bad_text": ["x", "y"],
+                    "bad_null": None,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    store = SyncCursorStore(path)
+    store.load()
+    assert store.get_pair("good") == (100.0, 5)
+    assert store.get_pair("bad_short") == (0.0, 0)
+    assert store.get_pair("bad_text") == (0.0, 0)
+    assert store.get_pair("bad_null") == (0.0, 0)

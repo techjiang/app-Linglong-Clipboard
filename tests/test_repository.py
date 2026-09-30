@@ -662,3 +662,118 @@ def test_iter_all_after_close_matches_list(repo):
     repo.close()
 
     assert len(list(repo.iter_all())) == len(repo.list())
+
+
+# ---- 同刻遍历（iter_since + since_id）----
+#
+# 与 `Storage.iter_since` 必须逐条同语义：同步模块不区分后端，
+# 两边行为一旦分叉，同刻记录塞满一页时 JSON 后端会静默丢记录。
+
+
+def test_iter_since_orders_by_time_then_id(repo):
+    for index in range(5):
+        _add(repo, content=f"c{index}", hash=f"h{index}", created_at=1000.0)
+
+    assert [item.hash for item in repo.iter_since(0.0)] == [
+        f"h{index}" for index in range(5)
+    ]
+
+
+def test_iter_since_is_exclusive_on_time(repo):
+    for index in range(3):
+        _add(repo, content=f"c{index}", hash=f"h{index}", created_at=1000.0 + index)
+
+    assert [item.hash for item in repo.iter_since(1001.0)] == ["h2"]
+
+
+def test_iter_since_id_resumes_within_same_instant(repo):
+    """同一时刻内靠 `since_id` 续读 —— 同刻记录塞满一页时的唯一出路。"""
+    for index in range(10):
+        _add(repo, content=f"c{index}", hash=f"h{index}", created_at=1000.0)
+
+    items = list(repo.iter_since(0.0))
+    page = items[:4]
+    assert [item.hash for item in page] == ["h0", "h1", "h2", "h3"]
+
+    last = page[-1]
+    assert [item.hash for item in repo.iter_since(last.created_at, since_id=last.id)] == [
+        "h4", "h5", "h6", "h7", "h8", "h9"
+    ]
+
+
+def test_iter_since_id_at_end_returns_empty(repo):
+    for index in range(4):
+        _add(repo, content=f"c{index}", hash=f"h{index}", created_at=1000.0)
+
+    items = list(repo.iter_since(0.0))
+    last = items[-1]
+    assert list(repo.iter_since(last.created_at, since_id=last.id)) == []
+
+
+def test_iter_since_id_excludes_earlier_ids_in_same_instant(repo):
+    """`since_id` 是「字典序严格大于」：同刻里 id 更小的不再重读。"""
+    for index in range(4):
+        _add(repo, content=f"c{index}", hash=f"h{index}", created_at=1000.0)
+
+    middle = list(repo.iter_since(0.0))[1]
+    after = [item.hash for item in repo.iter_since(middle.created_at, since_id=middle.id)]
+    assert after == ["h2", "h3"]
+
+
+def test_iter_since_matches_storage_on_mixed_timestamps(repo):
+    """时间跨度与同刻混在一起时，整体仍是 (时间, id) 全序。"""
+    _add(repo, content="a", hash="ha", created_at=1000.0)
+    _add(repo, content="b", hash="hb", created_at=1000.0)
+    _add(repo, content="c", hash="hc", created_at=1001.0)
+    _add(repo, content="d", hash="hd", created_at=1001.0)
+    _add(repo, content="e", hash="he", created_at=1002.0)
+
+    assert [item.hash for item in repo.iter_since(0.0)] == [
+        "ha", "hb", "hc", "hd", "he"
+    ]
+    # `since` 排他：给 1001.0 时，恰好落在该时刻的两条按语义被排除
+    assert [item.hash for item in repo.iter_since(1001.0)] == ["he"]
+
+    # 想读到 1001.0 上的记录，得给「1000.0 + 该条之前的 id」
+    first_at_1001 = repo.find_by_hash("hc")
+    assert first_at_1001 is not None
+    rest = [item.hash for item in repo.iter_since(1000.0, since_id=first_at_1001.id - 1)]
+    assert rest == ["hc", "hd", "he"]
+
+
+def test_iter_since_matches_storage_backend(repo, storage):
+    """两个后端在 `(since, since_id)` 上必须给出**逐条相同**的结果。
+
+    同步模块不区分后端（`iter_since` 是共用接口）。一旦分叉，
+    同刻记录塞满一页时只有其中一个后端会静默丢记录 —— 而这类缺陷
+    没有任何报错，只会表现为「换个存储后端就少一段历史」。
+    """
+    from linglong_clip.core.models import ClipboardItem
+
+    rows = [
+        ("ha", 1000.0),
+        ("hb", 1000.0),
+        ("hc", 1000.0),
+        ("hd", 1001.0),
+        ("he", 1001.0),
+        ("hf", 1002.0),
+    ]
+    for digest, created in rows:
+        _add(repo, content=digest, hash=digest, created_at=created)
+        storage.add(
+            ClipboardItem(
+                kind="text", content=digest, preview=digest,
+                hash=digest, created_at=created,
+            )
+        )
+
+    # 覆盖三档游标：起点、同刻中部（带 id）、跨时刻
+    probes = [(0.0, 0), (1000.0, 0), (1000.0, 2), (1000.0, 3), (1001.0, 0), (1001.0, 5)]
+    for since, since_id in probes:
+        json_side = [
+            item.hash for item in repo.iter_since(since, since_id=since_id)
+        ]
+        sqlite_side = [
+            item.hash for item in storage.iter_since(since, since_id=since_id)
+        ]
+        assert json_side == sqlite_side, f"since={since} since_id={since_id}"

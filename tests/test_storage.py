@@ -474,3 +474,109 @@ def test_iter_all_after_close_returns_nothing(storage):
     _add(storage, content="x", hash="h")
     storage.close()
     assert list(storage.iter_all()) == []
+
+
+# ---- 同刻遍历（iter_since + since_id）----
+#
+# `iter_since` 是同步游标的承载者。它必须表达「严格晚于 (created_at, id)」，
+# 而不只是「严格晚于 created_at」—— 后者在同刻记录多到塞满一页时推不动，
+# 剩下的记录会被永久跳过。
+
+
+def test_iter_since_orders_by_time_then_id(storage):
+    """同一时刻的多条按 id 升序给出，顺序稳定可复现。"""
+    for index in range(5):
+        _add(storage, content=f"c{index}", hash=f"h{index}", created_at=1000.0)
+
+    seen = [item.hash for item in storage.iter_since(0.0, batch=2)]
+    assert seen == ["h0", "h1", "h2", "h3", "h4"]
+
+
+def test_iter_since_is_exclusive_on_time(storage):
+    """`since` 是排他语义：恰好等于它的那条不再取出。"""
+    for index in range(3):
+        _add(storage, content=f"c{index}", hash=f"h{index}", created_at=1000.0 + index)
+
+    seen = [item.hash for item in storage.iter_since(1001.0)]
+    assert seen == ["h2"]
+
+
+def test_iter_since_id_resumes_within_same_instant(storage):
+    """核心作用：同一时刻内靠 `since_id` 续读，翻页才能前进。
+
+    这就是「同刻记录塞满一页」的解法 —— 只给 `since=1000.0` 时，
+    这条查询会返回空，剩下的记录再也拿不到。
+    """
+    for index in range(10):
+        _add(storage, content=f"c{index}", hash=f"h{index}", created_at=1000.0)
+
+    # `batch` 是**每次 SQL 取多少行**，不是迭代器总数 —— 同步侧靠
+    # 「取一页、读最后一行的 (created_at, id)、再拿它当游标取下一页」翻页。
+    first = list(storage.iter_since(0.0, batch=4))
+    assert [item.hash for item in first] == [f"h{index}" for index in range(10)]
+
+    # 模拟同步翻页：首页只取前 4 条，用最后一条的位置续读
+    page = [item for item, _ in zip(first, range(4))]
+    assert [item.hash for item in page] == ["h0", "h1", "h2", "h3"]
+
+    last = page[-1]
+    rest = [item.hash for item in storage.iter_since(last.created_at, since_id=last.id)]
+    assert rest == ["h4", "h5", "h6", "h7", "h8", "h9"]
+
+
+def test_iter_since_id_none_match_returns_empty(storage):
+    """游标停在该时刻的最后一条时，返回空而不是重读。"""
+    for index in range(4):
+        _add(storage, content=f"c{index}", hash=f"h{index}", created_at=1000.0)
+
+    items = list(storage.iter_since(0.0))
+    last = items[-1]
+    assert list(storage.iter_since(last.created_at, since_id=last.id)) == []
+
+    # 同一时刻、id 介于中间的位置：应当只给出它后面的那些
+    middle = items[1]
+    after = [
+        item.hash
+        for item in storage.iter_since(middle.created_at, since_id=middle.id)
+    ]
+    assert after == ["h2", "h3"]
+
+
+def test_iter_since_batch_does_not_change_result(storage):
+    """批量只影响分页次数，不改变结果集与顺序。"""
+    for index in range(20):
+        _add(storage, content=f"c{index}", hash=f"h{index}", created_at=1000.0)
+
+    for batch in (1, 3, 20, 500):
+        got = [item.hash for item in storage.iter_since(0.0, batch=batch)]
+        assert got == [f"h{index}" for index in range(20)], f"batch={batch}"
+
+
+def test_iter_since_mixed_timestamps(storage):
+    """时间跨度与同刻混在一起时，整体仍按 (时间, id) 全序。"""
+    _add(storage, content="a", hash="ha", created_at=1000.0)
+    _add(storage, content="b", hash="hb", created_at=1000.0)
+    _add(storage, content="c", hash="hc", created_at=1001.0)
+    _add(storage, content="d", hash="hd", created_at=1001.0)
+    _add(storage, content="e", hash="he", created_at=1002.0)
+
+    seen = [item.hash for item in storage.iter_since(0.0, batch=2)]
+    assert seen == ["ha", "hb", "hc", "hd", "he"]
+
+    # `since` 排他：给 1001.0 时，恰好落在 1001.0 的两条按语义被排除
+    assert [item.hash for item in storage.iter_since(1001.0)] == ["he"]
+
+    # 要读到 1001.0 上的记录，得给「1000.0 + 该条之前的 id」
+    first_at_1001 = storage.find_by_hash("hc")
+    assert first_at_1001 is not None
+    rest = [
+        item.hash
+        for item in storage.iter_since(1000.0, since_id=first_at_1001.id - 1)
+    ]
+    assert rest == ["hc", "hd", "he"]
+
+
+def test_iter_since_after_close_returns_nothing(storage):
+    _add(storage, content="x", hash="h", created_at=1000.0)
+    storage.close()
+    assert list(storage.iter_since(0.0)) == []

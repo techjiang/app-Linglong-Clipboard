@@ -59,6 +59,18 @@ class SyncRecord:
     #: 详见 ``models.PINNED_BY_KEY`` 的说明。
     pinned_by: str = ""
     created_at: float = field(default_factory=time.time)
+    #: 发送方库内的自增 id，**仅用于局域网翻页**，不参与内容判重。
+    #:
+    #: 游标是 `(created_at, seq)` 复合值：同一时刻的记录多到塞满一页时，
+    #: 只记时间戳的游标在首页之后就推不动了 —— 下一页请求
+    #: `created_at > T` 返回空，剩下的记录不是「更旧」而是**一样新**，
+    #: 于是被永久跳过且没有任何提示。`seq` 就是那个能让游标继续前进的次级键。
+    #:
+    #: 它不进 JSON：那是发送方的内部编号，对接收方没有意义
+    #: （接收方靠 `hash` 判重，靠 `created_at` 排序），
+    #: 而且 `to_json` 输出的就是写进共享日志的格式，多一个字段就多一次解析风险。
+    #: 局域网响应单独携带它，见 `lan_sync.collect_records_detailed`。
+    seq: int = 0
     #: 图片等二进制内容不进同步（体积大且隐私风险高）
     payload_b64: str = ""
     #: 非 0 表示这是一条**删除标记**而非内容记录，值为删除时刻。
@@ -122,6 +134,9 @@ class SyncRecord:
             favorite=bool(data.get("favorite", False)),
             pinned_by=str(data.get("pinned_by", "") or ""),
             created_at=float(data.get("created_at") or time.time()),
+            # 局域网响应会带上它（翻页游标的次级键）；共享日志里没有这个键，
+            # 缺省为 0，两种载入路径共用同一份解析。见 `SyncRecord.seq`。
+            seq=int(data.get("seq") or 0),
             payload_b64=str(data.get("payload_b64", "")),
             deleted_at=float(data.get("deleted_at") or 0.0),
             flag_change=str(data.get("flag_change", "") or ""),

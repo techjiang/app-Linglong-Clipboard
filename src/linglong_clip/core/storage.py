@@ -350,8 +350,14 @@ class Storage:
             if len(rows) < size:
                 return
 
-    def iter_since(self, since: float = 0.0, *, batch: int = 500) -> Iterator[ClipboardItem]:
-        """按 `(created_at, id)` 升序遍历 `created_at > since` 的记录。
+    def iter_since(
+        self,
+        since: float = 0.0,
+        *,
+        since_id: int = 0,
+        batch: int = 500,
+    ) -> Iterator[ClipboardItem]:
+        """按 `(created_at, id)` 升序遍历严格晚于 `(since, since_id)` 的记录。
 
         与 `iter_all` 的区别是**排序维度**：同步对端用时间戳做游标，
         所以这里必须按时间升序读，才能「读完一批就把游标推到这批的最大时间」。
@@ -361,19 +367,30 @@ class Storage:
         `id` 作为次级排序键保证**同一时刻的多条记录顺序稳定**：
         只按 `created_at` 排序时，同毫秒记录的相对次序由数据库决定，
         翻页可能重复或漏读。加上 `id` 就有了确定的全序。
+
+        `since_id` 是**游标的一部分**，不是可选装饰。只按时间戳做游标时，
+        「同一时刻的记录多到塞满一页」会让翻页彻底卡死：首页返回满页且
+        时间都是 `T`，下一页请求 `created_at > T` 得到 0 条 —— 剩下的记录
+        比这一页更旧吗？不是，是**一样新**。它们既不在这一页，也永远
+        不在下一页，且没有任何报错。`since_id` 让「同一时刻内读到哪一条」
+        也能表达，翻页于是总能前进。
+
+        边界语义是 `(created_at, id)` **字典序严格大于** `(since, since_id)`：
+        首页 `(since, since_id > 0)` 也不会重读 `since` 时刻那条 id 更小的记录。
         """
         if not self._usable():
             return
         size = max(1, int(batch or 1))
-        # 首页是「严格晚于 since」；之后才用 (created_at, id) 做键集续读。
-        # 这一点不能省：若首页就带上 `created_at = since AND id > -1`，
-        # 恰好等于 `since` 的那条会被重新取出 —— 而 `since` 语义本就是排他的。
-        last_seen: Optional[float] = None
-        last_id = 0
+        first = float(since or 0.0)
+        first_id = max(0, int(since_id or 0))
+        # 键集续读：`(created_at, id)` 全序，条件从第一页起就是同一个，
+        # 不必为「首页」单开一条不含 id 的语义（那样会漏掉同刻记录）。
+        last_seen: Optional[float] = None if first_id == 0 else first
+        last_id = first_id
         while True:
             if last_seen is None:
                 where = "created_at > ?"
-                params: List[Any] = [float(since or 0.0)]
+                params: List[Any] = [first]
             else:
                 where = "created_at > ? OR (created_at = ? AND id > ?)"
                 params = [last_seen, last_seen, last_id]

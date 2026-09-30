@@ -421,19 +421,37 @@ class JsonRepository:
             for item in items:
                 yield copy.deepcopy(item)
 
-    def iter_since(self, since: float = 0.0, *, batch: int = 500):
-        """按 `(created_at, id)` 升序遍历 `created_at > since` 的记录。
+    def iter_since(self, since: float = 0.0, *, since_id: int = 0, batch: int = 500):
+        """按 `(created_at, id)` 升序遍历严格晚于 `(since, since_id)` 的记录。
 
         与 `Storage.iter_since` 同语义：局域网对端用时间戳做游标，
         需要按时间升序读才能把游标稳步往前推。
+
+        `since_id` 同样是游标的一部分：同一时刻的记录多到塞满一页时，
+        只看时间戳的游标推进不了，剩下那些「一样新」的记录会被永久跳过。
+        字典序比较见 `Storage.iter_since` 的说明。
         """
         del batch  # 内存后端无需分批
+        first = float(since or 0.0)
+        first_id = max(0, int(since_id or 0))
+
+        def _after(item) -> bool:
+            """严格晚于 `(since, since_id)` 的字典序判断。
+
+            `since_id == 0` 时退化为**只比时间**（`created_at > since`）——
+            这不是偷懒，是为了与 `Storage.iter_since` 逐条同语义：
+            那边第一页的 `WHERE created_at > ?` 就是这个意思。
+            两边一旦分叉，同刻记录塞满一页时 JSON 后端会静默丢记录。
+            """
+            created = float(item.created_at or 0.0)
+            if created > first:
+                return True
+            if first_id == 0 or created < first:
+                return False
+            return int(item.id or 0) > first_id
+
         with self._lock:
-            items = [
-                item
-                for item in self._items.values()
-                if float(item.created_at or 0.0) > float(since or 0.0)
-            ]
+            items = [item for item in self._items.values() if _after(item)]
             items.sort(key=lambda one: (float(one.created_at or 0.0), int(one.id or 0)))
             for item in items:
                 yield copy.deepcopy(item)

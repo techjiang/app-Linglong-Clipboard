@@ -905,3 +905,156 @@ def test_lan_partial_paging_failure_keeps_progress_and_retries(nodes, monkeypatc
     monkeypatch.setattr(b._client, "fetch", original_fetch)
     assert b.sync_all() == 300
     assert remote.count() == 800
+
+
+# ---------- 同刻记录塞满一页：游标必须靠 (created_at, id) 复合键前进 ----------
+
+
+def _add_same_instant(storage, count, *, at, prefix="s"):
+    """写入 `count` 条 `created_at` 完全相同的记录。
+
+    这不是造出来的极端场景：紧密循环写库、批量导入系统剪贴板历史，
+    都会让同一毫秒挤进大量记录。
+    """
+    for index in range(count):
+        digest = f"{prefix}{index:05d}"
+        storage.add(
+            ClipboardItem(
+                kind="text",
+                content=digest,
+                preview=digest,
+                created_at=at,
+                hash=digest,
+            )
+        )
+
+
+def test_lan_same_instant_beyond_one_page_is_not_lost(nodes):
+    """同刻记录超过一页时，翻页必须靠 id 继续前进，而不是就此卡死。
+
+    这是「只按时间戳做游标」的死路：首页返回满页、时间戳全是 `T`，
+    下一页请求 `created_at > T` 拿到 0 条 —— 剩下的记录不是「更旧」，
+    是**一样新**。它们既不在这一页、也永远不在下一页，且毫无报错。
+    1005 > 500*2，所以旧实现会丢 505 条。
+    """
+    make, local, remote = nodes
+    _add_same_instant(local, 1005, at=3000.0)
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+
+    assert b.sync_all() == 1005
+    assert remote.count() == 1005
+    assert {item.hash for item in remote.list(limit=10_000)} == {
+        f"s{index:05d}" for index in range(1005)
+    }
+
+
+def test_lan_same_instant_paging_is_idempotent(nodes):
+    """靠 id 推进游标之后，重复同步仍不该重复导入。"""
+    make, local, remote = nodes
+    _add_same_instant(local, 1005, at=3000.0)
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+
+    assert b.sync_all() == 1005
+    assert b.sync_all() == 0
+    assert remote.count() == 1005
+
+
+@pytest.mark.parametrize("count", [499, 500, 501, 1000, 1001])
+def test_lan_same_instant_boundary_sizes(nodes, count):
+    """整数页边界逐档验证：不该漏读，也不该死循环。
+
+    恰好一页（500）最容易出问题：旧实现首页满、时间戳全相同，
+    下一页直接空手而归，一条不差地丢掉全部。
+    """
+    make, local, remote = nodes
+    _add_same_instant(local, count, at=4000.0)
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+
+    assert b.sync_all() == count
+    assert remote.count() == count
+    assert b.sync_all() == 0
+
+
+def test_lan_same_instant_followed_by_new_records(nodes):
+    """同刻记录占满两页之后，后续带新时间戳的记录仍要到达。"""
+    make, local, remote = nodes
+    _add_same_instant(local, 1000, at=5000.0)
+    for index in range(3):
+        digest = f"t{index:05d}"
+        local.add(
+            ClipboardItem(
+                kind="text", content=digest, preview=digest,
+                created_at=5001.0, hash=digest,
+            )
+        )
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+
+    assert b.sync_all() == 1003
+    assert remote.count() == 1003
+    assert remote.find_by_hash("t00000") is not None
+
+
+def test_lan_same_instant_then_new_same_instant_record_arrives(nodes):
+    """游标落在一个时刻上之后，该时刻**后补**的记录仍要能同步过来。
+
+    这是 `since_for` 回退安全窗口与复合键配合的地方：只回退时间、
+    却仍按 `id > 游标` 过滤的话，回退区间里 id 较小的记录会被漏掉。
+    """
+    make, local, remote = nodes
+    _add_same_instant(local, 1005, at=6000.0)
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+    assert b.sync_all() == 1005
+
+    # 对端在**同一时刻**又写了 3 条（游标正落在 6000.0 上）
+    for index in range(3):
+        digest = f"late{index}"
+        local.add(
+            ClipboardItem(
+                kind="text", content=digest, preview=digest,
+                created_at=6000.0, hash=digest,
+            )
+        )
+
+    assert b.sync_all() == 3
+    assert remote.count() == 1008
+
+
+def test_lan_server_page_carries_seq(nodes):
+    """服务端必须在响应里带上 `seq`：它是翻页游标的次级键。
+
+    只带 `created_at` 时客户端无从区分同一时刻内的先后，
+    游标推不动 —— 见 `test_lan_same_instant_beyond_one_page_is_not_lost`。
+    """
+    make, local, remote = nodes
+    _add_same_instant(local, 3, at=7000.0)
+
+    server = LanSyncServer(local, device_name="a")
+    page = [json.loads(blob) for blob in server.collect_records(limit=500)]
+    assert len(page) == 3
+    seqs = [entry.get("seq") for entry in page]
+    assert all(isinstance(seq, int) and seq > 0 for seq in seqs)
+    assert seqs == sorted(seqs), "同刻记录按 id 升序供出"
+
+
+def test_lan_seq_is_not_written_into_shared_journal(storage, tmp_path):
+    """`seq` 只走局域网响应，不能混进共享日志格式。
+
+    写进日志会改变格式，还要处理老版本读到未知字段的情形；
+    而 `seq` 是发送方的库内编号，对接收方没有意义。
+    """
+    record = SyncRecord(hash="h", kind="text", content="x", preview="x", seq=42)
+    assert "seq" not in record.to_json()
+
+    # 从日志形状的字典还原时，缺这个键要落回 0，而不是报错
+    restored = SyncRecord.from_json(record.to_json())
+    assert restored is not None and restored.seq == 0

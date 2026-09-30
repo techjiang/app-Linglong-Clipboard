@@ -96,6 +96,24 @@ class PeerInfo:
         }
 
 
+def _record_payload(record: SyncRecord) -> Dict[str, object]:
+    """局域网响应里的单条载荷。
+
+    与 `SyncRecord.to_json()` 的唯一区别是**多带一个 `seq`**：它是发送方库内
+    的自增 id，只服务于翻页游标的次级键，不必也不该写进共享日志
+    （那会改变日志格式，还要处理老版本读到未知字段的情形）。
+    `seq` 只在记录真的来自内容行时才写：墓碑与标记变更没有对应的内容行。
+    """
+    payload = record.to_json()
+    if record.seq:
+        payload["seq"] = int(record.seq)
+    return payload
+
+
+def _encode_record(record: SyncRecord) -> str:
+    return json.dumps(_record_payload(record), ensure_ascii=False)
+
+
 def parse_peer(spec: str, default_port: int) -> Optional[Tuple[str, int]]:
     """解析 `host:port` / `host` / `http://host:port` 形式的对端地址。"""
     if not spec:
@@ -183,12 +201,16 @@ class _PeerHandler(BaseHTTPRequestHandler):
             except ValueError:
                 since = 0.0
             try:
+                since_id = int(params.get("since_id", ["0"])[0])
+            except ValueError:
+                since_id = 0
+            try:
                 limit = int(params.get("limit", [str(DEFAULT_PAGE_SIZE)])[0])
             except ValueError:
                 limit = DEFAULT_PAGE_SIZE
             limit = max(1, min(limit, MAX_SYNC_ENTRIES))
             records, sent_tombstones, sent_changes = owner.collect_records_detailed(
-                since=since, limit=limit
+                since=since, since_id=max(0, since_id), limit=limit
             )
             self._send_json(
                 200,
@@ -270,7 +292,13 @@ class LanSyncServer:
 
     # ---- 数据 ----
 
-    def collect_records(self, *, since: float = 0.0, limit: int = DEFAULT_PAGE_SIZE) -> List[str]:
+    def collect_records(
+        self,
+        *,
+        since: float = 0.0,
+        since_id: int = 0,
+        limit: int = DEFAULT_PAGE_SIZE,
+    ) -> List[str]:
         """把最近记录编码成 `SyncRecord` JSON 串，供 HTTP 响应携带。
 
         返回字符串列表而不是对象，是因为加密后的载荷就是字节串，
@@ -278,10 +306,14 @@ class LanSyncServer:
 
         真正要确认送达的是 ``collect_records_detailed``，见它。
         """
-        return self.collect_records_detailed(since=since, limit=limit)[0]
+        return self.collect_records_detailed(since=since, since_id=since_id, limit=limit)[0]
 
     def collect_records_detailed(
-        self, *, since: float = 0.0, limit: int = DEFAULT_PAGE_SIZE
+        self,
+        *,
+        since: float = 0.0,
+        since_id: int = 0,
+        limit: int = DEFAULT_PAGE_SIZE,
     ) -> tuple:
         """同 `collect_records`，但额外返回「本批带出去的墓碑与标记变更」。
 
@@ -293,7 +325,7 @@ class LanSyncServer:
         """
         sent_tombstones: List[Tombstone] = []
         sent_changes: List[FlagChange] = []
-        items = self._eligible_items(since=since, limit=limit)
+        items = self._eligible_items(since=since, since_id=since_id, limit=limit)
 
         payload = [
             SyncRecord(
@@ -312,6 +344,9 @@ class LanSyncServer:
                 # 文件夹模式同一条规则，两处不能各写一套。
                 pinned_by=(item.pinned_by or self.device_name) if item.pinned else "",
                 created_at=item.created_at,
+                # 翻页游标的次级键：同一时刻的记录靠它区分先后，
+                # 见 `SyncRecord.seq` 的说明。
+                seq=int(item.id or 0),
             )
             for item in items
         ]
@@ -358,12 +393,12 @@ class LanSyncServer:
             return [], sent_tombstones, sent_changes
 
         body = "\n".join(
-            json.dumps(record.to_json(), ensure_ascii=False) for record in payload
+            _encode_record(record) for record in payload
         ).encode("utf-8")
 
         if not self._cipher.enabled:
             return (
-                [json.dumps(record.to_json(), ensure_ascii=False) for record in payload],
+                [_encode_record(record) for record in payload],
                 sent_tombstones,
                 sent_changes,
             )
@@ -394,8 +429,14 @@ class LanSyncServer:
                 [self.flag_changes._key(change) for change in change_list]
             )
 
-    def _eligible_items(self, *, since: float, limit: int) -> List[ClipboardItem]:
-        """挑选可外发的记录：过隐私、跳过图片与敏感项，且晚于 `since`。
+    def _eligible_items(
+        self,
+        *,
+        since: float,
+        since_id: int = 0,
+        limit: int,
+    ) -> List[ClipboardItem]:
+        """挑选可外发的记录：过隐私、跳过图片与敏感项，且晚于 `(since, since_id)`。
 
         遍历用 `iter_since`（按时间升序、`id` 兜同刻），而不是
         `list(limit=self._max_entries)`。后者有两个问题，都会导致对端拿不全：
@@ -405,11 +446,18 @@ class LanSyncServer:
         2. **界面排序不稳定**。`list()` 按 `pinned/used_at` 排，用户复制一下
            记录就会换位；对端按时间游标翻页时，翻着翻着就错位了。
 
-        客户端会带着推进后的 `since` 反复请求，直到某页不足 `limit`；
-        所以这里只要保证「给定 `since` 的下一条是确定的」即可。
+        客户端会带着推进后的 `(since, since_id)` 反复请求，直到某页不足
+        `limit`；所以这里只要保证「给定游标的下一条是确定的」即可。
+
+        `since_id` 必须参与过滤：全部记录共享同一 `created_at` 时
+        （紧密循环写库、批量导入系统历史都会这样），只比时间戳的游标
+        在第一页之后就推不动了 —— 剩下的记录不是更旧，是**一样新**，
+        于是被永久跳过且毫无提示。
         """
         out: List[ClipboardItem] = []
-        for item in self._storage.iter_since(since, batch=max(limit * 2, 64)):
+        for item in self._storage.iter_since(
+            since, since_id=since_id, batch=max(limit * 2, 64)
+        ):
             if not item.hash:
                 continue
             if item.kind == "image" or item.image_path:
@@ -514,9 +562,18 @@ class LanSyncClient:
         #: 正常情况下服务端某页不满就会让循环退出。
         self._max_pages = max(1, int((MAX_SYNC_ENTRIES // DEFAULT_PAGE_SIZE) + 2))
 
-    def fetch(self, peer: PeerInfo, *, since: float = 0.0, limit: int = DEFAULT_PAGE_SIZE) -> Optional[List[SyncRecord]]:
+    def fetch(
+        self,
+        peer: PeerInfo,
+        *,
+        since: float = 0.0,
+        since_id: int = 0,
+        limit: int = DEFAULT_PAGE_SIZE,
+    ) -> Optional[List[SyncRecord]]:
         """拉取一个对端的记录；不可达或鉴权失败时返回 `None`。"""
-        query = urllib.parse.urlencode({"since": f"{since:.6f}", "limit": limit})
+        query = urllib.parse.urlencode(
+            {"since": f"{since:.6f}", "since_id": max(0, int(since_id or 0)), "limit": limit}
+        )
         url = f"{peer.base_url}/records?{query}"
         request = urllib.request.Request(url, method="GET")
         if self.token:
@@ -767,23 +824,33 @@ class LanSyncClient:
         游标被推到第一页的最大时间戳，而剩余记录都比它旧，于是被永久跳过。
         表现为「新设备首同步丢了一半历史」，且没有任何报错。
 
-        翻页用 `(created_at, id)` 全序（服务端 `iter_since` 保证），
-        所以同毫秒的多条记录不会因为次序不稳而漏读或死循环。
-        持久化游标只在**整轮翻页结束**后推进一次：中途失败保留旧值，
-        下轮从同一位置重来（重复由 hash 去重吃掉）。
+        **游标用 `(created_at, seq)` 复合值，`seq` 不可省**。上一条修完
+        翻页之后，还有一条更难发现的死路：同一时刻的记录多到塞满一页时，
+        首页返回满页、时间戳全是 `T`，下一页请求 `created_at > T` 拿到 0 条 ——
+        剩下的记录不是「更旧」，是**一样新**。它们既不在这一页、也永远
+        不在下一页，同样没有任何报错。剪贴板里这并不罕见：紧密循环写库、
+        批量导入系统剪贴板历史，都会让同一毫秒挤进大量记录。
+        带上 `seq`（发送方库内自增 id）后，「同一时刻内读到哪一条」也能表达，
+        翻页于是总能前进。持久化游标只在**整轮翻页结束**后推进一次：
+        中途失败保留旧位置，下轮从同一处重来（重复由 hash 去重吃掉）。
         """
         key = self.cursor_key(peer)
-        requested = self.cursors.since_for(key) if since is None else max(0.0, float(since))
+        if since is None:
+            requested, requested_id = self.cursors.since_pair_for(key)
+        else:
+            requested, requested_id = max(0.0, float(since)), 0
 
         total = LanImportOutcome()
-        newest = 0.0
+        advanced: Optional[Tuple[float, int]] = None
         pages = 0
         #: 翻页上限，纯粹的保险丝：正常情况下「某页不满」就会退出。
         #: 万一服务端行为异常（比如始终返回同一批），这里兜住不让进程空转。
         max_pages = self._max_pages
 
         while pages < max_pages:
-            records = self.fetch(peer, since=requested, limit=DEFAULT_PAGE_SIZE)
+            records = self.fetch(
+                peer, since=requested, since_id=requested_id, limit=DEFAULT_PAGE_SIZE
+            )
             if records is None:
                 # 对端不可达或鉴权失败：不推进游标，下轮重试这一段。
                 # 已经导完的几页不会白做 —— 游标没动，但内容已按 hash 去重。
@@ -799,27 +866,45 @@ class LanSyncClient:
             total.flags_updated += page_outcome.flags_updated
             total.flag_changes += page_outcome.flag_changes
 
-            page_newest = max(
-                (float(getattr(r, "created_at", 0.0) or 0.0) for r in records), default=0.0
+            # 本页的「最后一条」= 服务端全序里的最大 `(created_at, seq)`。
+            # 服务端 `since` 是排他语义，直接把游标推到最后一条即可，
+            # 不会重读这一条。取 max 而不是末元素，是不假设响应内的顺序。
+            page_last = max(
+                (self._page_position(record) for record in records),
+                default=(0.0, 0),
             )
-            # 服务端 `since` 是排他语义（`created_at > since`），
-            # 直接把游标推到最后一条的时间即可，不会重读这一条。
-            if page_newest > requested:
-                requested = page_newest
-                newest = max(newest, page_newest)
-            else:
-                # 本页没有把时间往前推（同一时刻的记录堆满一页）。
-                # 继续问下去只会拿到同一批，靠剩下的记录下次再说，
-                # 否则这里会变成死循环。
+            if page_last <= (requested, requested_id):
+                # 位置没有前进：对端没带 `seq`（旧版本）且同刻记录塞满一页。
+                # 再问下去只会拿到同一批，只能结束本轮 —— 剩下的记录
+                # 要靠对端升级后补齐。这里保持原状而不是死循环。
+                _log.warning(
+                    "对端 %s 的游标无法前进（同刻记录已满一页且响应无 seq）："
+                    "本轮提前结束，剩余记录需对端升级后补齐",
+                    peer.host,
+                )
                 break
+            requested, requested_id = page_last
+            advanced = page_last
 
             # 不满一页说明对端已经给完了，不必再多发一次请求
             if len(records) < DEFAULT_PAGE_SIZE:
                 break
 
-        if newest > 0:
-            self.cursors.advance(key, newest)
+        if advanced is not None:
+            self.cursors.advance(key, advanced[0], since_id=advanced[1])
         return total
+
+    @staticmethod
+    def _page_position(record: SyncRecord) -> Tuple[float, int]:
+        """一条记录在服务端全序里的位置 `(created_at, seq)`。
+
+        `seq` 缺失时按 0 处理：这时它等价于旧版本的纯时间戳游标。
+        返回值与 `Storage.iter_since` 的字典序完全对应，两边不能各写一套。
+        """
+        return (
+            float(getattr(record, "created_at", 0.0) or 0.0),
+            max(0, int(getattr(record, "seq", 0) or 0)),
+        )
 
 
 class DiscoveryService:
