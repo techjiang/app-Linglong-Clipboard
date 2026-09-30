@@ -28,6 +28,17 @@ from .models import (
     TEXT,
     ClipboardItem,
 )
+from .search_index import (
+    BACKEND_CANDIDATE_LIMIT,
+    MAX_CANDIDATES,
+    IndexHit,
+    SearchIndex,
+    SearchOutcome,
+    relevance_map,
+    scan_items,
+    score_item_fields,
+    tokenize,
+)
 
 #: 中文/英文关键词 -> 载荷类型
 KIND_KEYWORDS: Dict[str, List[str]] = {
@@ -40,6 +51,140 @@ KIND_KEYWORDS: Dict[str, List[str]] = {
     TEXT: ["文本", "文字", "纯文本", "text", "plain"],
     SENSITIVE: ["密码", "敏感", "密钥", "password", "secret", "key"],
 }
+
+#: 这些词同时是**日常名词**，单独出现时按检索关键词处理，不当类型过滤。
+#:
+#: 问题是这么来的：`KIND_KEYWORDS` 把 `脚本` 映射到「代码」，机制上没问题，
+#: 但「脚本」这两个字本身也常常就是用户想找的内容 —— 而用户搜的往往正是
+#: 他自己刚复制过的那几个字：
+#:
+#: ```
+#: 用户输入「脚本」      实际意图：搜含「脚本」的记录
+#: 此前行为              {类型: 代码, 关键词: ''}
+#:                       → 只返回「代码类」里最新的一批，一条含「脚本」二字
+#:                         的文本记录都不出现，且界面只说「没有匹配的记录」
+#: 用户输入「看下脚本」   此前行为 {类型: 代码, 关键词: '看下'} → 查空
+#: 用户输入「路径问题」   此前行为 {类型: 文件, 关键词: '问题'} → 查空
+#: ```
+#:
+#: 所以判据是「这个词有没有被**结构**组织成一个类型查询」，而不是它出现了没有：
+#:
+#: | 输入 | 判定 | 为什么 |
+#: | --- | --- | --- |
+#: | `脚本` | 关键词 | 裸名词，用户要的就是这两个字 |
+#: | `看下脚本` | 关键词 | 上面没有类型化结构，`看下` 会被停用词吃掉 |
+#: | `收藏的代码` | 类型 | 有「收藏的 + 名词」的定中结构 |
+#: | `来自 Chrome 的链接` | 类型 | 有「来自 X 的 + 名词」结构 |
+#: | `上周的截图` | 类型 | 有「时间 + 的 + 名词」结构 |
+#: | `所有代码` / `只要图片` | 类型 | 有量化的限定词 |
+#:
+#: 代价是「光输一个名词就想筛某一类」不再成立。这个代价很小：界面左侧
+#: 本来就有类型筛选，不需要让搜索框兼职做它；而搜不到自己刚复制的字
+#: 是实打实的故障。真要按类型收窄，用 `linglong-clipboard --kind code`。
+AMBIGUOUS_KIND_WORDS = frozenset(
+    {
+        "文本", "文字", "纯文本",
+        "文件", "路径", "目录", "文件夹",
+        "代码", "脚本", "片段",
+        "图片", "图像", "截图", "照片", "图",
+        "链接", "网址", "网页",
+        "颜色", "色值", "色彩",
+        "密码", "密钥",
+    }
+)
+
+#: 让一个词「像类型」的结构信号。命中任意一条即认为它是被组织过的类型词。
+#:
+#: 这个名单刻意写得小：每加一条都要对应一个真实输入，否则
+#: 「看起来更像自然语言了」这种模糊的理由会把判据越放越松，
+#: 最后又回到「名词一律当类型」的老问题。
+_KIND_STRUCTURE_PATTERNS = (
+    # 「收藏的代码」「最近的截图」「来自 Chrome 的链接」
+    re.compile(r"[的之]\s*$"),
+    # 「所有代码」「只要图片」「任意文件」
+    re.compile(r"(?:所有|全部|任何|任意|各个|每个|哪些|哪个|只要|仅有|只有)\s*$"),
+    # 时间词直接接名词（不带「的」）：「最近图片」「今天截图」
+    re.compile(r"(?:今天|昨天|本周|这周|上周|本周内|本月|这个月|上个月|最近)\s*$"),
+)
+
+#: 出现这些词时，句子明显是在描述「内容本身」而不是在挑选类型。
+#: 与 `_STOP_WORDS` 不同：停用词是被删掉的，这些是**否决类型解析**的信号。
+_CONTENT_HINT_WORDS = (
+    "看下", "看看", "找下", "找找", "在哪", "在哪呢", "问题", "报错", "里写的",
+    "里写", "的内容", "那段", "这段", "这行", "那行",
+)
+
+
+def _is_type_query(
+    text: str, word: str, before: str, *, time_words_seen: bool = False
+) -> bool:
+    """这个类型词是被**结构**组织过的，还是只是碰巧出现的日常名词。
+
+    `before` 是这个词之前的原文，`text` 是整句。判定顺序有讲究：
+
+    1. **整句就是这个词** → 不是类型。「脚本」「截图」这种输入，
+       用户要的是含这两个字的记录。
+    2. **句子里有描述内容的词**（「问题」「在哪」「看下」）→ 不是类型。
+       这类句子的目标是内容本身：「路径问题」想找的是那条写着路径问题的记录。
+    3. **前面有类型化结构**（「收藏的」「来自 X 的」「上周的」「所有」）→ 是类型。
+    4. 其余 → 不是类型。**默认不当类型**是关键：宁可多召回几条，
+       也不要把用户刚复制的那段文字从结果里筛掉。
+    """
+    stripped = text.strip()
+    if stripped.lower() == word.lower():
+        return False
+    for hint in _CONTENT_HINT_WORDS:
+        if hint in stripped and hint != word:
+            return False
+    if any(pattern.search(before.strip()) for pattern in _KIND_STRUCTURE_PATTERNS):
+        return True
+    # 「最近图片」：时间词已被摘掉，剩下的 `before` 是空白。
+    # 只看 `before` 会漏掉这种写法，所以把「句中出现过时间词」也算结构 ——
+    # 「最近 + 名词」在中文里就是「最近的那批名词」，是类型查询。
+    if time_words_seen and not before.strip():
+        return True
+    return False
+
+
+#: 词 -> 类型 的反查表，让类型解析不必遍历 `KIND_KEYWORDS` 的嵌套结构。
+#: 一词多类型（如 `key` 同时属于 sensitive 与 code）时，取 `KIND_KEYWORDS`
+#: 里的先出现者 —— 与旧的「按字典序先匹配到谁算谁」行为一致。
+_KIND_BY_WORD: Dict[str, str] = {}
+for _kind, _words in KIND_KEYWORDS.items():
+    for _word in _words:
+        _KIND_BY_WORD.setdefault(_word.lower(), _kind)
+
+#: 类型词在句中的匹配位置，按「长词优先」返回。
+#:
+#: 长词优先是为了让「截图」先于「图」被匹配到 —— 否则「截图」会被拆成
+#: 「截」+「图」，判成图片类型的同时把「截」留成关键词，搜出一堆无关内容。
+_KIND_WORD_RE = re.compile(
+    "|".join(
+        re.escape(word)
+        for word in sorted(_KIND_BY_WORD, key=len, reverse=True)
+    ),
+    re.IGNORECASE,
+)
+
+
+def _iter_kind_word_matches(text: str) -> List[Tuple[str, int, int]]:
+    """扫描出句中所有的类型词及其位置。
+
+    用 `finditer` 而不是逐个 `sub`：一次遍历就能拿到全部匹配，
+    且不会因为「替换了前一个词导致后一个词的上下文错位」而漏判。
+    """
+    found: List[Tuple[str, int, int]] = []
+    for match in _KIND_WORD_RE.finditer(text):
+        word = match.group(0)
+        # 英文词要求两侧不是字母，避免 `chrome` 里的 `ch` 被当成类型词
+        if word.isascii() and word.isalpha():
+            before_ok = match.start() == 0 or not text[match.start() - 1].isalpha()
+            after_ok = match.end() >= len(text) or not text[match.end()].isalpha()
+            if not (before_ok and after_ok):
+                continue
+        found.append((word, match.start(), match.end()))
+    return found
+
 
 #: 时间范围关键词 -> (起始时间偏移秒数, 结束时间偏移秒数)；None 表示不限
 _TIME_RANGES: Dict[str, tuple] = {
@@ -65,7 +210,11 @@ _TIME_RANGES: Dict[str, tuple] = {
 #: 只在语义层生效的修饰词，不进全文检索
 _STOP_WORDS = {
     "的", "了", "我", "你", "他", "她", "它", "从", "来自", "在", "是", "有", "找", "搜索",
-    "查", "看看", "一下", "那个", "这个", "复制", "粘贴", "内容", "什么", "项", "些", "个",
+    "查", "看看", "看下", "找下", "找找", "一下", "那个", "这个", "复制", "粘贴",
+    "内容", "什么", "项", "些", "个",
+    # 量化限定词：它们只用来判断「这是个类型查询」，本身不进检索
+    "所有", "全部", "任何", "任意", "各个", "每个", "哪些", "哪个",
+    "只要", "仅有", "只有", "来个", "那段", "这段", "这行", "那行",
     "记录", "条目", "东西", "帮我", "之前", "以前",
     "the", "a", "an", "from", "find", "search", "show", "me", "my", "in", "of", "for",
     "copy", "copied", "clipboard", "please", "item", "items", "one",
@@ -179,6 +328,7 @@ def parse_intent(query: str) -> QueryIntent:
 
     lowered = text.lower()
     remaining = f" {text} "
+    time_words_seen = False
 
     # 1. 时间范围（长词优先，避免「上周」被「周」抢先匹配）
     for phrase in sorted(_TIME_RANGES, key=len, reverse=True):
@@ -191,19 +341,35 @@ def parse_intent(query: str) -> QueryIntent:
             if _TIME_RANGES[phrase][1]:
                 _, until2 = _resolve_range(_TIME_RANGES[phrase][1])
                 intent.until = intent.until or until2
-            remaining = re.sub(re.escape(phrase), " ", remaining, flags=re.IGNORECASE)
+            # 占位成与时间词等长的空白，而不是一个空格：位置对齐后，
+            # 后面判断「类型词前面写了什么」时才能分清「前面是时间词」
+            # 与「前面什么都没有」—— 「最近图片」是类型查询，
+            # 「图片」不是。
+            remaining = re.sub(
+                re.escape(phrase), " " * len(phrase), remaining, flags=re.IGNORECASE
+            )
+            time_words_seen = True
             break
 
-    # 2. 类型
-    for kind, words in KIND_KEYWORDS.items():
-        for word in sorted(words, key=len, reverse=True):
-            pattern = re.compile(rf"(?<![A-Za-z]){re.escape(word)}(?![A-Za-z])", re.IGNORECASE)
-            if pattern.search(remaining):
-                if kind not in intent.kinds:
-                    intent.kinds.append(kind)
-                    intent.explain.append(f"类型：{word}")
-                remaining = pattern.sub(" ", remaining)
-                break
+    # 2. 类型。歧义词要「被结构组织过」才算类型，见 `_is_type_query()`
+    #
+    #    这里对所有类型词（含非歧义的）统一处理：`_is_type_query` 只对
+    #    歧义词生效，其余一律照旧解析，所以「链接」这类同义词的行为不变。
+    for word_position in _iter_kind_word_matches(remaining):
+        word, start, end = word_position
+        kind = _KIND_BY_WORD.get(word.lower())
+        if kind is None:
+            continue
+        if word.lower() in AMBIGUOUS_KIND_WORDS and not _is_type_query(
+            text, word, remaining[:start], time_words_seen=time_words_seen
+        ):
+            continue  # 留作检索关键词
+        if kind not in intent.kinds:
+            intent.kinds.append(kind)
+            intent.explain.append(f"类型：{word}")
+        # 逐个替换而不是 `pattern.sub`：一次只处理一个类型词，
+        # 才不会把「所有链接 所有代码」里的第二个词当成第一个的后续内容跳过
+        remaining = remaining[:start] + " " * (end - start) + remaining[end:]
 
     # 3. 固定 / 收藏
     pinned_pattern = re.compile(r"固定|置顶|pinned?", re.IGNORECASE)
@@ -323,9 +489,17 @@ class SemanticEngine:
     依赖注入 `storage`，因此可在测试中换成内存库。
     """
 
-    def __init__(self, storage, weights: Optional[RankingWeights] = None) -> None:
+    def __init__(
+        self,
+        storage,
+        weights: Optional[RankingWeights] = None,
+        *,
+        index: Optional[SearchIndex] = None,
+    ) -> None:
         self._storage = storage
         self.weights = weights or RankingWeights()
+        #: 可选的跨查询全库快照，见 `use_index()`
+        self._index = index
 
     def rank(
         self,
@@ -367,18 +541,39 @@ class SemanticEngine:
         use_intent: bool = True,
     ) -> List[ClipboardItem]:
         """统一检索入口：自然语言或直接关键词都能用。"""
-        query = (query or "").strip()
-        if not query:
-            return self._storage.list(
-                kind=kind,
-                pinned_only=pinned_only,
-                favorite_only=favorite_only,
-                source_app=source,
-                since=since,
-                limit=limit,
-            )
+        return self.search_outcome(
+            query,
+            kind=kind,
+            source=source,
+            since=since,
+            until=until,
+            limit=limit,
+            pinned_only=pinned_only,
+            favorite_only=favorite_only,
+            use_intent=use_intent,
+        ).items
 
-        intent = parse_intent(query) if use_intent else QueryIntent(keywords=query)
+    def search_outcome(
+        self,
+        query: str,
+        *,
+        kind: Optional[str] = None,
+        source: Optional[str] = None,
+        since: Optional[float] = None,
+        until: Optional[float] = None,
+        limit: int = 60,
+        pinned_only: bool = False,
+        favorite_only: bool = False,
+        use_intent: bool = True,
+    ) -> SearchOutcome:
+        """检索并**说明结果是怎么来的**：候选集多大、扫了多少条、用的哪条路径。
+
+        `search()` 只是它的 `.items`。分成两个方法是为了让
+        「为什么搜不到」这类排查能拿到扫描量 —— 结果本身看不出这件事：
+        「没有匹配」与「没进候选集」在界面上长得完全一样。
+        """
+        query = (query or "").strip()
+        intent = parse_intent(query) if query and use_intent else QueryIntent(keywords=query)
         effective_kind = kind or (intent.kinds[0] if len(intent.kinds) == 1 else None)
         effective_since = since or intent.since
         effective_source = source or intent.source
@@ -386,18 +581,17 @@ class SemanticEngine:
         # （如「上周的截图」），此时不能退回原串去全文检索 ——
         # 图片、文件类记录本身没有可检索文本，退回必然查空。
         keywords = intent.keywords
-        if not keywords and not intent.has_filters:
+        if query and not keywords and not intent.has_filters:
             keywords = query
 
-        # 有来源过滤时把候选集放大：别名匹配只能在内存里做，
-        # 先按类型/时间收窄再筛，条数不够会让结果凭空消失。
-        candidate_limit = max(limit * 4, 200)
-        if effective_source:
-            candidate_limit = max(candidate_limit, 1000)
         if not keywords:
-            # 不把来源透传给 SQL：库里存的是 `google-chrome`，
-            # 用户说的是「chrome」，精确匹配必然查空。
-            # 来源一律留到下面的内存过滤里按别名判定。
+            # 无关键词：按过滤条件列出。`list` 的 `limit` 是界面意义上的
+            # 「前 N 条」，这里不该装作是全量 —— 但也不该把候选收得比
+            # 请求的条数还少，否则「只看固定项」这类查询会凭空少结果。
+            candidate_limit = max(limit * 4, 200)
+            if effective_source:
+                # 来源别名匹配只能在内存里做，先多取一些
+                candidate_limit = max(candidate_limit, 1000)
             candidates = self._storage.list(
                 kind=effective_kind,
                 pinned_only=pinned_only or intent.pinned_only,
@@ -405,17 +599,157 @@ class SemanticEngine:
                 since=max(effective_since, 0) or None,
                 limit=candidate_limit,
             )
-        else:
-            # 类型多选时先放宽到全量候选，再在内存里过滤
-            candidates = self._storage.search(
-                keywords, kind=effective_kind, limit=candidate_limit
+            filtered = self._filter(
+                candidates,
+                effective_kind=effective_kind,
+                intent=intent,
+                effective_since=effective_since,
+                until=until,
+                effective_source=effective_source,
+                pinned_only=pinned_only,
+                favorite_only=favorite_only,
             )
-            if not candidates and keywords != query:
-                # 关键词被停用词吃空时，用原串再查一次
-                candidates = self._storage.search(
-                    query, kind=effective_kind, limit=candidate_limit
-                )
+            return SearchOutcome(
+                items=filtered[:limit],
+                backend="filter",
+                scanned=len(candidates),
+                candidates=len(filtered),
+            )
 
+        candidates, backend, scanned = self._candidates(
+            keywords, query=query, kind=effective_kind
+        )
+        filtered = self._filter(
+            candidates,
+            effective_kind=effective_kind,
+            intent=intent,
+            effective_since=effective_since,
+            until=until,
+            effective_source=effective_source,
+            pinned_only=pinned_only,
+            favorite_only=favorite_only,
+        )
+        relevance = self.relevance_from(keywords, filtered)
+        return SearchOutcome(
+            items=self.rank(filtered, keywords=keywords, relevance=relevance)[:limit],
+            backend=backend,
+            scanned=scanned,
+            candidates=len(filtered),
+            terms=tokenize(keywords),
+        )
+
+    def _candidates(
+        self, keywords: str, *, query: str, kind: Optional[str]
+    ) -> tuple:
+        """取候选集：先问后端（SQLite 有 FTS5 这个真索引），再全库补齐。
+
+        为什么要补这一刀：后端检索把 `LIMIT` 截在**结果集**上，
+        于是「最近这一批记录里有没有」决定了最终还能看到什么。实测过一个
+        会误导人的场景 —— 真目标是正文命中但很老，另有 400 条只命中标签的
+        新记录：
+
+        ```
+        后端只返回标签命中的那 400 条（正文命中的那条被 LIMIT 切掉了）
+        语义层再按相关度排序，也只能在这 400 条噪音里排
+        用户看到 20 条噪音，真正要找的记录不在其中 —— 而库里它就在那
+        ```
+
+        更糟的是两个后端不一致：JSON 那边是纯子串扫描、排序规则不同，
+        同一条记录换个存储方式就搜得到。结果不该取决于数据存在哪。
+
+        所以 FTS 命中就够多时走快路径（省掉一次全库扫描），
+        不够时用全库扫描补齐，两边合并去重。
+        """
+        found = self._storage.search(keywords, kind=kind, limit=BACKEND_CANDIDATE_LIMIT)
+        if not found and keywords != query:
+            # 关键词被停用词吃空时，用原串再查一次
+            found = self._storage.search(query, kind=kind, limit=BACKEND_CANDIDATE_LIMIT)
+        if len(found) >= BACKEND_CANDIDATE_LIMIT:
+            # 后端给满了上限，说明它还有更多没给我们；这时不再全库扫描，
+            # 但要如实说明走的是哪条路（`--search --json` 里看得到）
+            return found, "backend", len(found)
+
+        scanned: List[int] = [0]
+        hits = scan_items(
+            self._all_items(),
+            tokenize(keywords),
+            limit=MAX_CANDIDATES,
+            scanned_out=scanned,
+        )
+        merged: Dict[int, ClipboardItem] = {}
+        for item in found:
+            if item.id is not None:
+                merged[item.id] = item
+        for hit in hits:
+            if hit.item.id is not None:
+                merged.setdefault(hit.item.id, hit.item)
+        return list(merged.values()), "backend+scan", scanned[0]
+
+    def _all_items(self) -> Sequence[ClipboardItem]:
+        """全库视图：优先用外部注入的快照，其次按需遍历一次。"""
+        if self._index is not None:
+            return self._index.snapshot()
+        iter_all = getattr(self._storage, "iter_all", None)
+        if iter_all is None:
+            return []
+        return list(iter_all())
+
+    def use_index(self, index: Optional[SearchIndex]) -> None:
+        """挂上一个跨查询复用的全库快照。
+
+        界面按输入逐字触发检索，没有它每次都要重新遍历全库。
+        不挂也能工作（每次查询自己遍历），只是多花一点。
+        """
+        self._index = index
+
+    def relevance_from(
+        self, keywords: str, items: Sequence[ClipboardItem]
+    ) -> Dict[int, float]:
+        """给候选集算相关度：有字段明细时用字段权重，否则退回位置估计。"""
+        tokens = tokenize(keywords)
+        if not tokens:
+            return {}
+        hits: List[IndexHit] = []
+        for item in items:
+            score, hit_count, matched = score_item_fields(item, tokens)
+            if not hit_count:
+                continue
+            hits.append(
+                IndexHit(
+                    item=item,
+                    position=self._content_position(item, tokens),
+                    hits=hit_count,
+                    fields=matched,
+                    score=score,
+                )
+            )
+        return relevance_map(hits, tokens)
+
+    @staticmethod
+    def _content_position(item: ClipboardItem, tokens: Sequence[str]) -> int:
+        text = (item.preview or item.content or "").lower()
+        positions = [text.find(token.lower()) for token in tokens]
+        positions = [pos for pos in positions if pos >= 0]
+        return min(positions) if positions else 0
+
+    def _filter(
+        self,
+        candidates: Sequence[ClipboardItem],
+        *,
+        effective_kind: Optional[str],
+        intent: QueryIntent,
+        effective_since: float,
+        until: Optional[float],
+        effective_source: str,
+        pinned_only: bool,
+        favorite_only: bool,
+    ) -> List[ClipboardItem]:
+        """按意图里的过滤条件收窄候选集。
+
+        过滤收在这里而不是散在 SQL 里，是因为**来源别名匹配只能在内存里做**：
+        库里存的是 `google-chrome`，用户说的是「chrome」，
+        把它透传给 SQL 的精确匹配必然查空。
+        """
         filtered: List[ClipboardItem] = []
         for item in candidates:
             if effective_kind and item.kind != effective_kind:
@@ -435,30 +769,7 @@ class SemanticEngine:
                 if not item.favorite:
                     continue
             filtered.append(item)
-
-        relevance = self._relevance_map(filtered, keywords)
-        return self.rank(filtered, keywords=keywords, relevance=relevance)[:limit]
-
-    @staticmethod
-    def _relevance_map(items: Sequence[ClipboardItem], keywords: str) -> Dict[int, float]:
-        """用子串命中位置与长度粗略估计相关度，供排序加权。"""
-        if not keywords:
-            return {}
-        probe = keywords.lower()
-        result: Dict[int, float] = {}
-        for item in items:
-            if item.id is None:
-                continue
-            content = (item.preview or item.content).lower()
-            if probe == content.strip():
-                result[item.id] = 1.0
-            elif probe in content:
-                # 命中越靠前越相关
-                position = content.index(probe)
-                result[item.id] = max(0.35, 0.9 - position / max(len(content), 1) * 0.5)
-            else:
-                result[item.id] = 0.25
-        return result
+        return filtered
 
     def suggest(self, query: str, *, limit: int = 5) -> List[str]:
         """为查询框提供补全建议，来源是历史里的高频词与标签。"""

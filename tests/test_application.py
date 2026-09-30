@@ -941,3 +941,69 @@ def test_quit_does_not_leave_window_signals_connected(app_instance):
     assert window._connected_external == []
     window.reload()  # 不该抛异常
     assert window._items == []
+
+
+# ---- 检索快照的失效 ----
+#
+# 快照是「全库视图」的缓存，它没被丢掉的表现是**新记录搜不到** ——
+# 不报错、不崩溃，只是搜索结果里少了刚复制的那条。所以每次写入路径
+# 都要验一遍「失效真的发生了」，而不是只验「某个方法被调用过」。
+
+
+def test_search_index_invalidated_after_capture(app_instance):
+    app_instance.monitor.start()
+    app_instance.search_index.snapshot()
+    assert app_instance.search_index.loaded
+
+    app_instance._on_captured_ui(
+        ClipboardItem(id=1, kind="text", content="新内容", hash="h"), "captured"
+    )
+    assert not app_instance.search_index.loaded
+
+
+def test_search_index_invalidated_after_delete(app_instance):
+    item = app_instance.storage.add(
+        ClipboardItem(kind="text", content="待删", preview="待删", hash="hd")
+    )
+    app_instance.search_index.snapshot()
+    app_instance.delete_item(item.id)
+    assert not app_instance.search_index.loaded
+
+
+def test_search_index_invalidated_after_clear(app_instance):
+    app_instance.storage.add(
+        ClipboardItem(kind="text", content="待清", preview="待清", hash="hc")
+    )
+    app_instance.search_index.snapshot()
+    app_instance.clear_unpinned()
+    assert not app_instance.search_index.loaded
+
+
+def test_freshly_captured_item_is_searchable(app_instance):
+    """端到端：刚采到的内容立刻能被搜到。
+
+    这是快照失效没做对时唯一会露出来的地方 —— 列表里 `reload()` 看得见它，
+    但搜索走的是另一条路径，两者用的是不同的数据来源。
+    """
+    app_instance.storage.add(
+        ClipboardItem(kind="text", content="可被检索的内容", preview="可被检索", hash="hs")
+    )
+    app_instance._invalidate_search_index()
+    assert app_instance.engine.search("可被检索")
+
+
+def test_stale_search_index_would_hide_new_item(app_instance):
+    """不失效就会漏 —— 用例把「为什么要有失效」钉住。
+
+    注意这里断言的是**候选集**而不是最终结果：后端那一刀（`storage.search`）
+    会直接查库，所以最终结果是对的；一旦后端改成只走全库快照
+    （缓存那条路），或者候选被先按时间收窄，这条就会漏。
+    """
+    app_instance.search_index.snapshot()  # 先建一份空快照
+    app_instance.storage.add(
+        ClipboardItem(kind="text", content="迟到的内容", preview="迟到", hash="hl")
+    )
+    assert app_instance.search_index.snapshot() == []
+
+    app_instance._invalidate_search_index()
+    assert [item.hash for item in app_instance.search_index.snapshot()] == ["hl"]

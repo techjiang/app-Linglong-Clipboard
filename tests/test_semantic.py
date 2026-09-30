@@ -46,7 +46,14 @@ def _seed(storage):
         ("固定项", [], "", True, False, False),
         ("收藏的代码", ["code"], "", False, True, False),
         ("今天的内容", [], "", False, False, True),
+        # 「最近图片」的「图片」前面只有时间词、没有「的」：仍算类型查询
         ("最近图片", ["image"], "", False, False, True),
+        ("最近的图片", ["image"], "", False, False, True),
+        ("所有代码", ["code"], "", False, False, False),
+        # 裸名词不是类型查询 —— 用户要的是含这两个字的记录
+        ("脚本", [], "", False, False, False),
+        ("链接", [], "", False, False, False),
+        ("剪贴板里的路径", ["file"], "", False, False, False),
     ],
 )
 def test_parse_intent(query, kinds, source, pinned, favorite, has_time):
@@ -64,6 +71,63 @@ def test_parse_intent_keeps_keywords_out_of_filters():
     assert "会议纪要" in intent.keywords
 
 
+# ---- 日常名词不该被当成类型过滤 ----
+#
+# `KIND_KEYWORDS` 把「脚本」映射到「代码」本身没错，但「脚本」这两个字
+# 也常常就是用户想找的内容。此前它被无条件吃掉，于是「看下脚本」变成
+# {类型: 代码, 关键词: '看下'}，含「脚本」二字的记录一条都不出现 ——
+# 用户看到的是「没有匹配的记录」，而那条记录就在库里。
+
+
+@pytest.mark.parametrize(
+    "query,keywords",
+    [
+        ("脚本", "脚本"),
+        ("链接", "链接"),
+        ("图片", "图片"),
+        ("部署 脚本", "部署 脚本"),
+        ("看下脚本", "脚本"),        # 「看下」是停用词，会被剔掉
+        ("路径问题", "路径问题"),
+        ("文件在哪", "文件在哪"),
+        ("那段代码有问题", "代码有问题"),
+    ],
+)
+def test_bare_nouns_stay_as_keywords(query, keywords):
+    intent = parse_intent(query)
+    assert intent.kinds == [], f"{query!r} 不该被解析成类型过滤"
+    assert intent.keywords == keywords
+
+
+@pytest.mark.parametrize(
+    "query,kind",
+    [
+        ("收藏的代码", "code"),
+        ("最近的链接", "link"),
+        ("来自 Chrome 的链接", "link"),
+        ("所有文件", "file"),
+        ("任意图片", "image"),
+        ("剪贴板里的路径", "file"),
+    ],
+)
+def test_structured_phrases_still_resolve_kind(query, kind):
+    """有类型化结构的句子照旧按类型解析 —— 这是自然语言检索的主要用法。
+
+    判据是「有没有被结构组织过」，不是「出现了名词没有」：
+    这条线画错任何一边都会让一类真实输入失效。
+    """
+    assert kind in parse_intent(query).kinds
+
+
+def test_multi_noun_query_is_not_silently_narrowed():
+    """「链接 代码」此前会解析成两个类型、关键词为空，把无关的记录也捞进来。
+
+    两个日常名词并列时，用户想搜的是这两个词，不是「这两类的最新一批」。
+    """
+    intent = parse_intent("链接 代码")
+    assert intent.kinds == []
+    assert "链接" in intent.keywords and "代码" in intent.keywords
+
+
 def test_parse_intent_strips_stop_words():
     intent = parse_intent("帮我找一下 那个 内容")
     assert "帮我" not in intent.keywords
@@ -76,10 +140,10 @@ def test_intent_has_filters_flag():
 
 
 def test_search_by_natural_language_kind(engine, storage):
+    """「上周的截图」按类型 + 时间收窄（有「的」这个结构信号）。"""
     _seed(storage)
-    results = engine.search("截图")
-    assert len(results) == 1
-    assert results[0].kind == "image"
+    results = engine.search("上周的截图")
+    assert [item.hash for item in results] == ["img"]
 
 
 def test_search_by_source(engine, storage):
@@ -103,10 +167,25 @@ def test_search_keywords(engine, storage):
     assert results[0].content == "hello world"
 
 
-def test_search_without_time_word_returns_all_matches(engine, storage):
+def test_bare_kind_noun_searches_text_not_kind(engine, storage):
+    """搜「链接」应当按**文字**匹配，而不是筛出所有链接类记录。
+
+    种子里有一条 `content="https://cnb.cool/x"` 的链接 —— 它不含「链接」二字，
+    所以不该出现在结果里；而「含链接二字的文本」即便类型不是 link 也该出现。
+    这一条钉住的是「名词当关键词」这个改动本身。
+    """
     _seed(storage)
+    storage.add(
+        ClipboardItem(
+            kind="text",
+            content="把链接发我",
+            preview="把链接发我",
+            hash="ask",
+            source_app="wechat",
+        )
+    )
     hashes = {item.hash for item in engine.search("链接", limit=50)}
-    assert hashes == {"lnk", "old"}
+    assert hashes == {"ask"}
 
 
 def test_search_time_range_excludes_old(engine, storage):
@@ -118,10 +197,11 @@ def test_search_time_range_excludes_old(engine, storage):
 
 
 def test_search_multi_kind_filter(engine, storage):
+    """两个类型名带结构地并列时取并集（用「的」把它们组织起来）。"""
     _seed(storage)
-    # 「链接 代码」解析出两个类型，取并集
-    results = engine.search("链接 代码")
+    results = engine.search("所有链接 所有代码", limit=50)
     assert {item.kind for item in results} <= {"link", "code"}
+    assert {item.kind for item in results} == {"link", "code"}
 
 
 def test_search_empty_query_returns_recent(engine, storage):

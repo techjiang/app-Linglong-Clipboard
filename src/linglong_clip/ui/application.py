@@ -25,6 +25,7 @@ from ..core.models import PINNED_BY_KEY, ClipboardItem
 from ..core.monitor import ClipboardMonitor, FocusTracker
 from ..core.ocr import build_engine as build_ocr_engine
 from ..core.privacy import PrivacyGuard
+from ..core.search_index import SearchIndex
 from ..core.semantic import SemanticEngine
 from ..core.repository import open_repository
 from ..core.lan_sync import LanSync, build_lan_sync
@@ -163,7 +164,10 @@ class Application(QObject):
         self.guard = PrivacyGuard(self.config)
         self.automation = AutomationEngine()
         self.automation.load_from_config(self.config.get("automation.workflows", []) or [])
-        self.engine = SemanticEngine(self.storage)
+        # 全库快照挂在引擎上：搜索框按输入逐字触发，没有它每次都要重新遍历全库。
+        # 数据一变就 `invalidate()`，见 `_invalidate_search_index()`。
+        self.search_index = SearchIndex(self.storage)
+        self.engine = SemanticEngine(self.storage, index=self.search_index)
         self.ocr = build_ocr_engine(self.config)
         # 同步增量游标：两种同步模式共用一份，切换模式时进度不丢
         self.sync_cursors = SyncCursorStore()
@@ -671,6 +675,7 @@ class Application(QObject):
         """GUI 线程：刷新列表与提示。"""
         if self._shutting_down:
             return
+        self._invalidate_search_index()
         self.window.reload()
         if outcome == CAPTURED:
             self.window.notify(f"已记录：{item.kind_label} · {item.display_source}")
@@ -985,6 +990,7 @@ class Application(QObject):
         item = self.storage.get(item_id)
         digest = fingerprint(item) if item is not None else ""
         self.storage.delete(item_id)
+        self._invalidate_search_index()
         if digest:
             self.tombstones.record(digest)
         self.window.reload()
@@ -1009,7 +1015,22 @@ class Application(QObject):
         doomed = [digest for digest in before if digest not in survivors]
         recorded = self.tombstones.record_many(doomed) if doomed else 0
         _log.info("清理未固定记录 %d 条，记下 %d 条删除标记", removed, recorded)
+        self._invalidate_search_index()
         self.window.notify_cleared(removed)
+
+    def _invalidate_search_index(self) -> None:
+        """本机历史变了 → 下次检索重新取全库快照。
+
+        集中成一个方法而不是在每处写 `self.search_index.invalidate()`：
+        要挂的地方只会增加（同步导入、切换存储、合并重复项…），
+        而漏挂的表现是「新记录搜不到」—— 一个不会报错、只会让人觉得
+        「我明明复制过」的症状。搜索一次失效一次最坏只是多遍历一遍，
+        比漏失效便宜得多。
+        """
+        try:
+            self.search_index.invalidate()
+        except Exception:  # noqa: BLE001 - 缓存失效失败不该影响主流程
+            _log.debug("检索快照失效失败", exc_info=True)
 
     def compact_storage(self) -> None:
         """压缩存储文件。界面只发意图，实际动作留在这里，保持分层。"""
@@ -1096,13 +1117,20 @@ class Application(QObject):
                 if isinstance(sync, LanSync):
                     imported = sync.sync_all()
                     _log.info("局域网同步完成：导入 %d 条", imported)
-                    return
-                exported = sync.export()
-                imported = sync.import_all()
-                sync.compact()
-                _log.info("同步完成：导出 %d 条，导入 %d 条", exported, imported)
+                else:
+                    exported = sync.export()
+                    imported = sync.import_all()
+                    sync.compact()
+                    _log.info("同步完成：导出 %d 条，导入 %d 条", exported, imported)
             except Exception:  # noqa: BLE001
                 _log.exception("同步执行失败")
+                return
+            # 导入会往本地库里写记录，快照得跟着失效 ——
+            # 否则「刚同步过来的内容搜不到」，而列表里明明已经有它了
+            try:
+                self.search_index.invalidate()
+            except Exception:  # noqa: BLE001
+                _log.debug("同步后失效检索快照失败", exc_info=True)
 
         threading.Thread(target=work, name="linglong-sync", daemon=True).start()
 

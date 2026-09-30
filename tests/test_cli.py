@@ -74,8 +74,54 @@ def test_search(cli_env, capsys):
 
 
 def test_search_natural_language(cli_env, capsys):
-    main(["--search", "链接"])
+    """带结构的名词才解析成类型过滤（「最近的链接」），带「的」是信号。"""
+    main(["--search", "最近的链接"])
     assert "cnb.cool" in capsys.readouterr().out
+
+
+def test_search_bare_noun_matches_text(cli_env, capsys):
+    """光输「链接」按文字搜，而不是筛出所有链接类记录。
+
+    种子里那条 `https://cnb.cool/x` 不含「链接」二字，所以不该被搜出来 ——
+    这是个真实故障的回归用例：此前「链接」被无条件当成类型过滤，
+    于是用户搜自己刚复制的那两个字时永远查空，而记录就在库里。
+    """
+    main(["--search", "链接"])
+    out = capsys.readouterr().out
+    assert "cnb.cool" not in out
+    assert "没有匹配的记录" in out
+
+
+def test_search_reports_scan_diagnostics(cli_env, capsys):
+    """结果末尾报出扫描量：这是「为什么搜不到」唯一的答案来源。
+
+    「没有匹配」与「没进候选集」在结果集里长得一样，用户只能怀疑自己
+    记错了关键词 —— 把这两个数打出来，问题当场可分。
+    """
+    main(["--search", "hello"])
+    out = capsys.readouterr().out
+    assert "扫描" in out and "候选" in out
+
+
+def test_search_json_includes_diagnostics(cli_env, capsys):
+    assert main(["--search", "hello", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["query"] == "hello"
+    assert payload["scanned"] >= 1
+    assert payload["backend"]
+    assert payload["count"] == len(payload["items"])
+
+
+def test_search_json_is_not_a_bare_list(cli_env, capsys):
+    """`--search --json` 带诊断字段后不再是裸数组，脚本要能据此判断。
+
+    这是刻意的破坏性变更：以前它和 `--list --json` 形状相同，
+    于是「为什么没搜到」这件事在脚本里无从下手。形状变了要写进文档。
+    """
+    main(["--search", "hello", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert isinstance(payload, dict)
+    assert "items" in payload
 
 
 def test_search_no_match(cli_env, capsys):
@@ -170,8 +216,10 @@ def test_merge_duplicates_preserves_usage_in_list(cli_env, capsys):
 
     assert main(["--search", "重复内容"]) == 0
     lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
-    assert len(lines) == 1
-    assert "x2" in lines[0]
+    # 命令行会额外打一行检索摘要（扫描量/候选数），它不是记录行
+    records = [line for line in lines if not line.startswith("（")]
+    assert len(records) == 1
+    assert "x2" in records[0]
 
 
 def test_json_output_includes_use_count(cli_env, capsys):

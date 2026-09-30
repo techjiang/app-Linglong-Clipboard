@@ -26,7 +26,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  linglong-clipboard --quick          唤起快速粘贴浮层\n"
             "  linglong-clipboard --monitor-primary  选中文字即记录（Linux）\n"
             "  linglong-clipboard --list -n 20     列出最近 20 条\n"
-            "  linglong-clipboard --search '上周的截图'\n"
+            "  linglong-clipboard --search '上周的截图'   # 扫全库，末尾会报扫描量\n"
+            "  linglong-clipboard --search '部署' --json  # 带 scanned/backend，便于排查搜不到\n"
             "  linglong-clipboard --get 12         输出第 12 条内容\n"
             "  linglong-clipboard --stats          查看统计与检索能力\n"
             "  linglong-clipboard --import-native-history  导入系统剪贴板历史\n"
@@ -917,10 +918,61 @@ def _run_cli(args: argparse.Namespace) -> int:
 
     if args.list or args.search:
         if args.search:
-            engine = SemanticEngine(storage)
-            items = engine.search(args.search, kind=args.kind, limit=args.limit)
-        else:
-            items = storage.list(kind=args.kind, limit=args.limit)
+            # 全库快照只取一次：`--search` 只查一遍，但 `search_outcome`
+            # 内部会同时问后端与扫全库，两次遍历同一份历史纯属浪费。
+            from .core.search_index import SearchIndex
+
+            engine = SemanticEngine(storage, index=SearchIndex(storage))
+            outcome = engine.search_outcome(args.search, kind=args.kind, limit=args.limit)
+            if args.json:
+                # 排查用：结果集本身看不出「为什么搜不到」，
+                # `scanned` / `backend` 才是回答那个问题的两个数。
+                print(
+                    json.dumps(
+                        {
+                            "query": args.search,
+                            "kind": args.kind,
+                            "backend": outcome.backend,
+                            "terms": outcome.terms,
+                            "scanned": outcome.scanned,
+                            "candidates": outcome.candidates,
+                            "count": len(outcome.items),
+                            "items": [
+                                {
+                                    "id": item.id,
+                                    "kind": item.kind,
+                                    "preview": item.preview,
+                                    "content": item.content,
+                                    "source_app": item.source_app,
+                                    "created_at": item.created_at,
+                                    "pinned": item.pinned,
+                                    "favorite": item.favorite,
+                                    "tags": item.tags,
+                                    "size": item.size,
+                                    "use_count": item.use_count,
+                                }
+                                for item in outcome.items
+                            ],
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+                storage.close()
+                return 0
+            _print_items(
+                outcome.items, as_json=False, plain=args.plain, limit=args.limit
+            )
+            if not args.plain:
+                # 这行是给「搜不到」准备的：用户能立刻看出是候选集太小
+                # 还是真的没有匹配，不必去猜自己是不是记错了关键词。
+                print(
+                    f"（{outcome.backend} · 扫描 {outcome.scanned} 条 · "
+                    f"候选 {outcome.candidates} 条 · 命中 {len(outcome.items)} 条）"
+                )
+            storage.close()
+            return 0
+        items = storage.list(kind=args.kind, limit=args.limit)
         _print_items(items, as_json=args.json, plain=args.plain, limit=args.limit)
         storage.close()
         return 0
