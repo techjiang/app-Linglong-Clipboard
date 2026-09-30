@@ -25,9 +25,14 @@
 
 ![浅色主题](docs/screenshots/main-light.png)
 
-设置页 —— 采集、OCR、同步、隐私都在这：
+设置页 —— 采集、OCR、同步、隐私都在这（这张是「采集」，历史保留里
+可以看到「收下剪贴板里的各种写法」）：
 
-![设置](docs/screenshots/settings-ocr.png)
+![设置·采集](docs/screenshots/settings-capture-formats.png)
+
+设置页「OCR」—— 识别语言、已装语言、降级原因：
+
+![设置·OCR](docs/screenshots/settings-ocr.png)
 
 设置页「外观」—— 主题、检索、列表密度、快捷键、关闭行为：
 
@@ -314,7 +319,70 @@ linglong-clipboard --merge-duplicates  # 重算 + 合并（含历史里的存量
 
 设置页「采集 → 记录合并」里可以单独关掉链接归一或路径归一。
 
-### 七、隐私是默认值，不是可选项
+### 七、剪贴板里那几种写法，都留下来了
+
+一次复制往往同时带来好几份表示，而此前只存了其中一份 —— 我们看得懂的那份。
+
+```
+在网页上复制一段带链接的正文
+  剪贴板里：text/html（带 <a>）、text/plain（链接被拍平成文字）
+  我们存下：只有 text/plain
+  想粘到别处：链接没了，得回原页面重新选一次
+```
+
+更隐蔽的是**换行**。`QMimeData.text()` 会把行分隔符统一成 `\n`，
+Windows 应用放进去的却是 `CRLF`；写回时 Qt 再按平台规矩补一次，
+用户看到的结果是「复制一段代码，粘贴出来末尾多一行」——
+而且只在部分应用里多，很难归因。
+
+所以采集时把**系统实际给出的那几种形式**都收下来，复制出站时再摆回剪贴板，
+让收件应用自己挑：
+
+| 形式 | 用它能做什么 |
+| --- | --- |
+| `text/html` | 粘进富文本编辑器/邮件，链接与加粗都还在 |
+| `text/plain` 的原始字节 | 粘贴结果与原文**逐字节一致**（行尾不多不少） |
+| `text/markdown` | 让 README 之类的文档保持 Markdown 原文，不被转成弱化的富文本 |
+| `text/rtf` | Word / WPS 那一路 |
+| `text/uri-list` | 从文件管理器复制多个文件时，喂给需要 URI 列表的程序 |
+
+判定标准只有一条：**取出来和普通粘贴不一样才算数**。一份和纯文本逐字相同的
+HTML 不构成额外信息，直接丢掉，否则每条记录都会翻倍。
+
+右键 → 「取用形式…」按这条记录实际有的形式动态出现，另有一组现算的：
+
+| 取用 | 结果 |
+| --- | --- |
+| 纯文本 | 去掉格式，只留文字 |
+| HTML / Markdown / RTF | 剪贴板里原本的那一份 |
+| 文件路径列表 | 一行一个路径，可直接喂给脚本 |
+| **Shell 命令** | 每条路径**按 shell 规则转义**：`/tmp/a b.txt` → `'/tmp/a b.txt'` |
+| JSON 数组 | 路径或多行文本转成 JSON 数组 |
+| Markdown 代码块 | 包在 ` ``` ` 里，粘进文档不会丢格式；正文本身含围栏时自动加长 |
+
+Shell 转义不是「无脑加引号」：路径里带 `$`、反引号或双引号时，
+双引号会被提前闭合、变量会被展开，粘到终端里执行的是另一个命令。
+所以只保留安全字符，其余一律单引号，单引号本身用 `'\''` 逃出去。
+
+**顺带纠正一处类型误判**：`# 标题` 这种文本会被判成「代码」——
+因为 `#` 正好是代码信号的注释符。而从 GitHub 复制一段 README 是很常见的操作，
+所以剪贴板里本来就有 `text/markdown` 时，就按文档记账，不再叫它代码。
+判定要求命中 Markdown 的结构特征（多级标题、列表、表格、围栏、行内代码），
+真正的代码片段不会被误伤。
+
+历史里已有的记录没有这些字段（升级前采集的），可以查、可以验：
+
+```bash
+linglong-clipboard --formats                 # 哪些记录带额外形式、各能取用哪些
+linglong-clipboard --formats 12 --json       # 单条，机器可读
+linglong-clipboard --get 12 --form-key html  # 取出来，可直接 > 到文件
+linglong-clipboard --get 12 --form-key shell # 路径按 shell 规则转义
+```
+
+设置页「采集 → 历史保留」里可以整个关掉「收下各种写法」，
+代价是粘贴结果只剩我们保存的那一份纯文本。
+
+### 八、隐私是默认值，不是可选项
 
 - **密码管理器直接跳过**：内置识别 1Password、Bitwarden、KeePass、LastPass 等 14 种，
   还可自加黑名单。
@@ -332,7 +400,7 @@ linglong-clipboard --merge-duplicates  # 重算 + 合并（含历史里的存量
 - **同步内容加密**：跨设备同步可选 Fernet 对称加密（PBKDF2 派生的密钥）。
 - **敏感项不进同步**：即使本地保留，也不导出。
 
-### 八、三平台原生适配
+### 九、三平台原生适配
 
 | 能力 | Windows | Linux (X11) | Linux (Wayland) | macOS |
 | --- | --- | --- | --- | --- |
@@ -423,7 +491,7 @@ linglong-clipboard --selfcheck
 真机验证清单见 [docs/native-verification.md](docs/native-verification.md)；
 没有目标机器时可用 `python tools/native_check.py` 在真机上一键采集结论。
 
-### 九、跨设备同步，不要中心服务器
+### 十、跨设备同步，不要中心服务器
 
 两种模式，都不经过第三方服务器：
 
@@ -733,6 +801,9 @@ linglong-clipboard --config-audit --json   # 机器可读，退出码 0/1
   每一次拖选。不支持主选择区的平台（Windows/macOS、
   无 `xclip`/`xsel`/`wl-clipboard` 的 X11）上开关会被禁用并写明原因，
   而不是给一个勾了没反应的复选框
+- **收下剪贴板里的各种写法**：采集时把 `text/html`、`text/plain` 的原始字节、
+  Markdown 等一并存下，复制出站时摆回剪贴板，让收件应用自己挑。
+  关掉后记录更小，但粘贴结果只剩我们保存的那份纯文本
 - **主选择区间隔**：主选择区有独立的读取节流（默认 1s，比剪贴板慢）。
   拖选一段长文本时每一帧内容都在变，按剪贴板那个间隔读会把中间状态
   全存下来；调慢之后，读取本身就充当防抖，用户停手那一版才会入库
@@ -853,6 +924,9 @@ linglong-clipboard --outbound --json          # 同上，JSON 输出便于回帖
 linglong-clipboard --privacy-audit            # 脱敏规则里哪些真的会生效
 linglong-clipboard --privacy-audit --json     # 同上，JSON 输出；退出码 1 表示有规则写错了
 linglong-clipboard --redact 'token=abc12345'  # 拿真实内容试跑脱敏，看会被替换成什么
+linglong-clipboard --formats                 # 哪些记录带额外形式（HTML、原始字节…）
+linglong-clipboard --get 12 --form-key html  # 取用某种形式，可直接管道给别的命令
+linglong-clipboard --get 12 --form-key shell # 路径按 shell 规则转义后再输出
 ```
 
 `--selfcheck` 退出码：`0` 全部正常、`1` 有降级、`2` 有失败，
@@ -1065,7 +1139,7 @@ pytest tests/ --cov=linglong_clip --cov-report=html # 带覆盖率
 QT_QPA_PLATFORM=offscreen pytest tests/test_ui.py   # 无头环境跑界面测试
 ```
 
-824 个用例，覆盖核心逻辑、平台适配、界面组件与端到端流程。
+1591 个用例，覆盖核心逻辑、平台适配、界面组件与端到端流程。
 界面测试统一走 Qt 的 `offscreen` 平台，无需真实显示器，CI 里也能跑。
 
 **平台相关的测试用「仿真原生层」而不是打桩断言。** Windows 分支喂一个
@@ -1073,6 +1147,12 @@ QT_QPA_PLATFORM=offscreen pytest tests/test_ui.py   # 无头环境跑界面测�
 `register()` → 事件分发 → 回调整条链路。差别在于：打桩只能验「调用了某个
 方法」，仿真能验「事件真的走到了回调」。本轮修掉的两个缺陷都属于后者 ——
 注册成功但消息没人分发、后端可用但 `register()` 是空实现。
+
+命令行标志有没有归宿由 `test_every_cli_flag_is_dispatched` 守着：新加的标志
+必须出现在分发表里，否则会静默掉进 GUI 分支卡住不返回 —— 这个坑踩过两次，
+第三次改成表驱动。剪贴板形式的判定（哪些算额外信息、Markdown 纠偏、
+shell 转义、精确字节）在 `test_clipboard_formats.py`，采集与写回的往返在
+`test_ui.py` 里用真实 `QMimeData` 跑。
 
 重复项合并的语义由两个后端各自一组同名用例守着
 （`test_storage.py` / `test_repository.py`），覆盖次数折算、最新时间提升、

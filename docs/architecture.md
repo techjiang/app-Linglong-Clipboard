@@ -41,11 +41,13 @@
    ▼
    │ ② gui_invoke → 切回 GUI 线程读取
    │    QClipboard 只能在所属线程访问，跨线程读会拿到空数据
+   │    顺带收下各种形式：text/html、text/plain 原始字节、Markdown、uri-list
    ▼
 ClipboardItem（原始载荷）
    │
    │ ③ Collector.process()（仍在采集线程，不碰 Qt）
    │    · 补齐来源（FocusTracker，按秒缓存）
+   │    · 处理形式（clipboard_formats）：补 html、Markdown 纠偏、写形式清单
    │    · 截图 OCR（OcrEngine）—— 识别结果写回 content
    │    · 类型识别 / 标签抽取（classify）
    │    · 隐私风控（PrivacyGuard）
@@ -77,6 +79,27 @@ GUI 线程：刷新列表 + 状态提示
 但排序仍把固定项排前（SQLite 的 `ORDER BY pinned DESC, …`，
 JSON 后端的 `_sort_key`），所以先被淘汰的仍是久未使用的普通记录。
 两个后端方法签名与语义逐条对齐。
+
+**剪贴板形式为什么必须在「采集那一刻」收下来。**
+`QMimeData` 是系统剪贴板当时那一份的快照，下一次复制就没了。
+之后无论读多少次 `storage`，都只能拿到我们当初决定存下来的东西 ——
+所以「这条记录还有没有 HTML 可用」是个**只能当场回答**的问题，
+不能事后推导。判定与取用收在 `core/clipboard_formats.py`，
+采集侧（`ui/clipboard_qt.py`）只负责把系统给的东西端过来。
+
+**`metadata` 是共享信封，写入按键合并。**
+往里写东西的至少有四个来源：采集（`last_source`）、形式（`formats`、
+`text_bytes`、`formats_summary`）、同步（`pinned_by`、`synced`）、
+截图识别（`ocr`）。`update_fields(metadata=...)` 因此是**合并补丁**语义：
+
+- 传部分键 → 只改这几个，其余原样保留
+- 传 `None` → 删掉这个键
+- 传 `{}` → 什么都不改
+
+此前是整体替换，于是每多一个写方，其它写方的键就开始轮流消失 ——
+而且是静默的，没有报错、界面照常，只有某天发现某个字段莫名其妙没了。
+「整体替换」还逼出一个反直觉的写法：想删一个键就得传整份拷出来的字典，
+一旦哪个写方忘了拷，删除动作就变成一次全量覆盖。
 
 ### 检索
 

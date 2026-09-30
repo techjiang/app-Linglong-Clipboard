@@ -81,6 +81,7 @@ def main() -> int:
 
     storage = Storage()
     seed_storage(storage)
+    _seed_form_item(storage)
     engine = SemanticEngine(storage)
     automation = AutomationEngine()
 
@@ -281,10 +282,52 @@ def main() -> int:
         tabs.setCurrentIndex(tabs.count() - 1)  # 「关于」是最后一页
     _render(about, OUT / "settings-native.png")
 
+    # 设置页「采集」：历史保留里新增的「收下各种写法」开关
+    keep_dialog = SettingsDialog(_config({"capture.monitor_primary": True}), automation)
+    keep_dialog.resize(760, 760)
+    keep_dialog._monitor_primary.setEnabled(True)
+    keep_dialog._monitor_primary.setChecked(True)
+    keep_dialog._primary_status.setText(
+        "可用 · 选中文字即进历史，与剪贴板记录走同一套隐私判定"
+    )
+    _render(keep_dialog, OUT / "settings-capture-formats.png")
+
     storage.close()
     app.quit()
     print("完成。")
     return 0
+
+
+def _seed_form_item(storage) -> None:
+    """造一条「剪贴板里还有别的写法」的记录，让截图体现形式取用。
+
+    没有这条记录的话，右键菜单里那一组项在截图与文档里都无从体现 ——
+    而它正是这一轮做的东西。
+    """
+    from linglong_clip.core.models import ClipboardItem, content_hash
+
+    storage.add(
+        ClipboardItem(
+            kind="text",
+            content="项目评审要点\n1. 交互稿下周二前定稿\n2. 接口文档同步更新",
+            preview="项目评审要点 1. 交互稿下周二前定稿",
+            source_app="chrome",
+            hash=content_hash("text", "form-shot"),
+            pinned=True,
+            metadata={
+                "formats": {
+                    "data": {
+                        "text/html": (
+                            "<p>项目评审要点</p><ol><li>交互稿下周二前"
+                            '<a href="https://cnb.cool/design">定稿</a></li>'
+                            "<li>接口文档同步更新</li></ol>"
+                        )
+                    }
+                },
+                "formats_summary": "text/html",
+            },
+        )
+    )
 
 
 def _seed_pending_flag_change(storage) -> None:

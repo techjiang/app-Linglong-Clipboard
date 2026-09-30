@@ -115,3 +115,24 @@ in firefox
 linglong-clipboard --search '上周的截图'
 linglong-clipboard --search '来自 chrome 的链接' --json
 ```
+
+
+## 取用「别的写法」
+
+检索找的是记录，而记录在剪贴板里往往有好几份写法。
+不在搜索框里区分，但在**右键菜单 → 取用形式…** 里可以按需取用：
+
+| 取用 | 什么时候要它 |
+| --- | --- |
+| HTML | 粘进邮件 / 富文本编辑器，链接与加粗还在 |
+| Markdown | 粘进文档时保留 Markdown 原文 |
+| Shell 命令 | 把路径贴进终端，带空格的自动作引号 |
+| JSON 数组 | 喂给脚本或配置文件 |
+| Markdown 代码块 | 粘进文档不丢格式 |
+
+命令行里同一套判定：
+
+```bash
+linglong-clipboard --formats                 # 哪些记录带额外形式
+linglong-clipboard --get 12 --form-key html  # 取出来（可直接管道）
+```

@@ -383,8 +383,18 @@ pytest tests/test_storage.py -k fts -v               # 单个模块
   需要按时间游标翻页时用 `iter_since()`。两条同步路径都曾因为只用一页
   而静默丢失老记录，且错误会自我固化。参考 `tests/test_sync.py` 的
   「全量导出」一组与 `tests/test_lan_sync.py` 的「整库传输」一组。
-  曾经有个标志没登记到分发表，表现是静默挂起（卡到 10 分钟超时才发现），
-  而不是报错。参考 `tests/test_cli.py::test_selfcheck_skips_gui_dispatch`。
+  曾经有标志没登记到分发表，表现是静默挂起（卡到 10 分钟超时才发现），
+  而不是报错 —— 而且踩过两次。现在新标志必须写进 `CLI_DEST_NAMES`
+  （GUI 专用项进 `GUI_ONLY_DESTS`），由
+  `tests/test_cli.py::test_every_cli_flag_is_dispatched` 守着。
+- **`metadata` 是共享信封，写入要按键合并**：多个写方各写自己那个键
+  （`last_source`、`formats`、`text_bytes`、`pinned_by`…）。`update_fields`
+  的 `metadata` 是**合并补丁**，传 `None` 表示删键，传 `{}` 表示什么都不改。
+  别再传「整份拷出来的字典」来表达删除 —— 合并语义下它删不掉任何东西。
+  参考 `tests/test_sync_flags.py::test_unpin_clears_origin`。
+- **「存下来」和「取出去」的字段名要成对改**：剪贴板形式的键名散落在
+  采集（`ui/clipboard_qt.py`）、判定（`core/clipboard_formats.py`）与
+  同步（`core/sync.py` 的记录字段）三处，改名时一起动。
 
 ## 提交
 
