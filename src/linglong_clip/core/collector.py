@@ -12,6 +12,12 @@ from typing import Callable, Optional
 from ..platform.base import FocusInfo
 from ..utils.logger import get_logger
 from . import classify
+from .clipboard_formats import (
+    FORMATS_KEY,
+    ClipboardFormats,
+    format_summary,
+    retag_markdown,
+)
 from .models import ClipboardItem, content_hash
 from .normalize import canonical_content
 from .ocr import OcrEngine
@@ -189,6 +195,7 @@ class Collector:
             item.metadata.setdefault(
                 "sensitive_reasons", list(analysis["sensitive_reasons"])
             )
+        self._apply_formats(item)
         tags = list(analysis["tags"])
         if item.kind == "link":
             parts = classify.summarize_url(item.content)
@@ -197,6 +204,38 @@ class Collector:
                 if classify.is_private_host(parts["host"]):
                     item.metadata.setdefault("private_host", True)
         item.tags = list(dict.fromkeys(item.tags + tags))
+
+    def _apply_formats(self, item: ClipboardItem) -> None:
+        """处理「这条记录在剪贴板里还有哪些写法」。
+
+        三件事，顺序不能反：
+
+        1. **补上 `html`**。分类判定依赖它（`detect_kind` 要看有没有富文本标记），
+           而 Qt 取回的那份有时是空的 —— 形式里存着就别浪费。
+        2. **纠正 Markdown**。`# 标题` 会被判成代码（`#` 是代码注释符），
+           而剪贴板里本来就有 `text/markdown` 的话，就该按文档记。
+        3. **落一份形式清单**。`metadata` 是唯一能跨会话留存它的地方，
+           下一次复制出站要靠它把 HTML / 原始字节摆回剪贴板。
+
+        `history.keep_formats` 关掉时整块跳过：多存一份 HTML 会让记录变大，
+        介意体积的用户应该能不要这个能力，而不是只能接受。
+        """
+        if not self._config.get("history.keep_formats", True):
+            return
+        formats = ClipboardFormats.from_metadata(item.metadata.get(FORMATS_KEY))
+        if formats.is_empty:
+            return
+
+        if not item.html and formats.html():
+            item.html = formats.html()
+        if not item.rtf and formats.rtf():
+            item.rtf = formats.rtf()
+
+        retag_markdown(item)
+
+        summary = format_summary(formats, item.content, files=item.files)
+        if summary:
+            item.metadata["formats_summary"] = summary
 
     def _ocr_enrich(self, item: ClipboardItem) -> None:
         """对截图做文字识别，把结果写进 `content` 供检索使用。

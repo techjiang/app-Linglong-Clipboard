@@ -51,6 +51,10 @@ DEFAULTS: Dict[str, Any] = {
             "path": True,
         },
         "pin_immune": True,
+        # 收下剪贴板里的各种写法（HTML、原始字节、Markdown、uri-list…），
+        # 让「复制出去」能拿回原来那份，而不是只剩我们存下来的纯文本。
+        # 关掉后记录更小，代价是粘贴结果只能是我们保存的那一份。
+        "keep_formats": True,
     },
     "privacy": {
         "exclude_password_managers": True,
