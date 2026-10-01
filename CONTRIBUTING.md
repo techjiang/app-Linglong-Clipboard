@@ -188,7 +188,20 @@ def _my_transform(text: str, option: str = "default") -> Optional[str]:
    - 测试写在 `tests/test_semantic.py` 的两组参数化用例里
      （裸名词当关键词 / 结构化短语仍解析成类型），两边都要补。
 
-8. **阈值类用例要放宽。** `test_scan_handles_20k_records_within_budget` 拦的是
+8. **剥停用词与识别来源介词时，必须卡词边界，不能按子串处理。**
+   停用词表里有 `in`、`of`、`a` 这类两字母词，`_SOURCE_RE` 里有 `in` / `from`。
+   按子串剥会把拉丁词削坏：`nginx` → `ng x`、`index` → **空串**、
+   `format` → `mat`（实测 91 个常见技术词里 19 个中招）。
+   症状一假阳性（`nginx` 捞到 `index` 的记录）、一假阴性
+   （关键词变空串 → 查询退化成「列出全部」，用户那条反而找不到，
+   界面上不报错，看着就像搜索坏了）。
+   中文没有词边界，连写照剥，所以判据是**字符类边界**：
+   停用词两侧不能是拉丁字母/数字 —— 汉字邻居不满足该断言，
+   于是中文剥离行为完全不变。改动 `_strip_stop_words()` 与
+   `_SOURCE_RE` 时，`tests/test_semantic.py` 里
+   「停用词子串受害者」那组参数化用例是回归闸门，不要删。
+
+9. **阈值类用例要放宽。** `test_scan_handles_20k_records_within_budget` 拦的是
    「复杂度写错导致的百倍退化」，不是几十毫秒的正常波动，
    所以阈值放到秒级 —— CI 机器慢几个数量级也不该因此红灯。
 

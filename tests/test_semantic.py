@@ -270,3 +270,111 @@ def test_rank_orders_by_score(engine):
     ]
     ordered = engine.rank(items, keywords="target", relevance={1: 0.5, 2: 1.0})
     assert ordered[0].id == 2
+
+
+#: 这些词都含有停用词作为**子串**，但本身是完整的技术关键词。
+#: 停用词表里有 `in` / `of` / `me` / `my` / `a` 这类两字母词，
+#: 早期实现按子串剥，把这些词削得面目全非（`nginx` -> `ng x`、
+#: `index` -> 空串、`format` -> `mat`）。21% 的常见技术词中招。
+_SUBSTRING_STOPWORD_VICTIMS = [
+    "nginx", "index", "format", "main", "container", "branch", "login",
+    "warning", "install", "mysql", "ansible", "terraform", "handler",
+    "memory", "balance", "metric", "span", "profile", "merge", "inside",
+    "intellij", "console", "prompt", "commit", "release",
+]
+
+
+@pytest.mark.parametrize("word", _SUBSTRING_STOPWORD_VICTIMS)
+def test_latin_keyword_survives_stop_word_stripping(word):
+    """拉丁词不能因为「碰巧含了停用词」就被拆开。
+
+    这是本轮修掉的一处静默缺陷：关键词被削坏后，
+    - 削成别的片段 → 假阳性（搜 `nginx` 捞出 `index` 的记录）
+    - 削成空串 → 整个查询退化成「无关键词」，界面把全部记录倒出来，
+      用户那条明明存在的记录反而找不到，看着就像「搜索坏了」
+    """
+    intent = parse_intent(word)
+    assert intent.keywords == word
+    assert intent.kinds == []
+    assert intent.source == ""
+
+
+@pytest.mark.parametrize(
+    "word,damaged",
+    [
+        # 抽查几个「曾经被削成什么」，防止有人把子串剥法改回来
+        ("nginx", "ng x"),
+        ("format", "mat"),
+        ("branch", "br ch"),
+        ("profile", "pr ile"),
+    ],
+)
+def test_latin_keyword_is_not_the_damaged_form(word, damaged):
+    assert parse_intent(word).keywords != damaged
+
+
+@pytest.mark.parametrize("word", ["index", "install"])
+def test_latin_keyword_never_becomes_empty(word):
+    """空关键词最危险：它等于关掉过滤，把全部记录倒出来。
+
+    这两条还额外踩到第二个缺陷 —— `_SOURCE_RE` 里的英文介词 `in`
+    没有词边界约束，`index` 被拆成「介词 in + 来源 dex」、
+    `install` 拆成「in + stall」，于是关键词没了、来源还成了垃圾值。
+    """
+    intent = parse_intent(word)
+    assert intent.keywords == word
+    assert intent.source == ""
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["来自 Chrome 的链接", "来自 Chrome", "从 vscode 复制的代码", "in firefox", "from Safari"],
+)
+def test_source_detection_still_works_after_boundary_fix(query):
+    """给英文介词加边界约束后，正常的来源识别必须照旧。
+
+    卡边界是为了不让 `index` 里的 `in` 被当成介词，
+    但真正的「in firefox」不能被一起挡掉 —— 那才是这条规则的用途。
+    """
+    assert parse_intent(query).source != ""
+
+
+def test_chinese_stop_word_stripping_is_unchanged():
+    """中文没有词边界，停用词仍按子串剥 —— 这条行为不能被英文的修复带偏。"""
+    intent = parse_intent("看看之前的所有链接")
+    assert "之前" not in intent.keywords
+    assert "所有" not in intent.keywords
+    assert "链接" in intent.keywords
+
+    assert parse_intent("帮我找下那段代码").keywords.endswith("代码")
+    assert "帮我" not in parse_intent("帮我找一下 部署").keywords
+
+
+def test_stop_word_inside_url_is_not_stripped():
+    """URL 里也藏着 `in` 这类片段（`/info`）；它们同样不该被剥。"""
+    intent = parse_intent("https://example.com/info")
+    assert "info" in intent.keywords
+
+
+def test_search_finds_latin_keyword_end_to_end(storage):
+    """端到端：这三个词此前分别命中 4 条（含 3 条无关）/ 0 条 / 0 条。"""
+    engine = SemanticEngine(storage)
+    rows = [
+        "server { index index.html; }",
+        "npm install --save lodash",
+        "nginx -t 配置文件检查",
+        "https://index.example.com/a",
+        "一条完全无关的记录",
+    ]
+    for i, content in enumerate(rows):
+        storage.add(ClipboardItem(kind="text", content=content, hash=f"h{i}", created_at=1000.0 + i))
+
+    nginx = [item.content for item in engine.search("nginx")]
+    assert nginx == ["nginx -t 配置文件检查"]
+
+    index_hits = {item.content for item in engine.search("index")}
+    assert "server { index index.html; }" in index_hits
+    assert "一条完全无关的记录" not in index_hits
+    assert "nginx -t 配置文件检查" not in index_hits
+
+    assert [item.content for item in engine.search("install")] == ["npm install --save lodash"]

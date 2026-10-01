@@ -220,8 +220,19 @@ _STOP_WORDS = {
     "copy", "copied", "clipboard", "please", "item", "items", "one",
 }
 
+#: 来源应用识别（「来自 Chrome」「in firefox」）。
+#:
+#: 英文介词必须卡词边界。此前 `in` 没有边界约束，`index` 被拆成
+#: 介词 `in` + 来源 `dex`、`install` 拆成 `in` + `stall` —— 整条查询
+#: 被当成「来自 dex 的记录」，关键词全丢（来源匹配不上就退化成不过滤），
+#: 界面把全部记录倒出来，用户那条索引内容反而消失。
+#: 与停用词子串剥离是同一类病：把「词」当成了「子串」。
+#:
+#: 中文介词（来自/从/在）不加边界：中文没有词边界，加了反而会漏掉
+#: 「来自Chrome」这种不带空格的写法。
 _SOURCE_RE = re.compile(
-    r"(?:来自|从|在|from|in)\s*([A-Za-z0-9_.\-\u4e00-\u9fff]{2,40})"
+    r"(?:来自|从|在|(?<![A-Za-z0-9])from(?![A-Za-z0-9])|(?<![A-Za-z0-9])in(?![A-Za-z0-9]))"
+    r"\s*([A-Za-z0-9_.\-\u4e00-\u9fff]{2,40})"
     r"(?:里|中|的|复制|拷走)?",
     re.IGNORECASE,
 )
@@ -319,6 +330,42 @@ def _resolve_range(token: str) -> tuple:
     return 0.0, 0.0
 
 
+def _strip_stop_words(text: str) -> str:
+    """把停用词按子串剔除，但**不碰拉丁词内部**。
+
+    中文没有空格分词，「看看之前的所有链接」整串连写，停用词只能按子串剥。
+    但同一条规则套到英文词上就是灾难：停用词表里有 `in`、`of`、`a` 这类
+    两字母词，子串匹配会把 `nginx` 削成 `ng x`、`index` 整词消失
+    （`in` + `de` + `x`）、`format` 削成 `mat`。
+
+    症状分两种，都很隐蔽：
+
+    - **假阳性**：`nginx` 变成 `ng x`，于是「index 的页面」也被搜了出来。
+    - **假阴性**：`index` 剥成空串，整个查询退化成「无关键词」，
+      界面把全部记录倒出来，用户那条明明存在的记录反而找不到了 ——
+      看起来像「搜索坏了」，实际是关键词被吃掉了。
+
+    所以判定标准是**字符类边界**而非空格：只有当停用词的两侧不是
+    拉丁字母/数字时才算一次命中。这样 `nginx` 里的 `in` 两侧都是字母，
+    直接跳过；而「所有的链接」里的「的」两侧是汉字，照剥不误。
+    """
+    if not text:
+        return text
+    for word in sorted(_STOP_WORDS, key=len, reverse=True):
+        if len(word) < 2 or word not in text:
+            continue
+        # 两侧不能是拉丁字母/数字 —— 这就是「不落在词内部」的判据。
+        # 中文词与英文词共用同一条规则：删除位置的邻居是汉字时，
+        # 断言天然成立（汉字不是 ASCII）；只有贴到 `nginx` 的 `in`、
+        # URL 里 `/info` 的 `in` 这类位置才会被挡住。
+        pattern = re.compile(
+            r"(?<![A-Za-z0-9])" + re.escape(word) + r"(?![A-Za-z0-9])",
+            re.IGNORECASE,
+        )
+        text = pattern.sub(" ", text)
+    return text
+
+
 def parse_intent(query: str) -> QueryIntent:
     """把自然语言查询拆成「过滤条件 + 检索关键词」。"""
     intent = QueryIntent(raw=query or "")
@@ -394,9 +441,7 @@ def parse_intent(query: str) -> QueryIntent:
 
     # 5. 剩余部分是关键词。中文没有空格分词，除按空格切分外，
     #    还要把停用词按子串剔除，否则「帮我找一下」会整段留下。
-    for word in sorted(_STOP_WORDS, key=len, reverse=True):
-        if len(word) >= 2 and word in remaining:
-            remaining = remaining.replace(word, " ")
+    remaining = _strip_stop_words(remaining)
     words = [word for word in remaining.split() if word.lower() not in _STOP_WORDS]
     intent.keywords = " ".join(words).strip()
     return intent
