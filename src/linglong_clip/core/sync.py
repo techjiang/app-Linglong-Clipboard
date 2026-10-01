@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 from ..utils.logger import get_logger
-from .models import PINNED_BY_KEY, ClipboardItem
+from .models import IMAGE_DIGEST_KEY, PINNED_BY_KEY, ClipboardItem
+from . import image_transfer
 from .privacy import PrivacyGuard
 from .storage import Storage
 from .sync_cursor import SyncCursorStore
@@ -73,6 +74,14 @@ class SyncRecord:
     seq: int = 0
     #: 图片等二进制内容不进同步（体积大且隐私风险高）
     payload_b64: str = ""
+    #: 这条记录引用的图片摘要（文件名去掉扩展名）。**只传「有这张图」和
+    #: 「它是哪一张」，不传字节** —— 接收方据此知道该去对端按需拉取。
+    #:
+    #: 为什么不干脆把字节一起传：同步目录会因此膨胀到几百 MB，而用户选
+    #: 同步目录时想的是「放个笔记本」；何况大部分图你根本不会在第二台
+    #: 机器上打开，全传是拿带宽和磁盘换一个多数时候用不上的保证。
+    #: 详见 `core/image_transfer.py`。
+    image_digest: str = ""
     #: 非 0 表示这是一条**删除标记**而非内容记录，值为删除时刻。
     #: 用同一根日志承载删除，是因为「传了什么」和「删了什么」必须在
     #: 同一条有序通道上，否则顺序颠倒会让删除被后面的新增覆盖掉。
@@ -104,6 +113,10 @@ class SyncRecord:
             "created_at": self.created_at,
             "payload_b64": self.payload_b64,
         }
+        # 只有真有图时才写：老版本读到缺字段即视为「没有图」，
+        # 与它此前的行为（图片不参与同步）完全一致，向后兼容。
+        if self.image_digest:
+            payload["image_digest"] = self.image_digest
         # 只有为真时才写：老版本读到缺字段即视为 False，向后兼容
         if self.pinned:
             payload["pinned"] = True
@@ -138,12 +151,22 @@ class SyncRecord:
             # 缺省为 0，两种载入路径共用同一份解析。见 `SyncRecord.seq`。
             seq=int(data.get("seq") or 0),
             payload_b64=str(data.get("payload_b64", "")),
+            image_digest=str(data.get("image_digest", "") or ""),
             deleted_at=float(data.get("deleted_at") or 0.0),
             flag_change=str(data.get("flag_change", "") or ""),
             flag_value=bool(data.get("flag_value", False)),
         )
 
     def to_item(self) -> ClipboardItem:
+        metadata: Dict[str, object] = {"synced": True}
+        if self.pinned and self.pinned_by:
+            metadata[PINNED_BY_KEY] = self.pinned_by
+        if self.image_digest:
+            # 记下「这条记录原本有图、摘要是什么」，但**故意不写 `image_path`**:
+            # 本机此刻并没有那份字节，写上一个指向不存在文件的路径，
+            # 会让界面以为图就在那儿，点开时才发现是空的。
+            # 摘要留给 `--sync-images` 去对端按需取，取回来才补上 `image_path`。
+            metadata[IMAGE_DIGEST_KEY] = self.image_digest
         return ClipboardItem(
             kind=self.kind,
             content=self.content,
@@ -155,11 +178,7 @@ class SyncRecord:
             favorite=self.favorite,
             hash=self.hash,
             created_at=self.created_at,
-            metadata=(
-                {"synced": True, PINNED_BY_KEY: self.pinned_by}
-                if self.pinned and self.pinned_by
-                else {"synced": True}
-            ),
+            metadata=metadata,
         )
 
     def flags(self) -> "FlagSnapshot":
@@ -328,8 +347,20 @@ class FolderSync:
 
     # ---- 导出 ----
 
-    def export(self, limit: int = 500, include_images: bool = False) -> int:
+    def export(self, limit: int = 500, include_images: bool = True) -> int:
         """把本地尚未导出过的记录追加到自己的日志文件。
+
+        `include_images` 现在默认**开启**，但导出的只是图片的**摘要**，
+        不是字节。这是本轮的一个行为变更，理由如下：
+
+        此前 `include_images=False` 意味着图片记录整条不进同步，
+        于是对端列表里连「这里曾经有一张图」都不知道 —— 跨设备同步在
+        截图这类最常用的内容上等于失效。而打开它就整条传字节，
+        体积代价又大到没人愿意付。两难来自「元数据」和「字节」被绑在了一起。
+
+        现在拆开：记录（含摘要）一律同步，代价是几十字节；字节走
+        `core/image_transfer.py` 的按需拉取，用户真要看那张图时才发生。
+        `include_images=False` 仍然保留「这些图别传出去」的语义供显式使用。
 
         `limit` 是**每页扫描批量**，不是「最多导出多少条」—— 遍历会一直走到
         历史末尾。这点与旧版不同，也是本轮修掉的一个静默丢数据的缺陷：
@@ -358,8 +389,24 @@ class FolderSync:
                 continue
             if item.kind == "image" and not include_images:
                 continue
+            # 没有指纹的记录不参与同步比对，必须**在这里**跳过：
+            # 后面所有判断（`already` 比对、标记补发）都以指纹为键，
+            # 让空指纹走进去等于依赖集合里恰好没有空串，属于侥幸。
             if not item.hash:
                 continue
+            # 有图就带上摘要（**不带字节**）。`image` 类型的记录本来就有，
+            # 但别的类型也可能带图（富文本里贴的图），所以按 `image_path`
+            # 判断而不是按 `kind` —— 只看 kind 会漏掉后者，
+            # 表现就是「有图的那条记录同步过去了，但图取不到且没人知道」。
+            image_digest = image_transfer.digest_of_item(item)
+            # 未经内容判定的图不报摘要：图片记录的 `content` 是文件名，
+            # 隐私判定对它天然失效，只有 OCR 结果能穿透进去。
+            # OCR 没跑过时我们**没有任何依据**说这张图不敏感，
+            # 所以宁可不提它 —— 提了就等于告诉对端「这里有张图可以来取」。
+            # 详见 `image_transfer.privacy_inspectable`。
+            if image_digest and not image_transfer.privacy_inspectable(item):
+                _log.debug("图片未经内容判定（无 OCR 结果），不报摘要：%s", image_digest)
+                image_digest = ""
 
             # 固定的来源要**以「发送方」为基准**落进日志：本机设的固定（来源为空）
             # 在这里补上自己的设备名，对端才会知道「这条固定是这台设备设的」。
@@ -402,6 +449,7 @@ class FolderSync:
                     favorite=item.favorite,
                     pinned_by=pinned_by,
                     created_at=item.created_at,
+                    image_digest=image_digest,
                 )
             )
 

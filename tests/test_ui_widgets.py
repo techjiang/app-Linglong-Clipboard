@@ -1495,3 +1495,87 @@ def test_settings_rejects_bad_rules_without_clearing(qt_app, home, monkeypatch):
     dialog._save()
 
     assert config.get("privacy.custom_redact_rules") == {"员工号": r"EMP\d{6}"}
+
+
+# ---- 设置页：图片附件的补图入口 ----
+
+
+def test_settings_image_fetch_disabled_without_pending(qt_app, home):
+    """没有缺失的图时按钮禁用 —— 一个点了没反应的按钮比不显示更让人困惑。"""
+    from linglong_clip.core.storage import Storage
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    storage = Storage(home / "history.db")
+    dialog = SettingsDialog(Config(home / "config.json"), storage=storage)
+    assert dialog._image_fetch.isEnabled() is False
+    assert dialog._image_fetch.text() == "从对端取回缺失的图片"
+    storage.close()
+
+
+def test_settings_image_fetch_shows_pending_count(qt_app, home):
+    """同步来的记录只有摘要、没有字节 —— 这个状态必须看得见。
+
+    否则用户在另一台机器上只会看到一张打不开的图，无从下手。
+    """
+    from linglong_clip.core.models import IMAGE_DIGEST_KEY, ClipboardItem
+    from linglong_clip.core.storage import Storage
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    storage = Storage(home / "history.db")
+    digest = "e" * 32
+    storage.add(
+        ClipboardItem(
+            kind="image",
+            content=f"{digest}.png",
+            preview="[图片]",
+            hash="img-pending",
+            metadata={IMAGE_DIGEST_KEY: digest},
+        )
+    )
+    dialog = SettingsDialog(Config(home / "config.json"), storage=storage)
+    assert dialog._image_fetch.isEnabled() is True
+    assert "1 张" in dialog._image_fetch.text()
+    assert "尚未取回" in dialog._image_hint.text()
+    storage.close()
+
+
+def test_settings_image_fetch_without_storage_does_not_crash(qt_app, home):
+    """命令行打开设置页时拿不到仓库对象：按钮禁用，不编数字。"""
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    dialog = SettingsDialog(Config(home / "config.json"))
+    assert dialog._image_fetch.isEnabled() is False
+
+
+def test_settings_image_fetch_warns_outside_lan_mode(qt_app, home, monkeypatch):
+    """共享文件夹模式下点补图要说清原因，而不是静默无事发生。"""
+    from linglong_clip.core.models import IMAGE_DIGEST_KEY, ClipboardItem
+    from linglong_clip.core.storage import Storage
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    storage = Storage(home / "history.db")
+    storage.add(
+        ClipboardItem(
+            kind="image",
+            content="f" * 32 + ".png",
+            preview="[图片]",
+            hash="img-folder-mode",
+            metadata={IMAGE_DIGEST_KEY: "f" * 32},
+        )
+    )
+    config = Config(home / "config.json")
+    config.set("sync.mode", "folder")
+    dialog = SettingsDialog(config, storage=storage)
+
+    shown = {}
+    monkeypatch.setattr(
+        "linglong_clip.ui.settings_dialog.QMessageBox.information",
+        lambda *args, **kwargs: shown.setdefault("text", args[2]),
+    )
+    dialog._run_image_fetch()
+    assert "共享文件夹" in shown["text"]
+    storage.close()

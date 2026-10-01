@@ -99,10 +99,27 @@ class FakeHotkeys:
         self.unregistered += 1
 
 
-def _run(backend=None, hotkeys=None):
+def _run(backend=None, hotkeys=None, monitor=None):
     return NativeSelfCheck(
-        backend=backend, hotkeys_factory=(lambda: hotkeys) if hotkeys else None
+        backend=backend,
+        hotkeys_factory=(lambda: hotkeys) if hotkeys else None,
+        monitor=monitor,
     ).run()
+
+
+def _find(report, name):
+    """按名字取一项检查结果 —— 比按下标可靠，插入新检查不会让用例错位。"""
+    for item in report.results:
+        if item.name == name:
+            return item
+    raise AssertionError(f"报告里没有「{name}」这一项：{[i.name for i in report.results]}")
+
+
+class FakeMonitor:
+    """只带 `is_event_driven` 的假监视器 —— 自检只需要这一个事实。"""
+
+    def __init__(self, event_driven):
+        self.is_event_driven = event_driven
 
 
 # ---------------------------------------------------------------- 全绿
@@ -589,3 +606,50 @@ def test_primary_check_fail_when_capabilities_raises():
     result = _primary_result(_Broken())
     assert result.status == FAIL
     assert "能力探测失败" in result.detail
+
+
+# ---------------------------------------------------------------- 采集通道
+
+
+class EventBackend(HealthBackend):
+    """支持事件通知的后端（`requires_polling = False`）。"""
+
+    name = "event-capable"
+    requires_polling = False
+
+
+def test_monitor_mode_reports_event_driven():
+    report = _run(EventBackend(), FakeHotkeys(), monitor=FakeMonitor(True))
+    item = _find(report, "采集通道")
+    assert item.status == OK
+    assert "事件驱动" in item.detail
+
+
+def test_monitor_mode_reports_degraded_when_events_failed_silently():
+    """本平台支持事件通知、实际却在轮询 —— 必须说出来。
+
+    这是它存在的理由：Windows 上 `AddClipboardFormatListener` 注册失败会
+    静默退回轮询，界面上毫无痕迹，而采集延迟已经变了。
+    """
+    report = _run(EventBackend(), FakeHotkeys(), monitor=FakeMonitor(False))
+    item = _find(report, "采集通道")
+    assert item.status == DEGRADED
+    assert "而非事件驱动" in item.detail
+    assert "窗口句柄" in item.hint
+
+
+def test_monitor_mode_ok_on_poll_only_platform():
+    """只能在轮询的平台上报 OK 而不是降级 —— 那不是缺陷。"""
+    report = _run(HealthBackend(), FakeHotkeys(), monitor=FakeMonitor(False))
+    item = _find(report, "采集通道")
+    assert item.status == OK
+    assert "轮询" in item.detail
+
+
+def test_monitor_mode_without_running_monitor_does_not_claim_events():
+    """没有运行中的监视器时不许编出「当前是事件驱动」这个结论。"""
+    report = _run(EventBackend(), FakeHotkeys())
+    item = _find(report, "采集通道")
+    assert item.status == OK
+    assert "当前" not in item.detail
+    assert "支持事件驱动采集" in item.detail

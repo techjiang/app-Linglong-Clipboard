@@ -33,6 +33,10 @@ def _add_image(repo, name, *, hash_=None, **kwargs):
             image_path=f"images/{name}",
             hash=hash_ or f"h-{name}",
             preview=f"[图片] {name}",
+            # 真机上采集管线会给图片补上 OCR 结果（哪怕是「图里没字」）。
+            # 没有这个标记的图被视为「没被读过」，不会外发 ——
+            # 见 `image_transfer.privacy_inspectable`。
+            metadata={"ocr": {"text": "", "backend": "stub"}},
             **kwargs,
         )
     )
@@ -507,3 +511,38 @@ def test_sweep_skips_entry_whose_type_cannot_be_read(tmp_path, monkeypatch):
     result = image_store.sweep(images, set(), dry_run=False)
     assert result.removed == 0
     assert result.errors == 0
+
+
+# ---- 两个后端：`image_path` 的回填 ----
+#
+# 同步只带图片摘要，字节按需拉取到位后才回填 `image_path`。
+# 两个后端各有一份 `update_fields` 的白名单，漏掉 `image_path` 的后果是
+# 「换个存储方式，有的图打得开、有的打不开」—— 同一份语义两处实现，
+# 就得用同一组断言把它们钉住。
+
+
+def test_update_fields_accepts_image_path(repo):
+    item = repo.add(
+        ClipboardItem(
+            kind="image", content="x.png", hash="h-img", metadata={"image_digest": "a" * 32}
+        )
+    )
+    repo.update_fields(item.id, image_path="images/x.png")
+    assert repo.get(item.id).image_path == "images/x.png"
+
+
+def test_update_fields_metadata_patch_keeps_image_path(repo):
+    """`metadata` 合并与 `image_path` 回填是两件独立的事，互不覆盖。"""
+    item = repo.add(
+        ClipboardItem(
+            kind="image", content="y.png", hash="h-img2", metadata={"image_digest": "b" * 32}
+        )
+    )
+    repo.update_fields(item.id, image_path="images/y.png")
+    repo.update_fields(item.id, metadata={"pinned_by": "laptop"})
+
+    loaded = repo.get(item.id)
+    assert loaded.image_path == "images/y.png"
+    assert loaded.metadata.get("pinned_by") == "laptop"
+    # 摘要没被顺手抹掉 —— 合并语义下这是「别的写方只动自己的键」
+    assert loaded.metadata.get("image_digest") == "b" * 32

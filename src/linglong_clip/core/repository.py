@@ -377,7 +377,18 @@ class JsonRepository:
         在 JSON 下丢字段」，而用户只是换了个存储方式就踩到 —— 这类
         只在其中一个后端出现的不一致，是最难被发现的一种。
         """
-        allowed = {"pinned", "favorite", "sensitive", "tags", "metadata", "kind"}
+        # `image_path` 参与其中，语义与 SQLite 后端一致：同步只带图片摘要，
+        # 字节按需拉取到位后才回填路径。两个后端不一致的话，
+        # 「换个存储方式就有的图打不开、有的打得开」。
+        allowed = {
+            "pinned",
+            "favorite",
+            "sensitive",
+            "tags",
+            "metadata",
+            "kind",
+            "image_path",
+        }
         payload = {key: value for key, value in fields.items() if key in allowed}
         if not payload or self._closed:
             return

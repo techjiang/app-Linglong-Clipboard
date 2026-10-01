@@ -88,10 +88,6 @@ class ClipboardFormats:
     def has(self, mime: str) -> bool:
         return mime in self.data or mime in self.names
 
-    def kind_names(self) -> List[str]:
-        """给人看的形式名列表：`text/html`、`text/rtf`、以及「另外 3 种」里的名字。"""
-        return list(self.data) + list(self.names)
-
     def to_metadata(self) -> Dict[str, object]:
         payload: Dict[str, object] = {}
         if self.data:

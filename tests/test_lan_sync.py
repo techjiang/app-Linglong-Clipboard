@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import socket
 import time
@@ -113,7 +114,12 @@ def test_sync_is_idempotent(nodes):
     assert remote.count() == 1
 
 
-def test_sensitive_and_image_are_not_shared(nodes):
+def test_sensitive_is_not_shared_but_image_metadata_is(nodes):
+    """敏感内容不外发；图片记录**元数据**外发、字节不外发。
+
+    这是本轮的行为变更（此前图片整条跳过）。分开断言两件事，
+    是因为它们现在走的是同一条通道但结论相反 —— 合成一句就说不清了。
+    """
     make, local, remote = nodes
     _add(local, "正常内容", digest="h1")
     _add(local, "身份证信息", digest="h2", sensitive=True)
@@ -122,19 +128,163 @@ def test_sensitive_and_image_are_not_shared(nodes):
     a, b = make(local, "a", token="t"), make(remote, "b", token="t")
     b.peers = [f"127.0.0.1:{a.status()['port']}"]
 
-    assert b.sync_all() == 1
-    assert [i.content for i in remote.list()] == ["正常内容"]
+    assert b.sync_all() == 2
+    contents = sorted(i.content for i in remote.list())
+    assert contents == ["截图", "正常内容"]
+
+    # `_add` 造的是没有 image_path 的裸记录，所以摘要为空 —— 这不矛盾：
+    # 「有图才带摘要」正是要的语义。下面单独造一条真有图的记录验证摘要会过去。
+    img = [i for i in remote.list() if i.kind == "image"][0]
+    assert img.image_path == ""
+    assert img.metadata.get("image_digest") is None
 
 
-def test_image_item_with_path_is_excluded(storage, home):
-    """即使 kind 不是 image，只要带 image_path 也不外发。"""
+def test_image_digest_travels_even_when_kind_is_not_image(storage, home):
+    """`kind` 不是 image 但带图（富文本里贴的图）时，摘要同样要带上。
+
+    按 `kind` 判断会漏掉这一类，表现是「有图的那条记录同步过去了，
+    但图取不到、而且没人知道它本该有图」。
+    """
     from linglong_clip.utils.config import Config
 
     node = LanSyncServer(storage, device_name="a", guard=PrivacyGuard(Config(home / "c.json")))
+    digest = "b" * 32
     storage.add(
-        ClipboardItem(kind="text", content="x", preview="x", hash="h1", image_path="/tmp/a.png")
+        ClipboardItem(
+            kind="text",
+            content="x",
+            preview="x",
+            hash="h1",
+            image_path=f"images/{digest}.png",
+            # 被 OCR 看过（真机上采集管线会补上）—— 没有这个标记的图
+            # 连摘要都不报，见 `test_unread_image_digest_is_not_advertised`
+            metadata={"ocr": {"text": "", "backend": "stub"}},
+        )
     )
-    assert node.collect_records() == []
+    records = node.collect_records()
+    assert len(records) == 1
+    assert f'"image_digest": "{digest}"' in records[0]
+    # 字节不在响应里
+    assert "payload_b64" in records[0]
+    assert f'"image_digest": "{digest}"' in records[0]
+
+
+def test_image_endpoint_refuses_unreferenced_file(storage, home):
+    """`/image` 的判据是「有没有记录引用」，不是「文件在不在」。
+
+    否则就开了一个「按摘要读本机文件」的口子 —— `images/` 里也可能
+    放着用户自己搁的东西。
+    """
+    from linglong_clip.utils.config import Config
+
+    node = LanSyncServer(storage, device_name="a", guard=PrivacyGuard(Config(home / "c.json")))
+    data = b"\x89PNG fake"
+    digest = hashlib.blake2b(data, digest_size=16).hexdigest()
+    (storage.images_dir / f"{digest}.png").write_bytes(data)
+
+    # 没有记录引用它 -> 拒绝
+    assert node.image_bytes(digest) is None
+
+    # 有记录引用、内容被 OCR 看过（真机上采集管线会补上）-> 放行
+    storage.add(
+        ClipboardItem(
+            kind="image",
+            content=f"{digest}.png",
+            hash="img1",
+            image_path=f"images/{digest}.png",
+            metadata={"ocr": {"text": "", "backend": "stub"}},
+        )
+    )
+    assert node.image_bytes(digest) == data
+
+
+def test_image_endpoint_refuses_images_never_read_by_ocr(storage, home):
+    """没被 OCR 读过的图不外发，即使它有记录引用。
+
+    图片记录的 `content` 是文件名，隐私判定对它天然失效 —— 只有 OCR
+    结果能穿透进去。没读过就不外发：理由不是「它一定敏感」，
+    而是**我们没有任何依据说它不敏感**。
+
+    实测过这条路径：关掉 OCR 时，一张写着 `BEGIN RSA PRIVATE KEY` 的截图
+    会以 `sensitive=False` 入库、进同步、字节可被对端取走，界面上一切正常。
+    """
+    from linglong_clip.utils.config import Config
+
+    node = LanSyncServer(storage, device_name="a", guard=PrivacyGuard(Config(home / "c.json")))
+    data = b"\x89PNG unread"
+    digest = hashlib.blake2b(data, digest_size=16).hexdigest()
+    (storage.images_dir / f"{digest}.png").write_bytes(data)
+    storage.add(
+        ClipboardItem(
+            kind="image",
+            content=f"{digest}.png",
+            hash="img-unread",
+            image_path=f"images/{digest}.png",
+            # 没有 metadata["ocr"] —— OCR 没跑过
+        )
+    )
+    assert node.image_bytes(digest) is None
+    from linglong_clip.core import image_transfer
+
+    assert image_transfer.privacy_inspectable(storage.list()[0]) is False
+
+
+def test_image_endpoint_never_serves_sensitive_records(storage, home):
+    """敏感记录的图不外发 —— 与记录通道走同一份判定。"""
+    from linglong_clip.utils.config import Config
+
+    node = LanSyncServer(storage, device_name="a", guard=PrivacyGuard(Config(home / "c.json")))
+    data = b"\x89PNG secret"
+    digest = hashlib.blake2b(data, digest_size=16).hexdigest()
+    (storage.images_dir / f"{digest}.png").write_bytes(data)
+    storage.add(
+        ClipboardItem(
+            kind="image",
+            content=f"{digest}.png",
+            hash="img2",
+            image_path=f"images/{digest}.png",
+            sensitive=True,
+            metadata={"ocr": {"text": "-----BEGIN RSA PRIVATE KEY-----", "backend": "t"}},
+        )
+    )
+    assert node.image_bytes(digest) is None
+
+
+def test_image_endpoint_rejects_bogus_digest(storage, home):
+    """摘要会参与拼路径，格式必须先校验，否则就是路径穿越。"""
+    from linglong_clip.utils.config import Config
+
+    node = LanSyncServer(storage, device_name="a", guard=PrivacyGuard(Config(home / "c.json")))
+    for bad in ["../../etc/passwd", "..%2f..%2fetc%2fpasswd", "", "zz" * 16, "a" * 31]:
+        assert node.image_bytes(bad) is None
+
+
+def test_image_digest_survives_the_round_trip(nodes):
+    """真有图时，远端拿到的记录带着摘要、且没有 `image_path`。
+
+    `image_path` 必须为空：本机此刻确实没有那份字节，写上一个指向不存在
+    文件的路径会让界面以为图就在那儿，点开才发现是空的。
+    """
+    make, local, remote = nodes
+    digest = "c" * 32
+    local.add(
+        ClipboardItem(
+            kind="image",
+            content=f"{digest}.png",
+            preview="[图片]",
+            hash="img-sync-1",
+            image_path=f"images/{digest}.png",
+            metadata={"ocr": {"text": "", "backend": "stub"}},
+        )
+    )
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+    assert b.sync_all() == 1
+
+    received = remote.list()[0]
+    assert received.image_path == ""
+    assert received.metadata.get("image_digest") == digest
 
 
 def test_wrong_token_is_rejected(nodes):
@@ -1058,3 +1208,223 @@ def test_lan_seq_is_not_written_into_shared_journal(storage, tmp_path):
     # 从日志形状的字典还原时，缺这个键要落回 0，而不是报错
     restored = SyncRecord.from_json(record.to_json())
     assert restored is not None and restored.seq == 0
+
+
+# ---------- 图片按需传输 ----------
+
+
+@pytest.fixture()
+def devices(tmp_path, monkeypatch):
+    """两台**真正独立**的设备：各自的数据库与各自的 `images/` 目录。
+
+    为什么必须分开：`Storage.images_dir` 是「数据库所在目录 / images」，
+    而共用一个 `home` 时两台设备指向同一个 `images/` —— 那样测「按需取图」
+    永远测不出东西，因为文件一开始就在那儿（第一版用例就是这么假绿了）。
+    真机上两台设备是两个数据目录，这里必须还原这一点。
+    """
+    from linglong_clip.core.storage import Storage
+
+    home_a = tmp_path / "dev-a"
+    home_b = tmp_path / "dev-b"
+    home_a.mkdir()
+    home_b.mkdir()
+    # `Path.home()` 类的代码路径不该被测试写到真实用户目录
+    monkeypatch.setenv("LINGLONG_CLIPBOARD_HOME", str(home_a))
+
+    st_a = Storage(home_a / "history.db")
+    st_b = Storage(home_b / "history.db")
+    started = []
+
+    def make(st, name, token=""):
+        node = LanSync(
+            storage=st, device_name=name, token=token, port=0, cipher=None,
+            guard=PrivacyGuard(),
+        )
+        assert node.start()
+        started.append(node)
+        return node
+
+    yield make, st_a, st_b
+    for node in started:
+        node.stop()
+    st_a.close()
+    st_b.close()
+
+
+def _png(payload: bytes = b"fake-png-body") -> bytes:
+    """造一段假 PNG 字节。
+
+    不用真 PNG：这里验的是「按摘要取、取回后校验」这条链路，
+    与图片格式无关，而真 PNG 的构造只会让用例更长。
+    """
+    return b"\x89PNG\r\n\x1a\n" + payload
+
+
+def _add_image(storage, data: bytes, *, ocr: bool = True) -> str:
+    """把图片落进 `images/` 并加一条引用它的记录，返回摘要。
+
+    `ocr=True`（默认）时补上 `metadata["ocr"]` —— 真机上这就是采集管线
+    跑完 OCR 之后的形状。必须在用例里显式带上它：一张**没被 OCR 看过**的图
+    不会外发（见 `image_transfer.privacy_inspectable`），
+    不带的话用例测的是另一条路径。
+    """
+    from linglong_clip.core import image_transfer
+
+    digest = image_transfer.digest_of(data)
+    (storage.images_dir / f"{digest}.png").write_bytes(data)
+    metadata = {"ocr": {"text": "", "backend": "stub"}} if ocr else {}
+    storage.add(
+        ClipboardItem(
+            kind="image",
+            content=f"{digest}.png",
+            preview="[图片]",
+            hash=f"img-{digest[:8]}",
+            image_path=f"images/{digest}.png",
+            metadata=metadata,
+        )
+    )
+    return digest
+
+
+def test_missing_image_is_fetched_and_adopted(devices):
+    """端到端：记录同步过去只带摘要，按需拉取后字节到位、`image_path` 被补上。"""
+    make, local, remote = devices
+    data = _png(b"hello")
+    digest = _add_image(local, data)
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+
+    assert b.sync_all() == 1
+    item = remote.list()[0]
+    # 同步后：知道有图、知道是哪张，但本机确实没有字节
+    assert item.metadata.get("image_digest") == digest
+    assert item.image_path == ""
+    assert not (remote.images_dir / f"{digest}.png").exists()
+
+    outcome = b.fetch_missing_images()
+    assert (outcome.missing, outcome.fetched, outcome.adopted, outcome.failed) == (1, 1, 1, 0)
+
+    # 字节真的落盘，且能被摘要校验
+    assert (remote.images_dir / f"{digest}.png").read_bytes() == data
+    # `image_path` 被补上，界面这才打得开
+    assert remote.list()[0].image_path == f"images/{digest}.png"
+
+
+def test_fetch_is_idempotent(devices):
+    """补齐之后再问一次，什么都不做。"""
+    make, local, remote = devices
+    digest = _add_image(local, _png(b"once"))
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+    b.sync_all()
+
+    assert b.fetch_missing_images().fetched == 1
+    second = b.fetch_missing_images()
+    assert (second.missing, second.fetched) == (0, 0)
+
+
+def test_fetch_verifies_digest_and_rejects_tampered_bytes(devices):
+    """对端给的内容与摘要不符时必须丢弃。
+
+    内容寻址白送的好处：不需要额外约定校验字段，重算一次摘要就能发现。
+    这里直接改对端磁盘上的文件来模拟（对端被换过 / 链路被换过）。
+    """
+    make, local, remote = devices
+    data = _png(b"original")
+    digest = _add_image(local, data)
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+    b.sync_all()
+
+    # 把对端磁盘上的字节换成另一份 —— 文件名仍是旧摘要
+    (local.images_dir / f"{digest}.png").write_bytes(_png(b"tampered"))
+
+    outcome = b.fetch_missing_images()
+    assert outcome.fetched == 0
+    assert outcome.failed == 1
+    # 关键：没有落盘。半个或不对的图进到 images/ 会被后续统计当成正常图。
+    assert not (remote.images_dir / f"{digest}.png").exists()
+
+
+def test_fetch_respects_limit(devices):
+    """单次上限：历史里积了几千张时不至于一次拉完卡住。"""
+    make, local, remote = devices
+    for i in range(5):
+        _add_image(local, _png(f"img-{i}".encode()))
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+    assert b.sync_all() == 5
+
+    first = b.fetch_missing_images(limit=2)
+    assert first.fetched == 2
+    assert first.truncated is True
+
+    # 第一轮上限 2 张，剩下 3 张
+    second = b.fetch_missing_images(limit=10)
+    assert second.missing == 3
+    assert second.fetched == 3
+    assert second.truncated is False
+
+    third = b.fetch_missing_images(limit=10)
+    assert third.missing == 0
+    assert third.fetched == 0
+
+
+def test_fetch_reports_orphaned_bytes(devices):
+    """记录没了但图还在对端：字节拿得回来，却不该计入「补上了记录」。"""
+    make, local, remote = devices
+    digest = _add_image(local, _png(b"orphan"))
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+    b.sync_all()
+
+    # 远端把记录删掉，但 metadata 里的摘要还在本地库里（模拟淘汰后又想补图）
+    remote.clear()
+    remote.add(
+        ClipboardItem(
+            kind="image",
+            content=f"{digest}.png",
+            preview="[图片]",
+            hash="manual",
+            metadata={"image_digest": digest},
+        )
+    )
+    outcome = b.fetch_missing_images()
+    assert outcome.fetched == 1
+    assert outcome.adopted == 1
+
+
+def test_fetch_with_no_peers_is_a_noop(devices):
+    make, local, remote = devices
+    _add_image(local, _png(b"x"))
+    b = make(remote, "b", token="t")
+    outcome = b.fetch_missing_images()
+    assert (outcome.missing, outcome.fetched, outcome.failed) == (0, 0, 0)
+
+
+def test_fetch_wrong_token_fails_cleanly(devices):
+    """口令不对时取不到图，但不抛异常、不落盘。"""
+    make, local, remote = devices
+    digest = _add_image(local, _png(b"secret-image"))
+
+    a, b = make(local, "a", token="correct"), make(remote, "b", token="wrong")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+    # 记录本身就拉不过来（401），所以先手工造一条带摘要的记录
+    remote.add(
+        ClipboardItem(
+            kind="image",
+            content=f"{digest}.png",
+            preview="[图片]",
+            hash="manual2",
+            metadata={"image_digest": digest},
+        )
+    )
+    outcome = b.fetch_missing_images()
+    assert outcome.fetched == 0
+    assert outcome.failed == 1
+    assert not (remote.images_dir / f"{digest}.png").exists()

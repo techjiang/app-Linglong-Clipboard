@@ -40,6 +40,13 @@ KIND_LABELS: Dict[str, str] = {
 #: 是，就说明它已失效，删除照做。
 PINNED_BY_KEY = "pinned_by"
 
+#: `metadata` 里记录「这条记录引用的图片是哪一张」的键。
+#:
+#: 图片字节不参与同步（体积大、隐私面大），同步过来的记录只有这个摘要。
+#: 它让界面能回答「这条记录原本有图」以及「还缺哪一张」，
+#: 也为 `--sync-images` 指明该去对端要什么。取回字节后才会补上 `image_path`。
+IMAGE_DIGEST_KEY = "image_digest"
+
 
 def content_hash(kind: str, payload: str) -> str:
     """内容指纹：用于去重与跨设备同步时的冲突判定。"""

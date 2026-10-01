@@ -180,6 +180,23 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="配 --images-gc 使用：只列出会删哪些文件，不真删",
     )
+    images_group.add_argument(
+        "--images-pending",
+        action="store_true",
+        help="列出「同步过来的记录说有图、但本机还没有那份文件」的图片（从对端按需取）",
+    )
+    images_group.add_argument(
+        "--sync-images",
+        action="store_true",
+        help="向局域网对端按需拉取缺失的图片（图片不进同步日志，要用时才取）",
+    )
+    images_group.add_argument(
+        "--images-limit",
+        type=int,
+        metavar="N",
+        default=20,
+        help="配 --sync-images：单次最多补几张（默认 20，避免一次拉几千张卡住界面）",
+    )
 
     storage_group = parser.add_argument_group("历史存储")
     storage_group.add_argument(
@@ -467,6 +484,83 @@ def _image_status(storage) -> dict:
         "unreferenced_bytes": unreferenced_bytes,
         "missing": usage.missing,
     }
+
+
+def _run_image_sync(args, storage, config) -> int:
+    """`--images-pending` 与 `--sync-images` 的实现。
+
+    两件事分开是有意的：**看清单**和**去拉取**是不同性质的动作用户要能分开。
+    前者只读本地记录，任何模式下都能看；后者要连对端，只有局域网模式能做到。
+    """
+    from .core import image_transfer
+    from .core.lan_sync import build_lan_sync
+    from .core.privacy import PrivacyGuard
+
+    images_dir = storage.images_dir
+    wanted = image_transfer.pending_digests(storage.iter_all(batch=512), images_dir)
+
+    if args.images_pending and not args.sync_images:
+        if args.json:
+            print(json.dumps({"pending": wanted, "count": len(wanted)}, ensure_ascii=False, indent=2))
+            return 0
+        if not wanted:
+            print("没有缺失的图片：同步过来的记录里每一张图本机都有")
+            return 0
+        print(f"缺失 {len(wanted)} 张图片（记录说有图，但本机没有那份文件）：")
+        # 只列前 20 个：这是给人看的清单，不是导出的数据。
+        for digest in wanted[:20]:
+            print(f"  {digest}")
+        if len(wanted) > 20:
+            print(f"  …… 还有 {len(wanted) - 20} 张")
+        print("\n  linglong-clipboard --sync-images   # 向局域网对端按需取回")
+        return 0
+
+    # --sync-images
+    mode = str(config.get("sync.mode", "folder") or "folder").lower()
+    if mode != "lan":
+        # 共享文件夹模式**没有请求通道**：对端只是另一个目录，
+        # 字节不在里面就无从索取。这不是没做，是模式本身不具备这个能力，
+        # 所以要明确说出来，而不是给一个「已尝试」的空结果。
+        print(
+            f"当前同步模式是 {mode}，没有可用的取图通道。\n"
+            "  图片字节不进同步日志，所以共享文件夹模式取不回图。\n"
+            "  要按需补图请把 sync.mode 设为 lan，并配置至少一个对端。",
+            file=sys.stderr,
+        )
+        return 2
+
+    # 带上隐私判定：构造 `LanSync` 时会一并起本机的服务端，
+    # 而服务端的 `/image` 要靠它决定「这张图该不该外发」。
+    # 不传的话，本机服务端在这条命令的进程里会对任何引用它的记录放行。
+    lan = build_lan_sync(storage, config, guard=PrivacyGuard(config))
+    if lan is None:
+        print("局域网同步未启用或配置不完整，无法取图", file=sys.stderr)
+        return 2
+
+    limit = max(1, int(getattr(args, "images_limit", 20) or 20))
+    try:
+        outcome = lan.fetch_missing_images(limit=limit)
+    finally:
+        lan.stop()
+
+    payload = outcome.as_dict()
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    if not outcome.missing:
+        print("没有缺失的图片：同步过来的记录里每一张图本机都有")
+        return 0
+    print(f"缺失 {outcome.missing} 张，本次补回 {outcome.fetched} 张（影响 {outcome.adopted} 条记录）")
+    if outcome.orphaned:
+        # 字节拿到了但没人引用 —— 多半是那条记录已经被删/淘汰了。
+        # 单独报出来，否则「补了 3 张」而界面上一条都没变，看着像坏掉。
+        print(f"  其中 {outcome.orphaned} 张取回时已无记录引用（记录可能已删除）")
+    if outcome.failed:
+        print(f"  {outcome.failed} 张没取到：对端都没有这张图，或口令不匹配")
+    if outcome.truncated:
+        print(f"  达到单次上限（{limit} 张）提前停下，再跑一次继续")
+    return 0
 
 
 def _run_images(args, storage) -> int:
@@ -810,6 +904,11 @@ def _run_cli(args: argparse.Namespace) -> int:
         return handled
 
     storage = _load_storage(config)
+
+    if args.images_pending or args.sync_images:
+        code = _run_image_sync(args, storage, config)
+        storage.close()
+        return code
 
     if args.images or args.images_gc:
         code = _run_images(args, storage)
@@ -1444,6 +1543,8 @@ CLI_DEST_NAMES = (
     "redact",
     "images",
     "images_gc",
+    "images_pending",
+    "sync_images",
 )
 
 

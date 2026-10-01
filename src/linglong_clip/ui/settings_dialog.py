@@ -1134,6 +1134,19 @@ class SettingsDialog(QDialog):
         self._image_gc.clicked.connect(self._run_image_gc)  # type: ignore[attr-defined]
         form.addRow("", self._image_gc)
 
+        # 图片字节不参与同步（只同步「有这张图、它是哪一张」），
+        # 所以「这条记录有图、但本机还没有那份文件」是一种**正常状态**，
+        # 而不是损坏。它必须能在这里被看见并一键补齐 ——
+        # 否则用户在另一台机器上只会看到一张打不开的图，无从下手。
+        self._image_fetch = QPushButton("从对端取回缺失的图片")
+        self._image_fetch.setToolTip(
+            "向局域网对端按需拉取：同步过来的记录只有图片摘要，字节要用了才取。\n"
+            "取回的字节会按摘要校验，对不上就丢弃。仅局域网同步模式可用。"
+        )
+        self._image_fetch.clicked.connect(self._run_image_fetch)  # type: ignore[attr-defined]
+        self._image_fetch.setEnabled(False)
+        form.addRow("", self._image_fetch)
+
         self._image_hint = QLabel()
         self._image_hint.setWordWrap(True)
         form.addRow("", self._image_hint)
@@ -1172,18 +1185,53 @@ class SettingsDialog(QDialog):
             wasted = sum(path.stat().st_size for path in orphans if path.exists())
             self._image_gc.setEnabled(True)
             self._image_gc.setText(f"回收 {len(orphans)} 张未被引用的图片")
-            self._image_hint.setText(
-                f"其中 {wasted / 1024 / 1024:.1f} MB 没有被任何记录引用，可以回收。"
-            )
+            hint_lines = [
+                f"{wasted / 1024 / 1024:.1f} MB 没有被任何记录引用，可以回收"
+            ]
         else:
             self._image_gc.setEnabled(False)
             self._image_gc.setText("回收未被引用的图片")
-            self._image_hint.setText("每张图都有记录在引用，没有可回收的。")
+            hint_lines = ["每张图都有记录在引用，没有可回收的"]
         if usage.missing:
-            self._image_hint.setText(
-                self._image_hint.text()
-                + f" 另有 {usage.missing} 条记录引用的图片已不在磁盘上，这些记录打不开原图。"
+            # 与「还没取回来」是两回事：这些是**曾经有过、现在没了**
+            # （手工删过、同步盘冲突），要找回来而不是去对端要。
+            hint_lines.append(
+                f"{usage.missing} 条记录引用的图片已不在磁盘上"
+                "（图片被手工删过或同步盘冲突），这些记录打不开原图"
             )
+        self._image_hint.setText("\n".join(hint_lines))
+
+        # 「同步过来但还没取字节」的张数。与上面的 `usage.missing` 是两回事：
+        # 前者是**从没在本机存在过**（等对端给），后者是**曾经有过、现在没了**
+        # （数据损坏）。处理方式不同，所以分开说。
+        try:
+            from ..core import image_transfer
+
+            pending = image_transfer.pending_digests(
+                storage.iter_all(batch=512), storage.images_dir
+            )
+        except Exception:  # noqa: BLE001
+            pending = []
+        if pending:
+            self._image_fetch.setEnabled(True)
+            self._image_fetch.setText(f"从对端取回缺失的图片（{len(pending)} 张）")
+            # 每条独立成行：之前把三件事拼在一段里，读起来像一句话说完了三件事，
+            # 而它们的处理方式完全不同（回收 / 找回来 / 去对端要）。
+            self._image_hint.setText(
+                "\n".join(
+                    filter(
+                        None,
+                        [
+                            self._image_hint.text(),
+                            f"{len(pending)} 张是同步过来的记录提到、本机尚未取回的，"
+                            "可用上面的按钮向对端索取",
+                        ],
+                    )
+                )
+            )
+        else:
+            self._image_fetch.setEnabled(False)
+            self._image_fetch.setText("从对端取回缺失的图片")
 
     def _run_image_gc(self) -> None:
         storage = self._image_backend()
@@ -1198,6 +1246,56 @@ class SettingsDialog(QDialog):
             f"（{result.bytes / 1024 / 1024:.1f} MB），"
             f"保留 {result.kept} 张仍被引用的。",
         )
+
+    def _run_image_fetch(self) -> None:
+        """向对端按需补图。只跑一次，不做后台循环。
+
+        刻意不做成「后台自动补」：补图要连对端，可能因为口令不对、
+        对端离线而反复失败；让它安静地在后台重试，用户看到的是
+        「图片时好时坏」而不知道原因。显式点一次，成败都当场说清楚。
+        """
+        storage = self._image_backend()
+        if storage is None:
+            return
+        from ..core.lan_sync import build_lan_sync
+
+        mode = str(self._config.get("sync.mode", "folder") or "folder").lower()
+        if mode != "lan":
+            QMessageBox.information(
+                self,
+                "需要局域网同步",
+                "图片字节不进同步日志，所以共享文件夹模式取不回图。\n"
+                "把「同步 → 模式」设为局域网，并配置至少一个对端。",
+            )
+            return
+
+        from ..core.privacy import PrivacyGuard
+
+        lan = build_lan_sync(storage, self._config, guard=PrivacyGuard(self._config))
+        if lan is None or not lan.start():
+            QMessageBox.warning(
+                self,
+                "无法启动同步",
+                "局域网同步未能启动：检查「同步」页里的端口与对端配置。",
+            )
+            return
+        try:
+            outcome = lan.fetch_missing_images(limit=50)
+        finally:
+            lan.stop()
+
+        self._refresh_image_usage()
+        lines = [
+            f"缺失 {outcome.missing} 张，本次取回 {outcome.fetched} 张"
+            f"（影响 {outcome.adopted} 条记录）"
+        ]
+        if outcome.orphaned:
+            lines.append(f"其中 {outcome.orphaned} 张取回时已无记录引用（记录可能已删除）")
+        if outcome.failed:
+            lines.append(f"{outcome.failed} 张没取到：对端都没有这张图，或口令不匹配")
+        if outcome.truncated:
+            lines.append("达到单次上限提前停下，再点一次可以继续")
+        QMessageBox.information(self, "取图完成", "\n".join(lines))
 
     def _refresh_storage_hint(self) -> None:
         is_json = self._storage_backend.currentData() == "json"

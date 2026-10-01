@@ -299,10 +299,207 @@ def main() -> int:
     image_dialog.resize(760, 760)
     _render(image_dialog, OUT / "settings-images.png")
 
+    # 设置页「采集」：图片附件面板 —— 「同步过来但本机还没有那份字节」的样子。
+    # 这一档此前在界面上完全看不见：用户只会在另一台机器上看到一张打不开的图。
+    _seed_pending_images(storage, count=4)
+    pending_image_dialog = SettingsDialog(_config({}), automation, storage=storage)
+    pending_image_dialog.resize(760, 780)
+    _render(pending_image_dialog, OUT / "settings-images-pending.png")
+
+    # 命令行输出也做成图：`--images-pending` / `--sync-images` 这条链路
+    # 没有界面可截，而它正是这一轮最需要被看见的部分。
+    # 内容是**真实跑出来的**（同一份数据、同一条代码路径），不是手写的字面量。
+    _render_terminal(
+        _capture_image_cli(storage),
+        OUT / "cli-image-fetch.png",
+        title="linglong-clipboard — 图片按需补图",
+    )
+
     storage.close()
     app.quit()
     print("完成。")
     return 0
+
+
+def _capture_image_cli(storage) -> list:
+    """真跑一遍「按需补图」的完整链路，把输出抓回来。
+
+    为什么要「真跑」而不是照着输出写一份字面量：截图一旦与实现脱节就会误导
+    读者，而这个仓库里已经吃过一次这个亏（README 承诺的入口实际不存在）。
+    真的执行、真的捕获输出，图里的每一行就都是程序说的。
+
+    **两台设备 + 真实 socket**：`--images-pending` 只读本地记录，
+    单独截它说明不了「字节怎么过来的」；而这一段正是这轮的重点。
+    所以这里真起一个对端服务，真走一次 HTTP 拉取。
+    """
+    import contextlib
+    import io
+    import socket as _socket
+    import threading
+
+    from linglong_clip.core.lan_sync import LanSync
+    from linglong_clip.core.privacy import PrivacyGuard
+    from linglong_clip.core.storage import Storage
+
+    lines: list = []
+
+    def run(args, label=None):
+        from linglong_clip.__main__ import main as cli_main
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            try:
+                cli_main(args)
+            except SystemExit:
+                pass
+        lines.append(f"$ linglong-clipboard {' '.join(args)}")
+        lines.extend(buffer.getvalue().splitlines())
+        lines.append("")
+
+    run(["--images-pending"])
+
+    # 起一个只读对端，把图片字节真的提供出去
+    peer_home = Path(os.environ["LINGLONG_CLIPBOARD_HOME"]) / "peer-device"
+    peer_home.mkdir(exist_ok=True)
+    peer = Storage(peer_home / "history.db")
+    from linglong_clip.core import image_transfer
+    from linglong_clip.core.models import IMAGE_DIGEST_KEY, ClipboardItem, content_hash
+
+    for index in range(1, 5):
+        # 摘要必须**由内容算出来**：图片按内容寻址，写死的十六进制串与字节
+        # 对不上时，对端会在外发前就拒绝（第一版截图正是这么错的 ——
+        # 图里全是「内容与摘要不符」，反倒说明校验是有效的）。
+        payload = _peer_image_payload(index)
+        digest = image_transfer.digest_of(payload)
+        (peer.images_dir / f"{digest}.png").write_bytes(payload)
+        peer.add(
+            ClipboardItem(
+                kind="image",
+                content=f"{digest}.png",
+                preview="[图片 1920×1080]",
+                hash=content_hash("image", f"peer{index}"),
+                image_path=f"images/{digest}.png",
+                metadata={"ocr": {"text": "", "backend": "stub"}},
+            )
+        )
+    node = LanSync(storage=peer, device_name="desktop", token="", port=0,
+                   guard=PrivacyGuard())
+    node.start()
+
+    # 让 CLI 走真实 HTTP：临时把配置指到刚起的这个对端
+    from linglong_clip.utils.config import Config
+
+    cfg_path = Config().path
+    saved = None
+    if cfg_path.exists():
+        saved = cfg_path.read_text(encoding="utf-8")
+    config = Config(cfg_path)
+    config.update(
+        {
+            "sync.enabled": True,
+            "sync.mode": "lan",
+            "sync.lan_peers": [f"127.0.0.1:{node.status()['port']}"],
+        }
+    )
+    try:
+        run(["--sync-images"])
+    finally:
+        node.stop()
+        peer.close()
+        if saved is not None:
+            cfg_path.write_text(saved, encoding="utf-8")
+        elif cfg_path.exists():
+            cfg_path.unlink()
+    return lines
+
+
+def _render_terminal(lines: list, target: Path, *, title: str = "") -> None:
+    """把命令行输出渲染成一张图。
+
+    用 PIL 而不是 Qt：这是一段纯文本，Qt 的富文本排版反而会让
+    「等宽」这个前提失效，而命令行输出对不齐就完全看不懂了。
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    # WenQuanYi Zen Hei Mono：装了 CJK 字形的等宽字体。
+    # 用 DejaVuSansMono 的话中文会全部变成豆腐块 —— 而这里的输出是中文的。
+    font_path = "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"
+    size = 15
+    try:
+        font = ImageFont.truetype(font_path, size)
+    except OSError:  # 没装中文字体时退回 DejaVu，至少 ASCII 部分还看得见
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", size
+        )
+
+    line_height = int(size * 1.65)
+    pad = 18
+    width = 92
+    text = "\n".join(lines)
+    longest = max((len(line) for line in lines), default=40)
+
+    image = Image.new("RGB", (1, 1))
+    probe = ImageDraw.Draw(image)
+    # 中文是双宽字符，按字符数估算宽度会切掉后半截；用真实测量。
+    measured = max(
+        (probe.textlength(line, font=font) for line in lines), default=600
+    )
+    width = int(max(measured + pad * 2, 620))
+    height = line_height * (len(lines) + 1) + pad * 2
+
+    image = Image.new("RGB", (width, height), (24, 26, 33))
+    draw = ImageDraw.Draw(image)
+    if title:
+        draw.text((pad, pad // 2), title, fill=(120, 128, 148), font=font)
+    y = pad + line_height
+    for line in lines:
+        # 命令与提示行染色，让「输入」和「输出」分得开
+        color = (110, 200, 160) if line.startswith("$") else (198, 205, 220)
+        if line.strip().startswith("缺失") or line.strip().startswith("其中"):
+            color = (230, 200, 120)
+        draw.text((pad, y), line, fill=color, font=font)
+        y += line_height
+    image.save(str(target))
+    print(f"  ✓ {target.relative_to(ROOT)} ({image.width}x{image.height})")
+
+
+def _peer_image_payload(index: int) -> bytes:
+    """「对端那台设备」上第 `index` 张图的字节。
+
+    抽成函数是为了让截图里的两台设备用**同一份**字节 —— 图片按内容寻址，
+    造数据时两边对不上，症状会是「内容与摘要不符」，看着像代码坏了。
+    """
+    return b"\x89PNG\r\n\x1a\n" + bytes(2048 * index)
+
+
+def _seed_pending_images(storage, count: int = 4) -> None:
+    """造「同步过来的记录说有图、但本机还没有那份文件」的状态。
+
+    这是按需补图的起点，也是这轮新增的那个可见的事实：
+    字节不进同步日志，所以「记录有、字节没有」是一种**正常状态**，
+    而不是数据损坏 —— 它必须在界面上看得见，否则另一台机器上
+    只会出现一张打不开的图，用户无从下手。
+    """
+    from linglong_clip.core import image_transfer
+    from linglong_clip.core.models import IMAGE_DIGEST_KEY, ClipboardItem, content_hash
+
+    now = time.time()
+    for index in range(count):
+        # 摘要必须与「对端那台设备」上的字节对得上（图片按内容寻址），
+        # 所以两边共用 `_peer_image_payload()`。各写一份字面量迟早对不上，
+        # 而那时的症状是「内容与摘要不符」，看起来像 bug，其实是造的数据不成立。
+        digest = image_transfer.digest_of(_peer_image_payload(index + 1))
+        storage.add(
+            ClipboardItem(
+                kind="image",
+                content=f"{digest}.png",
+                preview=f"[图片 1920×1080] 来自桌面设备",
+                hash=content_hash("image", f"pending{index}"),
+                source_app="shared-clipboard",
+                created_at=now - index * 180,
+                metadata={IMAGE_DIGEST_KEY: digest},
+            )
+        )
 
 
 def _seed_orphan_images(storage, count: int = 6) -> None:

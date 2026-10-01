@@ -185,13 +185,3 @@ class MacOSBackend(ClipboardBackend):
         timer.start()
         return True
 
-    # ---- 全局快捷键所需的前置条件（供自检引用）----
-
-    def accessibility_trusted(self) -> bool:
-        """辅助功能权限是否已授予。没有 pyobjc 时返回 False（无从判断）。"""
-        try:
-            import Quartz  # type: ignore
-
-            return bool(Quartz.AXIsProcessTrusted())
-        except Exception:  # noqa: BLE001
-            return False

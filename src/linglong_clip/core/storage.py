@@ -198,7 +198,18 @@ class Storage:
         「每多一个写方，其它写方的键就开始轮流消失」—— 而这种丢失是静默的：
         没有报错、界面照常、只有等到某天发现某个字段莫名其妙没了。
         """
-        allowed = {"pinned", "favorite", "sensitive", "tags", "metadata", "kind"}
+        # `image_path` 参与其中：同步只带图片摘要，字节要等按需拉取之后
+        # 才落地，那时得给记录补上路径 —— 不补的话界面永远停在
+        # 「这条图片打不开」，而字节其实已经躺在磁盘上了。
+        allowed = {
+            "pinned",
+            "favorite",
+            "sensitive",
+            "tags",
+            "metadata",
+            "kind",
+            "image_path",
+        }
         payload = {key: value for key, value in fields.items() if key in allowed}
         if not payload or not self._usable():
             return

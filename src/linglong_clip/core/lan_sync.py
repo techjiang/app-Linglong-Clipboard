@@ -36,6 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..utils.logger import get_logger
+from . import image_transfer
 from .models import ClipboardItem
 from .privacy import PrivacyGuard
 from .storage import Storage
@@ -229,6 +230,23 @@ class _PeerHandler(BaseHTTPRequestHandler):
             owner.ack_delivered(sent_tombstones, sent_changes)
             return
 
+        if path.startswith("/image/"):
+            digest = urllib.parse.unquote(path[len("/image/"):])
+            data = owner.image_bytes(digest)
+            if data is None:
+                # 不区分「没有这张图」与「有但不该外发」：区分开来就等于
+                # 告诉请求方「这台机器上确实有这么一个文件」，
+                # 而它本就不该知道。
+                self._send_json(404, {"ok": False, "error": "not found"})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Linglong-Digest", digest)
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
         self._send_json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -344,6 +362,18 @@ class LanSyncServer:
                 # 文件夹模式同一条规则，两处不能各写一套。
                 pinned_by=(item.pinned_by or self.device_name) if item.pinned else "",
                 created_at=item.created_at,
+                # 有图就把摘要带上（**不带字节**）。按 `image_path` 判断而不是
+                # 按 `kind`：富文本里贴的图 `kind` 是 `rich`，只看 kind 会漏掉它。
+                #
+                # **未经内容判定的图不报摘要。** 图片记录的 `content` 是文件名，
+                # 隐私判定对它天然失效，只有 OCR 结果能穿透进去；OCR 没跑过时
+                # 我们没有任何依据说它不敏感，而报出摘要就等于告诉对端
+                # 「这里有张图可以来取」。详见 `image_transfer.privacy_inspectable`。
+                image_digest=(
+                    ""
+                    if not image_transfer.privacy_inspectable(item)
+                    else image_transfer.digest_of_item(item)
+                ),
                 # 翻页游标的次级键：同一时刻的记录靠它区分先后，
                 # 见 `SyncRecord.seq` 的说明。
                 seq=int(item.id or 0),
@@ -413,6 +443,61 @@ class LanSyncServer:
             sent_changes,
         )
 
+    def image_bytes(self, digest: str) -> Optional[bytes]:
+        """按摘要读出图片字节，供 `/image/<digest>` 返回。
+
+        **判据是「这张图有没有被一条可外发的记录引用」，不是「文件在不在」。**
+        这个区别不是洁癖：接口按摘要取文件，如果只检查文件存在，
+        就等于给同网段的任何人（拿到口令的情况下）开了一个「按名字读本机文件」
+        的口子 —— 而 `images/` 目录里除了剪贴板的截图，用户也可能顺手放了别的东西。
+
+        走一遍隐私判定而不是直接读文件，是为了让「敏感截图不外发」这条
+        在图片通道上和记录通道上**是同一条规则**。两处各写一套的话，
+        迟早出现「记录拦住了、图还能下载」这种自相矛盾的状态。
+
+        摘要格式先校验：它会参与拼路径，放行 `../` 就是路径穿越。
+        """
+        if not image_transfer.is_valid_digest(digest):
+            return None
+
+        # 找到引用这张图的记录。只认可外发的那部分（非敏感、过隐私判定）。
+        owner: Optional[ClipboardItem] = None
+        for item in self._storage.iter_all(batch=256):
+            if image_transfer.digest_of_item(item) != digest:
+                continue
+            if item.sensitive:
+                continue
+            if self._guard is not None:
+                verdict = self._guard.inspect(item)
+                if not verdict.allowed or verdict.sensitive:
+                    continue
+            # 图片记录的内容判定天然失效（`content` 是文件名）。只有当 OCR
+            # 真的看过这张图（`metadata["ocr"]` 存在）时，我们才有依据说
+            # 「它不敏感」。没看过就不外发 —— 理由不是「它一定敏感」，
+            # 而是「我们没有任何依据说它不敏感」，而报出去的是
+            # 「这台机器上有张没人读过的图、拿到口令就能取走」。
+            if image_transfer.digest_of_item(item) and not image_transfer.privacy_inspectable(item):
+                _log.debug("图片未经内容判定（无 OCR 结果），拒绝外发：%s", digest)
+                continue
+            owner = item
+            break
+        if owner is None:
+            _log.debug("请求的图片没有可外发记录引用：%s", digest)
+            return None
+
+        path = self._storage.images_dir / f"{digest}.png"
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            _log.debug("图片读取失败 %s: %s", digest, exc)
+            return None
+        # 文件内容与文件名不符说明这份文件被人换过或写坏过。
+        # 与其把一份无法校验的东西发给对端，不如不认它。
+        if not image_transfer.verify(data, digest):
+            _log.warning("图片内容与摘要不符，拒绝外发：%s", digest)
+            return None
+        return data
+
     def ack_delivered(self, tombstones: Iterable, changes: Iterable) -> None:
         """确认这一批事件已经写进响应、交给对端。
 
@@ -460,8 +545,10 @@ class LanSyncServer:
         ):
             if not item.hash:
                 continue
-            if item.kind == "image" or item.image_path:
-                continue  # 图片不进局域网，体积大且隐私风险高
+            # 图片记录**要**发，但只发摘要、不发字节。
+            # 此前这里整条跳过，于是对端连「这张图存在过」都不知道；
+            # 现在带着 `image_digest` 过去，对端需要时再走 `/image/<digest>`
+            # 按需拉取。体积代价是几十字节，而这是剪贴板里最常用的一类内容。
             if item.sensitive:
                 continue
             if self._guard is not None:
@@ -518,6 +605,39 @@ class LanSyncServer:
 
 
 @dataclass
+@dataclass
+class ImageFetchOutcome:
+    """一次「按需补图」的结果。"""
+
+    missing: int = 0
+    """同步过来、但本机还没有字节的图片张数（本轮开始前的账面缺口）。"""
+
+    fetched: int = 0
+    """成功取回并已落到某条记录上的张数。"""
+
+    adopted: int = 0
+    """因此被补上 `image_path` 的记录条数（一张图可能对应多条记录）。"""
+
+    orphaned: int = 0
+    """字节取回了、但当前没有记录引用它（记录可能已被删除或淘汰）。"""
+
+    failed: int = 0
+    """没取到的张数：对端都没有、鉴权失败或校验不过。"""
+
+    truncated: bool = False
+    """是否因单次上限提前停下 —— 停下不代表补齐了。"""
+
+    def as_dict(self) -> Dict[str, object]:
+        return {
+            "missing": self.missing,
+            "fetched": self.fetched,
+            "adopted": self.adopted,
+            "orphaned": self.orphaned,
+            "failed": self.failed,
+            "truncated": self.truncated,
+        }
+
+
 class LanImportOutcome:
     """一次局域网导入的明细。"""
 
@@ -611,6 +731,51 @@ class LanSyncClient:
         peer.ok = True
         peer.error = ""
         return self._decode_records(data.get("records") or [])
+
+    def fetch_image(self, peer: PeerInfo, digest: str) -> Optional[bytes]:
+        """向对端按需拉一张图。返回**已通过摘要校验**的字节，失败返回 `None`。
+
+        `None` 与「空字节」是两回事，调用方要分开：前者是「这次没拿到，
+        下轮再试」，后者是「对端给了一张空图」（会在这里就被校验挡掉，
+        同样返回 `None`）。
+
+        校验放在这里而不是落盘处：无论是谁调这个函数，拿到的字节都已经
+        和摘要对上了。落盘处再校验一次是有意的重复 —— 见 `image_transfer.store`。
+        """
+        if not image_transfer.is_valid_digest(digest):
+            return None
+        url = f"{peer.base_url}/image/{urllib.parse.quote(digest)}"
+        request = urllib.request.Request(url, method="GET")
+        if self.token:
+            request.add_header("X-Linglong-Token", self.token)
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                if response.status != 200:
+                    return None
+                # 先按上限拒绝，再读 —— 对端可能被改过，不能假定它给的一定合规。
+                # `Content-Length` 缺失时（分块传输）只能靠读了之后判断，
+                # 所以下面还有一次长度检查。
+                declared = response.headers.get("Content-Length")
+                if declared and declared.isdigit() and int(declared) > image_transfer.MAX_IMAGE_BYTES:
+                    _log.warning("对端图片超过上限，拒绝：%s", digest)
+                    return None
+                data = response.read(image_transfer.MAX_IMAGE_BYTES + 1)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                _log.warning("对端 %s 拒绝取图：口令不匹配", peer.host)
+            return None
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            _log.debug("取图失败 %s：%s", digest, exc)
+            return None
+
+        if not data or len(data) > image_transfer.MAX_IMAGE_BYTES:
+            return None
+        if not image_transfer.verify(data, digest):
+            # 内容寻址白送的好处：不需要额外约定校验字段，
+            # 对端给错东西（或被中间人换过）在这里就会暴露。
+            _log.warning("对端返回的图片与摘要不符，丢弃：%s", digest)
+            return None
+        return data
 
     def _decode_records(self, raw_records: Sequence[object]) -> List[SyncRecord]:
         """把对端返回的载荷还原成记录，兼容明文与加密两种形态。"""
@@ -1164,6 +1329,84 @@ class LanSync:
             total.flags_updated += outcome.flags_updated
             total.flag_changes += outcome.flag_changes
         return total
+
+    def fetch_missing_images(self, *, limit: int = 20) -> "ImageFetchOutcome":
+        """对缺失的图片逐张向对端索取，直到全部补齐或达到单次上限。
+
+        为什么需要单次上限：历史里可能积了几千张图（换过机器、同步盘丢过
+        文件），一次全拉会把界面卡住、也会把对端打满。上限之外的部分
+        下一轮继续 —— 库里没有的那张图，只要对端还在，随时都能再要。
+
+        顺序是「先本地已有的对端，再其它对端」，并且**一张图只问一台**：
+        同一张图在多个对端都有时（同一份剪贴板同步到了三台设备），
+        挨个问一遍只是白白多跑两次网络。
+        """
+        assert self._client is not None
+        outcome = ImageFetchOutcome()
+        peers = self.discover()
+        if not peers:
+            return outcome
+
+        images_dir = self.storage.images_dir
+        wanted = image_transfer.pending_digests(
+            self.storage.iter_all(batch=512), images_dir
+        )
+        outcome.missing = len(wanted)
+        if not wanted:
+            return outcome
+
+        for digest in wanted:
+            if outcome.fetched + outcome.failed >= limit:
+                outcome.truncated = True
+                break
+            data = None
+            for peer in peers:
+                # 每个对端都试一次，是因为「哪个对端有这张图」本机并不知道 ——
+                # 记录是从某台设备同步来的，但图可能后来在别的设备上也存在。
+                # 失败一次不算结论：可能只是那台恰好没这张图。
+                data = self._client.fetch_image(peer, digest)
+                if data is not None:
+                    break
+            if data is None:
+                outcome.failed += 1
+                continue
+            result = image_transfer.store(images_dir, digest, data)
+            if not result.stored:
+                outcome.failed += 1
+                continue
+            adopted = self._adopt_image(digest, result.path)
+            if adopted:
+                outcome.fetched += 1
+                outcome.adopted += adopted
+            else:
+                # 字节拿到了、但没有记录引用它 —— 落盘是为了下次用，
+                # 计入 `orphaned` 而不是 `fetched`，免得报告看着像补齐了记录。
+                outcome.orphaned += 1
+        return outcome
+
+    def _adopt_image(self, digest: str, relative: str) -> int:
+        """图片字节到位后，给引用它的记录补上 `image_path`。
+
+        为什么需要这一步：同步过来的记录只带 `image_digest`，`image_path`
+        是空的（那时本机确实没有那份文件）。字节落地后不回填，界面就永远
+        停在「这条图片打不开」—— 而这正是本轮要消灭的症状。
+
+        只动**确实引用这个摘要、且当前没有 `image_path`** 的记录：
+        本机自己采集的图早已有路径，回填会是一次无意义的写入
+        （还会顺带把 `updated_at` 推新，让列表顺序莫名其妙地动）。
+        """
+        storage = self.storage
+        count = 0
+        for item in storage.iter_all(batch=512):
+            if image_transfer.digest_of_item(item) != digest:
+                continue
+            if getattr(item, "image_path", ""):
+                continue
+            if image_transfer.normalize_digest(item.metadata.get("image_digest", "")) != digest:
+                continue
+            storage.update_fields(item.id, image_path=relative)
+            count += 1
+        return count
 
     def probe(self, peer: PeerInfo) -> bool:
         """探测某对端是否在线（用 `/ping`，不需要口令）。"""

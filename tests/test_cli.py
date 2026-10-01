@@ -1397,6 +1397,7 @@ def test_redact_skips_gui_dispatch(cli_env, monkeypatch):
 #: 也走 CLI 分支，而它没有任何含义）。
 MODIFIER_DESTS = {
     "dry_run",
+    "images_limit",
 }
 
 #: GUI 专用（或仅影响输出的）标志：它们不决定走哪条分支。
@@ -1670,3 +1671,80 @@ def test_images_flag_skips_gui_dispatch(cli_env, monkeypatch):
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("不该启动 GUI")),
     )
     assert main(["--images"]) == 0
+
+
+# ---- 图片按需补图（--images-pending / --sync-images）----
+
+
+def _seed_pending(home, count=2):
+    """造「记录说有图、但本机没有那份文件」的状态。"""
+    from linglong_clip.core.models import IMAGE_DIGEST_KEY, ClipboardItem
+    from linglong_clip.core.storage import Storage
+
+    storage = Storage(home / "history.db")
+    digests = [f"{index:032x}" for index in range(1, count + 1)]
+    for digest in digests:
+        storage.add(
+            ClipboardItem(
+                kind="image",
+                content=f"{digest}.png",
+                preview="[图片]",
+                hash=f"img-{digest[:6]}",
+                metadata={IMAGE_DIGEST_KEY: digest},
+            )
+        )
+    storage.close()
+    return digests
+
+
+def test_images_pending_lists_missing(cli_env, capsys):
+    digests = _seed_pending(cli_env, 2)
+
+    assert main(["--images-pending"]) == 0
+    out = capsys.readouterr().out
+    assert "缺失 2 张图片" in out
+    for digest in digests:
+        assert digest in out
+    assert "--sync-images" in out
+
+
+def test_images_pending_json_shape(cli_env, capsys):
+    digests = _seed_pending(cli_env, 1)
+
+    assert main(["--images-pending", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["pending"] == digests
+
+
+def test_images_pending_empty(cli_env, capsys):
+    assert main(["--images-pending"]) == 0
+    assert "没有缺失的图片" in capsys.readouterr().out
+
+
+def test_sync_images_without_lan_mode_explains(cli_env, capsys):
+    """共享文件夹模式没有请求通道，要明确说出来而不是给个空结果。"""
+    _seed_pending(cli_env, 1)
+
+    assert main(["--sync-images"]) == 2
+    err = capsys.readouterr().err
+    assert "没有可用的取图通道" in err
+    assert "lan" in err
+
+
+def test_sync_images_flag_is_dispatched_not_gui(cli_env, monkeypatch, capsys):
+    """`--sync-images` 必须走 CLI 分支。
+
+    漏登记到分发表时它不报错，而是掉进 GUI 分支去连显示器、起事件循环 ——
+    本该立刻返回的命令变成一直挂着，等超时才发现。
+    """
+    _seed_pending(cli_env, 1)
+    called = {}
+
+    def fake_gui(*args, **kwargs):
+        called["gui"] = True
+        raise AssertionError("--sync-images 不该走 GUI 分支")
+
+    monkeypatch.setattr("linglong_clip.__main__._run_gui", fake_gui, raising=False)
+    main(["--sync-images"])
+    assert "gui" not in called

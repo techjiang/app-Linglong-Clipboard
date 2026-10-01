@@ -106,11 +106,16 @@ class NativeSelfCheck:
     也不会改写用户的剪贴板。
     """
 
-    def __init__(self, backend=None, hotkeys_factory=None, config=None) -> None:
+    def __init__(self, backend=None, hotkeys_factory=None, config=None, monitor=None) -> None:
         self._backend = backend
         self._hotkeys_factory = hotkeys_factory
         #: OCR 检查需要读配置；为 None 时按默认配置探测
         self._config = config
+        #: 正在运行的监视器（可选）。传进来时「采集通道」这一项报的是**实际**
+        #: 状态，而不是「按配置推出来应该是什么」—— 事件驱动是否真的生效，
+        #: 只有跑起来之后才知道：Windows 上 `AddClipboardFormatListener`
+        #: 注册失败会**静默退回轮询**，那一刻日志里只有一行 info。
+        self._monitor = monitor
 
     # ---- 入口 ----
 
@@ -135,6 +140,7 @@ class NativeSelfCheck:
             lambda: self._check_primary_selection(backend),
             self._check_hotkey_backend,
             self._check_hotkey_probe,
+            self._check_monitor_mode,
             self._check_ocr,
         ]
         for check in checks:
@@ -357,6 +363,65 @@ class NativeSelfCheck:
         finally:
             probe.unregister_all()
 
+    def _check_monitor_mode(self) -> CheckResult:
+        """采集通道是事件驱动还是轮询兜底。
+
+        这一项此前**无处可看**：`ClipboardMonitor.is_event_driven` 写好了、
+        `set_event_driven()` 也真的会被调用，但没有任何读取方 ——
+        于是「我这台机器到底是事件驱动还是在轮询」只能翻日志。
+        而它是个有分歧的答案：Windows 上 `AddClipboardFormatListener`
+        注册失败时会保持轮询，用户看到的采集延迟已经变了，界面上却毫无痕迹。
+
+        轮询不是缺陷（三平台里只有 Windows 有可靠的通知），所以这里报 OK，
+        只在「本可以事件驱动却退化成轮询」时说清原因。
+        """
+        monitor = self._monitor
+        backend = self._backend
+        if backend is None:
+            from ..platform import detect_backend
+
+            backend = detect_backend()
+        supports_events = not getattr(backend, "requires_polling", True)
+
+        if monitor is None:
+            # 没有运行中的监视器时只能报「平台是否支持事件通知」，
+            # 不编一个「当前是事件驱动」的结论出来。
+            if supports_events:
+                return CheckResult(
+                    "采集通道",
+                    OK,
+                    "本平台支持事件驱动采集",
+                    "启用采集后由系统通知触发；具体模式可在应用运行时的设置页查看",
+                )
+            return CheckResult(
+                "采集通道",
+                OK,
+                "轮询采集",
+                "本平台没有可靠的剪贴板变更通知，轮询是预期行为",
+            )
+
+        if bool(getattr(monitor, "is_event_driven", False)):
+            return CheckResult(
+                "采集通道",
+                OK,
+                "事件驱动（含低频轮询兜底）",
+                "剪贴板变更由系统通知触发，轮询只在通知通道静默时兜底",
+            )
+        if supports_events:
+            return CheckResult(
+                "采集通道",
+                DEGRADED,
+                "轮询，而非事件驱动",
+                "本平台支持事件通知但注册未成功 —— 常见原因是窗口句柄还没就绪。"
+                "功能不受影响，只是采集延迟取决于轮询间隔",
+            )
+        return CheckResult(
+            "采集通道",
+            OK,
+            "轮询",
+            "本平台没有可靠的剪贴板变更通知，轮询是预期行为",
+        )
+
     def _check_ocr(self) -> CheckResult:
         """检查 OCR 是否**真的**能跑，而不只是「tesseract 在 PATH 里」。
 
@@ -449,10 +514,15 @@ def format_report(report: SelfCheckReport) -> str:
     return "\n".join(lines)
 
 
-def run_self_check(backend=None, hotkeys_factory=None, config=None) -> SelfCheckReport:
+def run_self_check(
+    backend=None, hotkeys_factory=None, config=None, monitor=None
+) -> SelfCheckReport:
     """便捷入口。"""
     return NativeSelfCheck(
-        backend=backend, hotkeys_factory=hotkeys_factory, config=config
+        backend=backend,
+        hotkeys_factory=hotkeys_factory,
+        config=config,
+        monitor=monitor,
     ).run()
 
 

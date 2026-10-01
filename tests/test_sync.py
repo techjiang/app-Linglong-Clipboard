@@ -82,11 +82,47 @@ def test_sensitive_content_is_not_imported(tmp_path):
     assert importer.import_all() == 0
 
 
-def test_images_not_exported_by_default(tmp_path):
+def test_image_records_export_only_the_digest(tmp_path):
+    """图片记录**要**同步，但只带摘要不带字节。
+
+    这是本轮的行为变更（此前整条跳过）。旧行为下对端连「这里曾经有一张图」
+    都不知道，跨设备同步在截图这类最常用的内容上等于失效。
+    """
     shared = tmp_path / "shared"
     source = Storage(tmp_path / "a.db")
-    source.add(ClipboardItem(kind="image", image_path="images/a.png", hash="img"))
-    assert FolderSync(source, shared, device_name="a").export() == 0
+    digest = "a" * 32
+    source.add(
+        ClipboardItem(
+            kind="image",
+            image_path=f"images/{digest}.png",
+            hash="img",
+            # 真机上采集管线会给图片补上 OCR 结果（哪怕图里没字）。
+            # 没有这个标记的图被视为「没被读过」不会外发 ——
+            # 见 `image_transfer.privacy_inspectable`。
+            metadata={"ocr": {"text": "", "backend": "stub"}},
+        )
+    )
+    sync = FolderSync(source, shared, device_name="a")
+    assert sync.export() == 1
+    record = list(sync._read_journal(sync.journal_path))[0]
+    assert record.image_digest == digest
+    # 字节一个都不带：`payload_b64` 仍为空
+    assert record.payload_b64 == ""
+
+
+def test_images_can_still_be_excluded_explicitly(tmp_path):
+    """`include_images=False` 保留「这些图别传出去」的语义。"""
+    shared = tmp_path / "shared"
+    source = Storage(tmp_path / "a.db")
+    source.add(
+        ClipboardItem(
+            kind="image",
+            image_path="images/" + "a" * 32 + ".png",
+            hash="img",
+            metadata={"ocr": {"text": "", "backend": "stub"}},
+        )
+    )
+    assert FolderSync(source, shared, device_name="a").export(include_images=False) == 0
 
 
 def test_own_device_records_not_reimported(tmp_path):
@@ -394,3 +430,36 @@ def test_json_backend_export_covers_full_history(tmp_path, home):
     assert {item.hash for item in target.list(limit=10_000)} == {
         f"h{index:05d}" for index in range(800)
     }
+
+
+def test_unread_image_digest_is_not_advertised(tmp_path):
+    """OCR 没跑过的图，连摘要都不报给对端。
+
+    图片记录的 `content` 是文件名，隐私判定对它天然失效 —— 只有 OCR
+    结果能穿透进去。没读过时我们没有任何依据说它不敏感，
+    而报出摘要就等于告诉对端「这里有张图可以来取」。
+
+    实测过这条路径：关掉 OCR 时，一张写着 `BEGIN RSA PRIVATE KEY` 的截图
+    会以 `sensitive=False` 入库、进同步、字节可被对端取走，界面上一切正常。
+    """
+    shared = tmp_path / "shared"
+    source = Storage(tmp_path / "a.db")
+    unread = "a" * 32
+    read = "b" * 32
+    source.add(
+        ClipboardItem(kind="image", image_path=f"images/{unread}.png", hash="unread")
+    )
+    source.add(
+        ClipboardItem(
+            kind="image",
+            image_path=f"images/{read}.png",
+            hash="read",
+            metadata={"ocr": {"text": "", "backend": "stub"}},
+        )
+    )
+
+    sync = FolderSync(source, shared, device_name="a")
+    assert sync.export() == 2
+    by_hash = {r.hash: r for r in sync._read_journal(sync.journal_path)}
+    assert by_hash["unread"].image_digest == ""
+    assert by_hash["read"].image_digest == read

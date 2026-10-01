@@ -56,6 +56,11 @@ _log = get_logger("app")
 #: 同步与清理的定时周期（毫秒）
 SYNC_INTERVAL_MS = 60_000
 
+#: 同步后自动补图的单次上限。首次同步一台攒了几千张图的设备时，
+#: 一次全拉会把对端和本机都拖住，而用户此时多半只想要「记录先过来」。
+#: 剩下的在设置页点「从对端取回」继续。
+AUTO_FETCH_LIMIT = 20
+
 #: Windows 事件驱动生效后的轮询兜底间隔（毫秒）
 EVENT_DRIVEN_FALLBACK_MS = 1_000
 SENSITIVE_SWEEP_MS = 30_000
@@ -492,8 +497,12 @@ class Application(QObject):
         """
         if self._native_report is None:
             try:
+                # 把**正在运行的**监视器传进去：「采集通道」这一项
+                # 只有跑起来之后才有真实答案（事件驱动注册失败会静默退回轮询）。
                 self._native_report = run_self_check(
-                    backend=self.backend, hotkeys_factory=lambda: self.hotkeys
+                    backend=self.backend,
+                    hotkeys_factory=lambda: self.hotkeys,
+                    monitor=self.monitor,
                 )
             except Exception:  # noqa: BLE001 - 自检失败不能挡住设置页
                 _log.exception("原生能力自检失败")
@@ -1118,6 +1127,21 @@ class Application(QObject):
                 if isinstance(sync, LanSync):
                     imported = sync.sync_all()
                     _log.info("局域网同步完成：导入 %d 条", imported)
+                    # 顺手把缺失的图片补上。**限制张数**是有意的：
+                    # 首次同步一台攒了几千张图的设备时，一次全拉会把对端
+                    # 和本机都拖住，而用户此时多半只想要「记录先过来」。
+                    # 剩下的在设置页点「从对端取回」继续。
+                    try:
+                        fetched = sync.fetch_missing_images(limit=AUTO_FETCH_LIMIT)
+                        if fetched.fetched:
+                            _log.info(
+                                "顺带补回 %d 张图片（影响 %d 条记录）",
+                                fetched.fetched,
+                                fetched.adopted,
+                            )
+                            self.search_index.invalidate()
+                    except Exception:  # noqa: BLE001 - 补图失败不该影响同步结论
+                        _log.debug("同步后补图失败", exc_info=True)
                 else:
                     exported = sync.export()
                     imported = sync.import_all()
