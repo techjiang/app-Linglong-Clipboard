@@ -65,28 +65,39 @@ class Collector:
     # ---- 主入口 ----
 
     def process(self, item: ClipboardItem, focus: Optional[FocusInfo] = None) -> tuple:
-        """处理一条剪贴板内容，返回 `(结果常量, 记录或 None)`。"""
+        """处理一条剪贴板内容，返回 `(结果常量, 记录或 None)`。
+
+        **落盘的截图若最终没有成为记录，要把文件收回去。** 图片是在读取阶段
+        落盘的（`_from_image`），而隐私判定、类型开关、去重判断都在这里 ——
+        任何一条不通过，那份 PNG 就成了没人引用的孤儿：用户看不见、界面照常，
+        只有磁盘在涨；而被隐私拦下的截图，内容恰恰可能是不该留的密钥或证件照。
+        所以每个「不落库」的出口都走 `_discard_image()`。
+        """
         if item is None or item.is_empty:
             return SKIPPED_EMPTY, None
 
         if not self._config.get("capture.enabled", True):
+            self._discard_image(item)
             return SKIPPED_TYPE, None
 
         self._apply_source(item, focus)
         self._enrich(item)
 
         if not self._is_type_enabled(item.kind) and item.kind != "sensitive":
+            self._discard_image(item)
             return SKIPPED_TYPE, None
 
         verdict = self._guard.inspect(item)
         if not verdict.allowed:
             _log.info("内容被隐私策略拦截：%s", verdict.summary)
+            self._discard_image(item)
             return SKIPPED_PRIVACY, None
         if verdict.sensitive:
             item.sensitive = True
             if not self._guard.should_keep_sensitive():
                 # 敏感内容不落盘：既不进历史，也不参与同步
                 _log.info("敏感内容不入库：%s", verdict.summary)
+                self._discard_image(item)
                 return SKIPPED_PRIVACY, None
 
         # 超长文本的截断放在隐私判定之后：判定读的是完整内容，
@@ -128,6 +139,8 @@ class Collector:
                 merged = self._storage.get(existing.id)
                 self._emit(merged, MERGED)
                 return MERGED, merged
+            # 合并关闭时同内容会各自成行，但图片文件仍是同一份、已有记录在引用；
+            # 此时不能回收，否则新记录借用的图会被删掉。
             return SKIPPED_DUPLICATE, existing
 
         saved = self._storage.add(item)
@@ -136,6 +149,24 @@ class Collector:
         return CAPTURED, saved
 
     # ---- 辅助 ----
+
+    def _discard_image(self, item: ClipboardItem) -> None:
+        """收回一条不会落库的记录所占的图片文件。
+
+        判据交给存储层（`referenced_images()`）而不是这里手算：图片按内容哈希
+        命名，同一张图可能已经被别的记录用着。存储层才知道「还有没有别人引用」，
+        这里动手删就会误伤 —— 采集侧拿不到完整引用集。
+        """
+        relative = getattr(item, "image_path", "")
+        if not relative:
+            return
+        remover = getattr(self._storage, "discard_unreferenced_image", None)
+        if remover is None:
+            return
+        try:
+            remover(relative)
+        except Exception:  # noqa: BLE001 - 回收失败不该影响采集结果
+            _log.debug("图片回收失败 %s", relative, exc_info=True)
 
     def _apply_source(self, item: ClipboardItem, focus: Optional[FocusInfo]) -> None:
         if focus is None or focus.is_empty:

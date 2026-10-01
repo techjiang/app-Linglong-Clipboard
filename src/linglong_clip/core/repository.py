@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..utils.logger import get_logger
+from . import image_store
 from .models import ClipboardItem, content_hash
 from .normalize import canonical_key
 
@@ -288,6 +289,59 @@ class JsonRepository:
         if relative and is_data_uri(uri):
             self._images[relative] = uri
 
+    def _remove_image(self, relative: str) -> None:
+        """删掉某条记录独占的那张图。
+
+        只在这张图**不再被任何记录引用**时才删。图片按内容哈希命名，
+        同一张图被复制多次只有一份文件、多条记录共用它 —— 无条件
+        `unlink` 会让其它记录的图片平白失联。SQLite 后端同此语义。
+        """
+        name = image_store.basename_of(relative)
+        if not name:
+            return
+        with self._lock:
+            still_used = any(
+                image_store.basename_of(item.image_path) == name
+                for item in self._items.values()
+            )
+        if still_used:
+            return
+        try:
+            (self.path.parent / "images" / name).unlink(missing_ok=True)
+        except OSError as exc:
+            _log.debug("图片清理失败 %s: %s", name, exc)
+
+    def discard_unreferenced_image(self, relative: str) -> bool:
+        """收下一份「没能成为记录」的图片文件；仍被别的记录引用时不动它。"""
+        name = image_store.basename_of(relative)
+        if not name:
+            return False
+        with self._lock:
+            used = any(
+                image_store.basename_of(item.image_path) == name
+                for item in self._items.values()
+            )
+        if used:
+            return False
+        self._remove_image(relative)
+        return True
+
+    def referenced_images(self) -> set:
+        """全库正在引用哪些图片文件（文件名集合），供回收前比对。"""
+        with self._lock:
+            paths = [item.image_path for item in self._items.values() if item.image_path]
+        return image_store.referenced_names(paths)
+
+    def sweep_images(self, *, dry_run: bool = True, limit: int = image_store.DEFAULT_LIMIT):
+        """回收 `images/` 里不再被任何记录引用的文件。"""
+        return image_store.sweep(
+            self.images_dir, self.referenced_images(), dry_run=dry_run, limit=limit
+        )
+
+    def image_usage(self):
+        """图片目录的占用、文件数，以及「记录引用了但文件不在」的数量。"""
+        return image_store.usage(self.images_dir, self.referenced_images())
+
     def add(self, item: ClipboardItem) -> Optional[ClipboardItem]:
         if self._closed:
             return None
@@ -348,19 +402,27 @@ class JsonRepository:
         if self._closed:
             return
         with self._lock:
-            if self._items.pop(item_id, None) is not None:
+            item = self._items.pop(item_id, None)
+            if item is not None:
                 self._maybe_save()
+        if item is not None:
+            self._remove_image(item.image_path)
 
     def delete_many(self, ids: Iterable[int]) -> int:
         if self._closed:
             return 0
         with self._lock:
             removed = 0
+            images: List[str] = []
             for item_id in list(ids):
-                if self._items.pop(item_id, None) is not None:
+                item = self._items.pop(item_id, None)
+                if item is not None:
                     removed += 1
+                    images.append(item.image_path)
             self._maybe_save()
-            return removed
+        for relative in images:
+            self._remove_image(relative)
+        return removed
 
     def clear(self, keep_pinned: bool = True) -> int:
         if self._closed:
@@ -371,10 +433,13 @@ class JsonRepository:
                 for item_id, item in self._items.items()
                 if not (keep_pinned and item.pinned)
             ]
+            images = [self._items[item_id].image_path for item_id in doomed]
             for item_id in doomed:
                 self._items.pop(item_id, None)
             self._maybe_save()
-            return len(doomed)
+        for relative in images:
+            self._remove_image(relative)
+        return len(doomed)
 
     def get(self, item_id: int) -> Optional[ClipboardItem]:
         with self._lock:
@@ -622,6 +687,7 @@ class JsonRepository:
         """与 SQLite 版语义逐条对齐（含 `pin_immune`）。"""
         removed = 0
         with self._lock:
+            images: List[str] = []
             if max_days > 0:
                 cutoff = time.time() - max_days * 86400
                 doomed = [
@@ -631,6 +697,7 @@ class JsonRepository:
                 ]
                 removed += len(doomed)
                 for item_id in doomed:
+                    images.append(self._items[item_id].image_path)
                     self._items.pop(item_id, None)
 
             if max_items > 0:
@@ -642,10 +709,13 @@ class JsonRepository:
                 doomed = [item.id for item in candidates if item.id not in keep]
                 removed += len(doomed)
                 for item_id in doomed:
+                    images.append(self._items[item_id].image_path)
                     self._items.pop(item_id, None)
 
             if removed:
                 self._maybe_save()
+        for relative in images:
+            self._remove_image(relative)
         return removed
 
     def purge_expired_sensitive(self, ttl_seconds: int) -> int:
@@ -658,11 +728,14 @@ class JsonRepository:
                 for item_id, item in self._items.items()
                 if item.sensitive and item.created_at < cutoff
             ]
+            images = [self._items[item_id].image_path for item_id in doomed]
             for item_id in doomed:
                 self._items.pop(item_id, None)
             if doomed:
                 self._maybe_save()
-            return len(doomed)
+        for relative in images:
+            self._remove_image(relative)
+        return len(doomed)
 
     def set_meta(self, key: str, value: str) -> None:
         with self._lock:

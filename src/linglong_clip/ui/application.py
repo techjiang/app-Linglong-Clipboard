@@ -1076,6 +1076,7 @@ class Application(QObject):
             self.sync.status() if self.sync else {},
             self.window,
             native_report=self.native_report(),
+            storage=self.storage,
         )
         if dialog.exec() != SettingsDialog.DialogCode.Accepted:
             return

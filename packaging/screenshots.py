@@ -292,10 +292,30 @@ def main() -> int:
     )
     _render(keep_dialog, OUT / "settings-capture-formats.png")
 
+    # 设置页「采集」：图片附件面板（占用 + 可回收的张数）
+    # 造几张没人引用的图，让「有多少是垃圾」这件事在截图里看得见
+    _seed_orphan_images(storage)
+    image_dialog = SettingsDialog(_config({}), automation, storage=storage)
+    image_dialog.resize(760, 760)
+    _render(image_dialog, OUT / "settings-images.png")
+
     storage.close()
     app.quit()
     print("完成。")
     return 0
+
+
+def _seed_orphan_images(storage, count: int = 6) -> None:
+    """往 `images/` 里放几张没有记录引用的图。
+
+    「图片附件」面板最该展示的就是「有多少没被引用」，而这个数在
+    seed 出来的干净数据里恒为 0 —— 不特意造出垃圾，截图就什么都说明不了。
+    """
+    images = storage.images_dir
+    images.mkdir(parents=True, exist_ok=True)
+    for index in range(count):
+        # 单张 ~420KB，让「占用多少」这件事在截图里看得出量级
+        (images / f"orphan-{index}.png").write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(420_000))
 
 
 def _seed_form_item(storage) -> None:

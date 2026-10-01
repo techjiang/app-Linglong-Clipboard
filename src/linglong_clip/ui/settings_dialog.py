@@ -68,6 +68,7 @@ class SettingsDialog(QDialog):
         device_status: Dict[str, object] = None,
         parent=None,
         native_report=None,
+        storage=None,
     ) -> None:
         super().__init__(parent)
         self._config = config
@@ -75,6 +76,8 @@ class SettingsDialog(QDialog):
         self._device_status = device_status or {}
         #: `utils.selfcheck.SelfCheckReport`，为 None 时跳过原生能力面板
         self._native_report = native_report
+        #: 历史仓库，用于「图片附件」的占用统计与回收。为 None 时该区块只读提示。
+        self._storage = storage
         self.changes: Dict[str, object] = {}
 
         self.setWindowTitle("设置 — 玲珑剪切板")
@@ -1105,7 +1108,96 @@ class SettingsDialog(QDialog):
 
         self._storage_inline.setEnabled(self._storage_backend.currentData() == "json")
         self._storage_limit.setEnabled(self._storage_backend.currentData() == "json")
+
+        group.layout().addWidget(self._build_image_group())
         return group
+
+    def _build_image_group(self) -> QGroupBox:
+        """图片附件的占用与回收入口。
+
+        为什么要在设置页露出来：`images/` 的垃圾是**看不见**的 —— 记录数被
+        `history.max_items` 压住了，磁盘却可能一直在涨，而此前 `--stats`
+        里连图片占用都不报。用户唯一的线索是「这个目录怎么这么大」，
+        却没有任何入口能收拾它。
+        """
+        group = QGroupBox("图片附件")
+        form = QFormLayout(group)
+
+        self._image_usage = QLabel("统计中…")
+        self._image_usage.setWordWrap(True)
+        form.addRow("占用", self._image_usage)
+
+        self._image_gc = QPushButton("回收未被引用的图片")
+        self._image_gc.setToolTip(
+            "删掉 images/ 里不再被任何记录引用的文件。仍被记录引用的图片一律不动。"
+        )
+        self._image_gc.clicked.connect(self._run_image_gc)  # type: ignore[attr-defined]
+        form.addRow("", self._image_gc)
+
+        self._image_hint = QLabel()
+        self._image_hint.setWordWrap(True)
+        form.addRow("", self._image_hint)
+        self._refresh_image_usage()
+        return group
+
+    def _image_backend(self):
+        """只在能直接拿到仓库对象时统计；拿不到就显示「未知」，不编数字。"""
+        return getattr(self, "_storage", None)
+
+    def _refresh_image_usage(self) -> None:
+        storage = self._image_backend()
+        if storage is None:
+            self._image_usage.setText("当前无法统计（设置从命令行打开时看不到）")
+            self._image_gc.setEnabled(False)
+            return
+        try:
+            usage = storage.image_usage()
+            referenced = storage.referenced_images()
+            from ..core import image_store
+
+            orphans = [
+                path
+                for path in image_store.iter_image_files(storage.images_dir)
+                if path.name not in referenced
+            ]
+        except Exception:  # noqa: BLE001 - 统计失败不该让设置页打不开
+            self._image_usage.setText("统计失败，可用命令行 --images 查看")
+            self._image_gc.setEnabled(False)
+            return
+
+        self._image_usage.setText(
+            f"{usage.files} 张 · {usage.bytes / 1024 / 1024:.1f} MB"
+        )
+        if orphans:
+            wasted = sum(path.stat().st_size for path in orphans if path.exists())
+            self._image_gc.setEnabled(True)
+            self._image_gc.setText(f"回收 {len(orphans)} 张未被引用的图片")
+            self._image_hint.setText(
+                f"其中 {wasted / 1024 / 1024:.1f} MB 没有被任何记录引用，可以回收。"
+            )
+        else:
+            self._image_gc.setEnabled(False)
+            self._image_gc.setText("回收未被引用的图片")
+            self._image_hint.setText("每张图都有记录在引用，没有可回收的。")
+        if usage.missing:
+            self._image_hint.setText(
+                self._image_hint.text()
+                + f" 另有 {usage.missing} 条记录引用的图片已不在磁盘上，这些记录打不开原图。"
+            )
+
+    def _run_image_gc(self) -> None:
+        storage = self._image_backend()
+        if storage is None:
+            return
+        result = storage.sweep_images(dry_run=False)
+        self._refresh_image_usage()
+        QMessageBox.information(
+            self,
+            "图片回收完成",
+            f"已回收 {result.removed} 张图片"
+            f"（{result.bytes / 1024 / 1024:.1f} MB），"
+            f"保留 {result.kept} 张仍被引用的。",
+        )
 
     def _refresh_storage_hint(self) -> None:
         is_json = self._storage_backend.currentData() == "json"

@@ -1392,6 +1392,14 @@ def test_redact_skips_gui_dispatch(cli_env, monkeypatch):
 #: 这些标志**故意**没有 CLI 分支：它们是给图形界面用的运行模式。
 #: 出现新名字时必须在这里显式登记 —— 让「漏登记」变成一个需要改两处的动作，
 #: 而不是一个不会报错的疏忽。
+#: 修饰性标志。它们本身不表示「要跑命令行」，只跟着别的标志走，
+#: 所以不该出现在 `CLI_DEST_NAMES` 里（放进去会让 `--dry-run` 单独执行时
+#: 也走 CLI 分支，而它没有任何含义）。
+MODIFIER_DESTS = {
+    "dry_run",
+}
+
+#: GUI 专用（或仅影响输出的）标志：它们不决定走哪条分支。
 GUI_ONLY_DESTS = {
     "version",
     "quick",
@@ -1425,10 +1433,10 @@ def test_every_cli_flag_is_dispatched():
         if action.dest:
             dests.add(action.dest)
 
-    missing = dests - set(CLI_DEST_NAMES) - GUI_ONLY_DESTS
+    missing = dests - set(CLI_DEST_NAMES) - GUI_ONLY_DESTS - MODIFIER_DESTS
     assert not missing, (
         f"这些参数没有归宿：{sorted(missing)}。"
-        f"要么在 CLI_DEST_NAMES 里加上，要么在 GUI_ONLY_DESTS 里登记为 GUI 专用。"
+        f"要么在 CLI_DEST_NAMES 里加上，要么在 GUI_ONLY_DESTS / MODIFIER_DESTS 里登记。"
     )
     unknown = set(CLI_DEST_NAMES) - dests
     assert not unknown, f"CLI_DEST_NAMES 里有不存在的参数：{sorted(unknown)}"
@@ -1531,3 +1539,134 @@ def test_form_key_shell_quotes_paths(cli_env, capsys):
     storage.close()
     assert main(["--get", str(item.id), "--form-key", "shell"]) == 0
     assert capsys.readouterr().out.strip() == "'/tmp/a b/c.txt' /tmp/d.txt"
+
+
+# ---- 图片附件（--images / --images-gc）----
+
+
+def _seed_images(home, orphans=0, *, referenced=1):
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.storage import Storage
+
+    storage = Storage(home / "history.db")
+    images = storage.images_dir
+    images.mkdir(parents=True, exist_ok=True)
+    for index in range(referenced):
+        name = f"used{index}.png"
+        (images / name).write_bytes(b"\x89PNG" + bytes([index]))
+        storage.add(
+            ClipboardItem(
+                kind="image",
+                content=name,
+                image_path=f"images/{name}",
+                hash=f"h{index}",
+                preview=f"[图片] {name}",
+            )
+        )
+    for index in range(orphans):
+        (images / f"orphan{index}.png").write_bytes(b"\x89PNG" + b"junk" * 50)
+    storage.close()
+    return images
+
+
+def test_images_reports_usage(cli_env, capsys):
+    _seed_images(cli_env, orphans=2)
+
+    assert main(["--images"]) == 0
+    out = capsys.readouterr().out
+    assert "3 张" in out
+    assert "2 张未被任何记录引用" in out
+    assert "--images-gc" in out
+
+
+def test_images_json_shape(cli_env, capsys):
+    _seed_images(cli_env, orphans=1)
+
+    assert main(["--images", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["files"] == 2
+    assert payload["unreferenced"] == 1
+    assert payload["unreferenced_bytes"] > 0
+    assert payload["missing"] == 0
+
+
+def test_images_without_any_files(cli_env, capsys):
+    from linglong_clip.core.storage import Storage
+
+    Storage(cli_env / "history.db").close()
+    assert main(["--images"]) == 0
+    assert "没有图片附件" in capsys.readouterr().out
+
+
+def test_images_reports_missing(cli_env, capsys):
+    images = _seed_images(cli_env, referenced=1)
+    (images / "used0.png").unlink()
+
+    assert main(["--images"]) == 0
+    out = capsys.readouterr().out
+    assert "已不在磁盘上" in out
+
+
+def test_images_gc_dry_run_keeps_files(cli_env, capsys):
+    images = _seed_images(cli_env, orphans=3)
+
+    assert main(["--images-gc", "--dry-run"]) == 0
+    out = capsys.readouterr().out
+    assert "将回收 3 张" in out
+    assert "预演" in out
+    assert sorted(path.name for path in images.iterdir()) == [
+        "orphan0.png",
+        "orphan1.png",
+        "orphan2.png",
+        "used0.png",
+    ]
+
+
+def test_images_gc_removes_only_orphans(cli_env, capsys):
+    images = _seed_images(cli_env, orphans=3)
+
+    assert main(["--images-gc"]) == 0
+    assert "已回收 3 张" in capsys.readouterr().out
+    assert [path.name for path in images.iterdir()] == ["used0.png"]
+
+
+def test_images_gc_nothing_to_do(cli_env, capsys):
+    _seed_images(cli_env, orphans=0)
+    assert main(["--images-gc"]) == 0
+    assert "没有可回收" in capsys.readouterr().out
+
+
+def test_images_gc_json(cli_env, capsys):
+    _seed_images(cli_env, orphans=2)
+    assert main(["--images-gc", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["removed"] == 2
+    assert sorted(payload["names"]) == ["orphan0.png", "orphan1.png"]
+
+
+def test_stats_mentions_image_usage(cli_env, capsys):
+    _seed_images(cli_env, orphans=2)
+    assert main(["--stats"]) == 0
+    out = capsys.readouterr().out
+    assert "图片附件" in out
+    assert "--images-gc" in out
+
+
+def test_stats_json_includes_images(cli_env, capsys):
+    _seed_images(cli_env, orphans=1)
+    assert main(["--stats", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["images"]["files"] == 2
+    assert payload["images"]["unreferenced"] == 1
+
+
+def test_images_flag_skips_gui_dispatch(cli_env, monkeypatch):
+    """新标志忘登记到分发表时会静默掉进 GUI 分支并挂住 —— 这条守着它。"""
+    from linglong_clip.ui import application as app_module
+
+    monkeypatch.setattr(
+        app_module,
+        "Application",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("不该启动 GUI")),
+    )
+    assert main(["--images"]) == 0

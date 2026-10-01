@@ -821,6 +821,74 @@ A: 复制 → 同步给 B（两边都有）→ A 上删除 → 记指纹 → 随
 两条同步路径共用同一套语义：共享文件夹走日志文件，局域网走只读 HTTP 接口，
 两处的 `_apply_tombstone()` 判定逐条对齐（过期、固定项、幂等）。
 
+## 图片附件（`images/`）
+
+`core/image_store.py` 收口「图片文件谁来删」这件事。
+
+背景是一类**看不见**的泄漏：记录被删掉之后，`images/` 里那份 PNG 没人来收。
+三条路径都漏，且都不报错：
+
+| 路径 | 原因 |
+| --- | --- |
+| `enforce_limits()` | 直接 `DELETE FROM items`，不像 `delete()` / `clear()` 那样顺手删图 |
+| `purge_expired_sensitive()` | 同上。而这条路径里最要紧的恰恰是密钥/证件截图 —— 到期不删图等于没删 |
+| 采集期被拦下 | 文件在 `_from_image()` 里已落盘，隐私判定在之后的 `Collector.process()` 里 |
+
+外加一条只有 JSON 后端才有的：`delete()` / `clear()` 在 SQLite 上删图、
+在 JSON 上不删 —— 「换个存储方式，磁盘表现就不一样」。
+
+### 判据只有一个：有没有记录引用
+
+回收靠的是「引用集」，不是「文件名像不像垃圾」：
+
+```python
+referenced = storage.referenced_images()      # 全库的 image_path 收敛成文件名集合
+image_store.sweep(images_dir, referenced, dry_run=True)
+```
+
+按**文件名**比对而不是完整路径：库里历史遗留了 `images/x.png` 与 `x.png`
+两种写法（还有绝对路径、data URI），不归一就会把还在用的图当成孤儿删掉。
+归一的实现在 `image_store.normalize_relative()` / `basename_of()`。
+
+### 删记录时不能无条件 `unlink`
+
+图片按内容哈希命名（`_from_image()` 里的 `digest`），所以同一张截图被复制两次
+只落一份文件。`merge_duplicates` 关掉时两条记录会共存并共用这个文件 ——
+删其中一条就 `unlink`，另一条的图片会平白失联。
+
+所以两个后端的 `_remove_image()` 都先问一句「还有别人引用吗」，
+确认没有才删。`test_image_store.py` 里那条 `test_delete_keeps_image_still_shared`
+就是钉这个的（两个后端各跑一遍）。
+
+### 采集侧的回滚
+
+图片是**先落盘、后判定**的：`QtClipboardAdapter._from_image()` 写下文件并返回
+`ClipboardItem`，隐私判定、类型开关、去重都在之后的 `Collector.process()` 里。
+任一不过，那份文件就没有主人。
+
+`Collector._discard_image()` 负责收回去，走的是存储层的
+`discard_unreferenced_image()` —— 判据仍交给存储层，因为采集侧拿不到完整引用集，
+自己动手删会误伤「已被别的记录引用」的同一份文件。
+
+### 只碰自己写下的东西
+
+`iter_image_files()` 只产出目录下的**普通文件**且扩展名匹配 `*.png`。
+子目录不递归、符号链接跳过、别的东西一律不动。`images/` 可能被用户指向
+同步盘（或手工往里放了自己另存的截图），误删的代价远大于多留几 MB。
+
+代价写在 README 的「已知限制」里：手工放进该目录、又不在任何记录里的文件，
+会被 `--images-gc` 当成垃圾删掉。
+
+### 「文件不在」与「垃圾没清」要分开
+
+两者在目录列表里长得完全不同，但都不该混着报：
+
+- `unreferenced` —— 目录里有、没记录提到。**待回收**。
+- `missing` —— 记录提到了、文件不在。**数据损坏**（图片被手工删了、
+  同步盘冲突丢了），要去找回来而不是清掉。
+
+`ImageUsage` 两类都报，`--images` 与设置页各说一句。
+
 ## OCR
 
 `core/ocr.py` 把「图片里的文字」变成可检索的 `content`，从而复用既有的
@@ -1029,6 +1097,7 @@ A 设备                                        B 设备
 | 存储 | 内存/临时 SQLite，覆盖 FTS 降级与索引重建 |
 | JSON 存储 | 临时目录里的 JSON 文件，覆盖损坏恢复、原子写、内联图片与搬迁 |
 | 重复项合并 | 两个后端各一组同名用例：次数折算、最新时间提升、幂等、空 hash 跳过 |
+| 图片附件回收 | 两个后端各一组同名用例：删除/清空/淘汰/敏感到期都收图、共享引用不误删、只碰普通 PNG |
 | 平台层（Linux） | 真实调用，覆盖 X11/Wayland 双栈与降级路径 |
 | 平台层（Windows/macOS） | **仿真原生层**：假的 `user32` / 假的 `Quartz`，跑真实业务链路 |
 | 原生能力自检 | 自检自身可测：探测抛异常时仍要能给出结论 |

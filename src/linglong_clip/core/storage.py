@@ -17,6 +17,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from ..utils.logger import get_logger
 from ..utils.paths import data_dir
+from . import image_store
 from .models import ClipboardItem, content_hash
 from .normalize import canonical_key
 
@@ -277,10 +278,75 @@ class Storage:
         return cursor.rowcount
 
     def _remove_image(self, relative: str) -> None:
+        """删掉某条记录独占的那张图。
+
+        只在**没有别的记录引用同一个文件**时才真删。图片是按内容哈希命名的，
+        同一张图被复制三次只落一份文件、三条记录共用它；此前直接 `unlink`
+        会让后两条记录的图片平白失联。
+
+        路径按文件名比对（见 `image_store`），因为库里历史遗留了
+        `images/x.png` 与 `x.png` 两种写法。
+        """
+        name = image_store.basename_of(relative)
+        if not name or not self._usable():
+            return
+        with self._lock:
+            still_used = self._conn.execute(
+                "SELECT 1 FROM items WHERE image_path LIKE ? LIMIT 1", (f"%{name}",)
+            ).fetchone()
+        if still_used is not None:
+            return
         try:
-            (self.path.parent / relative).unlink(missing_ok=True)
+            (self._images_dir / name).unlink(missing_ok=True)
         except OSError as exc:
-            _log.debug("图片清理失败 %s: %s", relative, exc)
+            _log.debug("图片清理失败 %s: %s", name, exc)
+
+    # ---- 图片附件 ----
+
+    def discard_unreferenced_image(self, relative: str) -> bool:
+        """收下一份「没能成为记录」的图片文件；仍被别的记录引用时不动它。
+
+        采集是「先落盘、后判定」：图片文件在读取阶段就写下了，隐私判定与
+        类型开关在之后才做决定。判定不通过时文件没有主人，这条路径负责回收。
+        """
+        name = image_store.basename_of(relative)
+        if not name or not self._usable():
+            return False
+        with self._lock:
+            used = self._conn.execute(
+                "SELECT 1 FROM items WHERE image_path LIKE ? LIMIT 1", (f"%{name}",)
+            ).fetchone()
+        if used is not None:
+            return False
+        self._remove_image(relative)
+        return True
+
+    def referenced_images(self) -> set:
+        """全库正在引用哪些图片文件（文件名集合）。
+
+        这是判断「`images/` 里哪个文件是垃圾」的唯一依据。回收前**必须先问它**，
+        否则会把还在用的图当成孤儿删掉。
+        """
+        if not self._usable():
+            return set()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT image_path FROM items WHERE image_path != ''"
+            ).fetchall()
+        return image_store.referenced_names(row["image_path"] for row in rows)
+
+    def sweep_images(self, *, dry_run: bool = True, limit: int = image_store.DEFAULT_LIMIT):
+        """回收 `images/` 里不再被任何记录引用的文件。"""
+        return image_store.sweep(
+            self._images_dir,
+            self.referenced_images(),
+            dry_run=dry_run,
+            limit=limit,
+        )
+
+    def image_usage(self):
+        """图片目录的占用、文件数，以及「记录引用了但文件不在」的数量。"""
+        return image_store.usage(self._images_dir, self.referenced_images())
 
     # ---- 查询 ----
 
@@ -647,6 +713,7 @@ class Storage:
         removed = 0
         if not self._usable():
             return 0
+        doomed_images: List[str] = []
         with self._lock:
             if max_days > 0:
                 cutoff = time.time() - max_days * 86400
@@ -654,6 +721,7 @@ class Storage:
                     sql = "DELETE FROM items WHERE pinned = 0 AND created_at < ?"
                 else:
                     sql = "DELETE FROM items WHERE created_at < ?"
+                doomed_images += self._image_paths_matching(sql, (cutoff,))
                 cursor = self._conn.execute(sql, (cutoff,))
                 removed += cursor.rowcount
             if max_items > 0:
@@ -674,23 +742,53 @@ class Storage:
                         "    COALESCE(NULLIF(used_at,0), created_at) DESC LIMIT ?"
                         ")"
                     )
+                doomed_images += self._image_paths_matching(sql, (max_items,))
                 cursor = self._conn.execute(sql, (max_items,))
                 removed += cursor.rowcount
             if removed:
                 self._conn.commit()
+        # 删行之后才动文件：反过来一旦事务回滚，记录还在文件却没了。
+        for relative in doomed_images:
+            self._remove_image(relative)
         return removed
 
+    def _image_paths_matching(self, sql: str, params: Iterable[Any]) -> List[str]:
+        """把一条待删 SQL 换成「这些行的 image_path 有哪些」。
+
+        淘汰语句是 `DELETE ... WHERE <条件>`，直接照着条件再查一次即可 ——
+        比让调用方在 Python 里复算一遍淘汰规则可靠得多（复算迟早会分叉）。
+        """
+        if " WHERE " not in sql:
+            return []
+        where = sql.split(" WHERE ", 1)[1]
+        try:
+            rows = self._conn.execute(
+                f"SELECT image_path FROM items WHERE {where}", tuple(params)
+            ).fetchall()
+        except sqlite3.Error as exc:
+            # 取不到就不删文件 —— 宁可有垃圾，也不能删掉还在用的图。
+            _log.debug("淘汰前取图片路径失败: %s", exc)
+            return []
+        return [row["image_path"] for row in rows if row["image_path"]]
+
     def purge_expired_sensitive(self, ttl_seconds: int) -> int:
-        """清除超期的敏感记录（不落库内容，直接从历史移除）。"""
+        """清除超期的敏感记录（不落库内容，直接从历史移除）。
+
+        敏感记录里最要紧的一类恰恰是**截图**（密钥、身份证截图）。这条路径
+        此前只删行不删图，等于「限时保留」到期后原始 PNG 仍在磁盘上躺着 ——
+        与该功能的目的正好相反。
+        """
         if ttl_seconds <= 0 or not self._usable():
             return 0
         cutoff = time.time() - ttl_seconds
+        sql = "DELETE FROM items WHERE sensitive = 1 AND created_at < ?"
         with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM items WHERE sensitive = 1 AND created_at < ?", (cutoff,)
-            )
+            doomed = self._image_paths_matching(sql, (cutoff,))
+            cursor = self._conn.execute(sql, (cutoff,))
             self._conn.commit()
-            return cursor.rowcount
+        for relative in doomed:
+            self._remove_image(relative)
+        return cursor.rowcount
 
     def set_meta(self, key: str, value: str) -> None:
         if not self._usable():

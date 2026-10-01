@@ -51,6 +51,10 @@
 
 ![设置·隐私](docs/screenshots/settings-privacy-outbound.png)
 
+设置页「采集 → 历史存储」里的「图片附件」—— 占用、可回收多少，都在这一处：
+
+![设置·图片附件](docs/screenshots/settings-images.png)
+
 设置页「隐私 → 自定义脱敏规则」—— 正则写错不会报错，只会被静默跳过，
 所以在这里边写边体检（下图第二条是故意写错的，看得出它被当场标出来）：
 
@@ -470,7 +474,65 @@ linglong-clipboard --get 12 --form-key shell # 路径按 shell 规则转义
 设置页「采集 → 历史保留」里可以整个关掉「收下各种写法」，
 代价是粘贴结果只剩我们保存的那一份纯文本。
 
-### 八、隐私是默认值，不是可选项
+### 八、图片附件有出口，磁盘不会只涨不缩
+
+截图是剪贴板里最占地方的东西。它们落在数据目录的 `images/` 下，
+数据库只存相对路径 —— 但**记录消失之后那份 PNG 没人来收**。
+三条路径都会漏，而且都不报错：
+
+| 路径 | 此前行为 |
+| --- | --- |
+| 淘汰（`max_items` / `max_days`） | 只 `DELETE` 行，不动文件 |
+| 敏感内容限时保留到期 | 同上 —— 而这条路径里最要紧的恰恰是密钥/证件截图 |
+| 采集期就被拦下 | 文件在读取阶段已落盘，隐私判定在之后才做，判定不过就成了孤儿 |
+
+还有一条只有 JSON 后端才有的：`--remove` 与 `--clear` 在 SQLite 上会顺手
+删图，在 JSON 上不会 —— 换个存储方式，磁盘表现就不一样。
+
+共同的后果是**用户看不见**：记录数被 `history.max_items` 压住了，
+`--stats` 里连图片占用都不显示，唯一的线索是「这个目录怎么这么大」。
+
+现在四处都接上了，并且多了两个能查的入口：
+
+```bash
+linglong-clipboard --images                          # 占用多少、几张是垃圾
+linglong-clipboard --images-gc --dry-run             # 先看会删哪些
+linglong-clipboard --images-gc                       # 真的回收
+```
+
+```
+$ linglong-clipboard --images
+图片目录：~/.local/share/linglong-clipboard/images
+共 1204 张，占用 318.4 MB
+其中 87 张未被任何记录引用（22.1 MB）
+  linglong-clipboard --images-gc --dry-run   # 先看会删哪些
+  linglong-clipboard --images-gc             # 真的回收
+```
+
+`--stats` 里也带上了这一项：
+
+```
+图片附件：1204 张 · 318.4 MB
+          其中 87 张（22.1 MB）没有记录引用，可用 --images-gc 回收
+```
+
+设置页「采集 → 历史存储」下方有同一个面板，显示占用并带一个回收按钮：
+
+![设置·图片附件](docs/screenshots/settings-images.png)
+
+几条刻意定下的规矩：
+
+- **回收只动「没有被任何记录引用」的文件**。图片按内容哈希命名，
+  同一张截图被复制两次只落一份文件、两条记录共用它 —— 删一条记录时
+  会被拦下（还有别人在用），删最后一条才真删。两个后端语义逐条对齐。
+- **只碰自己写下的普通 PNG**。子目录、符号链接、`.txt` 之类一律不动：
+  `images/` 可能被用户指向同步盘，误删的代价远大于多留几 MB。
+- **`--images-gc` 默认要显式触发**，`--dry-run` 可以只看不删。
+  后台不会偷偷清 —— 什么算垃圾得由「引用集」决定，给错了就是丢用户的图。
+- **「文件不在」与「垃圾没清」分开报**。前者是数据损坏（图片被手工删了、
+  同步盘起了冲突），后者是待回收，处理方式完全不同。
+
+### 九、隐私是默认值，不是可选项
 
 - **密码管理器直接跳过**：内置识别 1Password、Bitwarden、KeePass、LastPass 等 14 种，
   还可自加黑名单。
@@ -488,7 +550,7 @@ linglong-clipboard --get 12 --form-key shell # 路径按 shell 规则转义
 - **同步内容加密**：跨设备同步可选 Fernet 对称加密（PBKDF2 派生的密钥）。
 - **敏感项不进同步**：即使本地保留，也不导出。
 
-### 九、三平台原生适配
+### 十、三平台原生适配
 
 | 能力 | Windows | Linux (X11) | Linux (Wayland) | macOS |
 | --- | --- | --- | --- | --- |
@@ -579,7 +641,7 @@ linglong-clipboard --selfcheck
 真机验证清单见 [docs/native-verification.md](docs/native-verification.md)；
 没有目标机器时可用 `python tools/native_check.py` 在真机上一键采集结论。
 
-### 十、跨设备同步，不要中心服务器
+### 十一、跨设备同步，不要中心服务器
 
 两种模式，都不经过第三方服务器：
 
@@ -842,7 +904,7 @@ $ linglong-clipboard --sync-status
   192.168.1.9:48620 · 不可达
 ```
 
-### 十一、设置里能勾的，勾了就真的有用
+### 十二、设置里能勾的，勾了就真的有用
 
 剪贴板工具最让人恼火的不是功能少，而是**开关是假的**：设置页里
 勾了一个选项，界面上一切正常，实际上什么也没发生，用户只能反复怀疑自己。
@@ -991,6 +1053,9 @@ linglong-clipboard --normalize '<文本>'      # 预览归一结果（排查为�
 linglong-clipboard --quick                   # 唤起快速粘贴浮层
 linglong-clipboard --minimized               # 启动后最小化到托盘
 linglong-clipboard --monitor-primary         # 选中文字即记录（Linux 主选择区）
+linglong-clipboard --images                   # 图片占多少磁盘、几张是垃圾
+linglong-clipboard --images-gc --dry-run      # 预览会回收哪些图片（不删）
+linglong-clipboard --images-gc                # 回收未被引用的图片
 linglong-clipboard --storage-status          # 历史存在哪（SQLite 还是 JSON）
 linglong-clipboard --where                   # 只输出数据目录路径
 linglong-clipboard --storage json            # 切换存储方式
@@ -1139,6 +1204,8 @@ $ linglong-clipboard --config-audit
 因为漏一次就等于删除/取消没有传播，没有第二次机会。
 
 图片附件存在 `images/` 子目录，数据库只存相对路径，整体搬走目录也不会失联。
+记录消失时对应的文件会被一起收走（淘汰、敏感到期、删除、清空四条路径都接上了），
+`--images` 可以查看占用、`--images-gc` 可以回收历史遗留的孤儿文件。
 JSON 方式下图片默认**内联进历史文件**（data URI），
 所以单个 `clipboard.json` 拷到别的机器，图片也一起跟着走；
 超过 2MB 的大图仍留在 `images/`（可在设置里调上限）。
@@ -1229,7 +1296,7 @@ pytest tests/ --cov=linglong_clip --cov-report=html # 带覆盖率
 QT_QPA_PLATFORM=offscreen pytest tests/test_ui.py   # 无头环境跑界面测试
 ```
 
-1664 个用例，覆盖核心逻辑、平台适配、界面组件与端到端流程。
+1732 个用例，覆盖核心逻辑、平台适配、界面组件与端到端流程。
 界面测试统一走 Qt 的 `offscreen` 平台，无需真实显示器，CI 里也能跑。
 
 **平台相关的测试用「仿真原生层」而不是打桩断言。** Windows 分支喂一个
@@ -1307,6 +1374,7 @@ src/linglong_clip/
 │   ├── monitor.py           #   剪贴板监听调度
 │   ├── automation.py        #   34 个转换器 + 规则引擎
 │   ├── ocr.py               #   截图文字识别（tesseract 后端 + 降级）
+│   ├── image_store.py       #   图片附件的回收与对账
 │   ├── sync.py              #   共享文件夹同步与加密
 │   ├── lan_sync.py          #   局域网直连同步（拉取模型 + 鉴权）
 │   ├── sync_cursor.py       #   同步增量游标（每来源只拉新记录）
@@ -1394,6 +1462,11 @@ tools/
   验证清单见 [docs/native-verification.md](docs/native-verification.md)。
 - **复制后自动粘贴**：Linux 下依赖 `xdotool`，Wayland 不支持。
 - **图片不同步**：为避免同步目录膨胀，图片默认只在本地，不参与跨设备流转。
+- **`images/` 的回收只认「有没有记录引用」**：手工放进该目录的文件（比如自己
+  另存的截图）不在任何记录里，会被 `--images-gc` 当成垃圾删掉。要长期保留的东西
+  请别放在这个目录下 —— 或者把它固定为一条记录，那样它就有了引用。
+- **`--images-gc` 单次默认有上限**：极端情况下（首次运行、历史积攒了十几万张）
+  一次跑不完，会提示「达到单次上限提前停下」，再跑一次继续。
 - **OCR 依赖系统 tesseract**：未安装时截图照常记录，只是搜不到图中的文字。
   手写体、低分辨率与复杂排版的识别率有限，属通用 OCR 的固有局限。
 - **光输一个类型名不再筛类型**：「脚本」「链接」这类词本身也是常用名词，

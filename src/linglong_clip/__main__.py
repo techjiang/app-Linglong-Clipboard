@@ -164,6 +164,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="删除一条记录，并让这次删除同步到其它设备",
     )
 
+    images_group = parser.add_argument_group("图片附件")
+    images_group.add_argument(
+        "--images",
+        action="store_true",
+        help="历史里的图片占用多少磁盘、有多少张没被任何记录引用",
+    )
+    images_group.add_argument(
+        "--images-gc",
+        action="store_true",
+        help="回收 images/ 里不再被记录引用的图片文件（配 --dry-run 只报告不删）",
+    )
+    images_group.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="配 --images-gc 使用：只列出会删哪些文件，不真删",
+    )
+
     storage_group = parser.add_argument_group("历史存储")
     storage_group.add_argument(
         "--storage-status",
@@ -399,6 +416,117 @@ def _print_items(items, *, as_json: bool, plain: bool, limit: int) -> None:
             f"{str(item.id):>5}  [{markers}] {stamp}  {item.kind_label:<4} "
             f"{count} {preview}"
         )
+
+
+def _image_status(storage) -> dict:
+    """图片附录的占用与垃圾量，供 `--stats` / `--images` 输出。
+
+    `unreferenced` 是「目录里有、但没有任何记录提到」的文件 —— 它就是
+    磁盘只涨不缩的来源。`missing` 相反，是记录提到了、文件却不在，
+    属于数据损坏，两者必须分开说：一个要清，一个要找回来。
+    """
+    empty = {
+        "dir": "",
+        "files": 0,
+        "bytes": 0,
+        "unreferenced": 0,
+        "unreferenced_bytes": 0,
+        "missing": 0,
+    }
+    usage_fn = getattr(storage, "image_usage", None)
+    if usage_fn is None:
+        return empty
+    try:
+        usage = usage_fn()
+    except Exception:  # noqa: BLE001 - 统计失败不该拖垮整个命令
+        return empty
+
+    import os
+
+    dir_path = getattr(storage, "images_dir", None)
+    referenced = storage.referenced_images()
+    unreferenced = 0
+    unreferenced_bytes = 0
+    if dir_path is not None:
+        from .core import image_store
+
+        for path in image_store.iter_image_files(dir_path):
+            if path.name in referenced:
+                continue
+            unreferenced += 1
+            try:
+                unreferenced_bytes += path.stat().st_size
+            except OSError:
+                pass
+
+    return {
+        "dir": str(dir_path) if dir_path is not None else "",
+        "files": usage.files,
+        "bytes": usage.bytes,
+        "unreferenced": unreferenced,
+        "unreferenced_bytes": unreferenced_bytes,
+        "missing": usage.missing,
+    }
+
+
+def _run_images(args, storage) -> int:
+    """`--images` 与 `--images-gc` 的实现。"""
+    from .core import image_store
+
+    if args.images_gc:
+        dry_run = bool(args.dry_run)
+        # 上限调大一些：`--images-gc` 是用户显式要求回收，不是后台顺手清一下，
+        # 卡在默认 2000 个文件会让「清干净」变成「清了两次」。
+        result = storage.sweep_images(dry_run=dry_run, limit=200000)
+        payload = result.as_dict()
+        payload["names"] = result.names
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0
+        verb = "将回收" if dry_run else "已回收"
+        if not result.removed and not result.errors:
+            print("没有可回收的图片：images/ 里每个文件都有记录在引用")
+            return 0
+        print(
+            f"{verb} {result.removed} 张图片"
+            f"（{result.bytes / 1024 / 1024:.1f} MB），"
+            f"保留 {result.kept} 张仍被引用的"
+        )
+        if dry_run and result.names:
+            print("将被删除的文件（最多列 50 个）：")
+            for name in result.names:
+                print(f"  {name}")
+            print("这是预演，什么都没有删。确认后去掉 --dry-run 再跑一次。")
+        if result.errors:
+            print(f"有 {result.errors} 个文件删除失败（已跳过，下次会重试）")
+        if result.truncated:
+            print("达到单次上限提前停下，再跑一次可以继续。")
+        return 0
+
+    info = _image_status(storage)
+    if args.json:
+        print(json.dumps(info, ensure_ascii=False, indent=2))
+        return 0
+    if not info["files"] and not info["missing"]:
+        print(f"没有图片附件（目录：{info['dir']}）")
+        return 0
+    print(f"图片目录：{info['dir']}")
+    print(f"共 {info['files']} 张，占用 {info['bytes'] / 1024 / 1024:.1f} MB")
+    if info["unreferenced"]:
+        print(
+            f"其中 {info['unreferenced']} 张未被任何记录引用"
+            f"（{info['unreferenced_bytes'] / 1024 / 1024:.1f} MB）"
+        )
+        print("  linglong-clipboard --images-gc --dry-run   # 先看会删哪些")
+        print("  linglong-clipboard --images-gc             # 真的回收")
+    else:
+        print("每张图都有记录在引用，没有可回收的")
+    if info["missing"]:
+        print(
+            f"另有 {info['missing']} 条记录引用的图片已不在磁盘上"
+            "（图片被手工删过或同步盘冲突），这些记录打不开原图"
+        )
+    return 0
 
 
 def _primary_status(config) -> dict:
@@ -683,6 +811,11 @@ def _run_cli(args: argparse.Namespace) -> int:
 
     storage = _load_storage(config)
 
+    if args.images or args.images_gc:
+        code = _run_images(args, storage)
+        storage.close()
+        return code
+
     if args.stats:
         from .core.ocr import build_engine
 
@@ -691,6 +824,8 @@ def _run_cli(args: argparse.Namespace) -> int:
         stats["ocr"] = ocr_status
         primary_status = _primary_status(config)
         stats["primary_selection"] = primary_status
+        image_info = _image_status(storage)
+        stats["images"] = image_info
         if args.json:
             print(json.dumps(stats, ensure_ascii=False, indent=2))
         else:
@@ -728,6 +863,22 @@ def _run_cli(args: argparse.Namespace) -> int:
             if primary_status["warning"]:
                 line += f"\n          注意：{primary_status['warning']}"
             print(line)
+            # 图片占用：此前统计里完全没有这一项，于是「磁盘为什么一直涨」
+            # 在界面上是个无解的问题 —— 记录数明明被上限压住了。
+            if image_info["files"] or image_info["missing"]:
+                line = (
+                    f"图片附件：{image_info['files']} 张 · "
+                    f"{image_info['bytes'] / 1024 / 1024:.1f} MB"
+                )
+                if image_info["unreferenced"]:
+                    line += (
+                        f"\n          其中 {image_info['unreferenced']} 张"
+                        f"（{image_info['unreferenced_bytes'] / 1024 / 1024:.1f} MB）"
+                        "没有记录引用，可用 --images-gc 回收"
+                    )
+                if image_info["missing"]:
+                    line += f"\n          有 {image_info['missing']} 条记录引用的图片已不在磁盘上"
+                print(line)
         storage.close()
         return 0
 
@@ -1291,6 +1442,8 @@ CLI_DEST_NAMES = (
     "rules",
     "privacy_audit",
     "redact",
+    "images",
+    "images_gc",
 )
 
 
