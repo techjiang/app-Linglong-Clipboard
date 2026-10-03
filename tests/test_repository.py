@@ -215,6 +215,23 @@ def test_find_by_hash_and_latest(repo):
     assert repo.latest().content == "dup2"
 
 
+def test_get_many_returns_only_existing(repo):
+    """两个后端的 `get_many` 语义必须一致：只返回存在的 id，顺序无关。"""
+    first = _add(repo, content="a", hash="a")
+    second = _add(repo, content="b", hash="b")
+    found = repo.get_many([first.id, second.id, 999999])
+    assert set(found) == {first.id, second.id}
+    assert found[first.id].content == "a"
+    assert repo.get_many([]) == {}
+
+
+def test_get_many_ignores_unusable_ids(repo):
+    """id 来自界面与同步日志，可能带 `None` 或字符串 —— 判不出数就跳过，不炸。"""
+    item = _add(repo, content="a", hash="a")
+    found = repo.get_many([None, "abc", item.id, str(item.id)])
+    assert set(found) == {item.id}
+
+
 def test_pinned_and_favorite_sort_first(repo):
     now = time.time()
     _add(repo, content="plain", hash="1", created_at=now)

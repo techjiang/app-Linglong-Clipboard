@@ -143,6 +143,32 @@ def _my_transform(text: str, option: str = "default") -> Optional[str]:
 不一致的表现不是报错，而是历史里多出一条你自己刚复制的内容 ——
 很容易被当成「采集正常」而放过。
 
+### 界面上的「第 N 条」
+
+数字序号（快速粘贴浮层的 `1-9`、`Ctrl+1..9`）指的是**屏幕上那一列的
+第 N 行**，不是「库里当前第 N 条」。这两者在列表渲染之后就会分叉 ——
+浮层是常驻组件，它显示着的时候监控线程仍在往库里写。
+
+`ui/` 不直接读写数据库，所以「屏幕上那一条是哪一条」只能由界面自己记：
+`QuickPasteOverlay` 在 `_reload()` 时把 `_row_ids` 与 `_items` 一起定下来，
+`_choose()` 只按这份快照解析序号。
+
+要发信号传递「哪一条」时**传 id，不要自己重新查一遍列表**：
+
+```python
+overlay._row_ids[position]        # 屏幕上印的那个数字解释出来的 id
+storage.list(limit=N)[position]   # ✗ 这是「库里当前第 N 条」，会漂移
+```
+
+失败模式不是报错，是**粘出来另一条内容**：用户按下 1，粘出的是他刚复制的
+那段垃圾，而他会以为工具粘错了。`tests/test_ui_widgets.py` 里三个
+`test_quick_paste_numbered_hotkey_*` 守着这件事（其中「列表真的重新加载过
+之后按新列表算」是防止修过头的对照）。
+
+`Storage.get_many()` / `JsonRepository.get_many()` 是配套的按 id 取值入口，
+两个后端语义必须一致（只返回存在的 id）。新增存储后端时要一并实现 ——
+缺了它，症状是「换个存储方式就取不到」。
+
 ### 改动检索路径
 
 检索的候选集与排序由 `core/semantic.py` 与 `core/search_index.py` 共同决定。

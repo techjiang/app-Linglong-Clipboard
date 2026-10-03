@@ -457,6 +457,24 @@ class JsonRepository:
             item = self._items.get(item_id)
             return copy.deepcopy(item) if item is not None else None
 
+    def get_many(self, ids: Iterable[int]) -> Dict[int, ClipboardItem]:
+        """按 id 批量取记录，返回 `{id: 记录}`。语义与 `Storage.get_many` 一致。
+
+        两个后端对同一份数据要给出同一个答案 —— 界面不该因为用户换了
+        存储方式就取不到某一条。
+        """
+        result: Dict[int, ClipboardItem] = {}
+        with self._lock:
+            for raw in ids:
+                try:
+                    key = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                item = self._items.get(key)
+                if item is not None:
+                    result[key] = copy.deepcopy(item)
+        return result
+
     def find_by_hash(self, digest: str) -> Optional[ClipboardItem]:
         """同哈希可能有多条（历史遗留），按排序优先级返回第一条。"""
         if not digest:

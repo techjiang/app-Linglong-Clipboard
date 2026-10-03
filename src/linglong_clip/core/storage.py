@@ -368,6 +368,48 @@ class Storage:
             row = self._conn.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
         return ClipboardItem.from_row(row) if row else None
 
+    def get_many(self, ids: Iterable[int]) -> Dict[int, ClipboardItem]:
+        """按 id 批量取记录，返回 `{id: 记录}`；不存在的 id 不出现在结果里。
+
+        存在的意义是**让「按 id 取一条」不再依赖界面上那一份快照**：
+        界面持有的是某一刻的列表，而记录会在列表之外被别的写方改动
+        （复制频次、固定、清理）。要传递「用户指的是哪一条」时传 id 最可靠，
+        但拿到 id 的一方此前只能自己遍历一遍。
+
+        **分块是必须的**：`IN (...)` 的占位符数量受 SQLite 变量上限约束
+        （常见实现是 999），一次几千条会直接报 `too many SQL variables` ——
+        症状是「整批都取不到」，而不是「少几条」。
+        """
+        wanted: List[int] = []
+        seen = set()
+        for raw in ids:
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if value in seen:
+                continue
+            seen.add(value)
+            wanted.append(value)
+
+        result: Dict[int, ClipboardItem] = {}
+        if not wanted or not self._usable():
+            return result
+
+        chunk = 400
+        with self._lock:
+            for start in range(0, len(wanted), chunk):
+                batch = wanted[start : start + chunk]
+                placeholders = ",".join("?" for _ in batch)
+                rows = self._conn.execute(
+                    f"SELECT * FROM items WHERE id IN ({placeholders})", batch
+                ).fetchall()
+                for row in rows:
+                    item = ClipboardItem.from_row(row)
+                    if item.id is not None:
+                        result[int(item.id)] = item
+        return result
+
     def find_by_hash(self, digest: str) -> Optional[ClipboardItem]:
         if not self._usable():
             return None

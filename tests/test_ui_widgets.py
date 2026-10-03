@@ -1052,6 +1052,94 @@ def test_quick_paste_overlay_paste_nth(storage, config, qt_app):
     chosen.clear()
     overlay.paste_nth(99)
     assert chosen == []
+def test_quick_paste_numbered_hotkey_pastes_what_was_shown(storage, config, qt_app):
+    """浮层显示着的时候若库里多了新记录，按数字快捷键必须仍取「看到的那条」。
+
+    这是一条**用户会以为是数据错乱**的路径：
+
+    ```
+    浮层打开，第 1 条是「旧的重要片段」（用户想粘的就是它）
+    此刻在别处复制了一段垃圾          ← 浮层没关，监控线程照常入库
+    按 Ctrl+Shift+1                    → 粘出来的是那段垃圾
+    ```
+
+    序号在界面上只对「列表里的第 N 条」有意义，而旧实现是按序号去库里
+    **重新取一次「当前第 N 条」** —— 库里顺序变了，序号的含义就变了，
+    浮层上印的数字与粘出来的东西对不上。用户没有任何办法自己发现
+    中间发生过入库，只会以为「这东西粘错了」。
+    """
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.semantic import SemanticEngine
+    from linglong_clip.ui.quick_paste import QuickPasteOverlay
+
+    storage.add(ClipboardItem(kind="text", content="旧的重要片段", preview="旧的重要片段", hash="h0"))
+    overlay = QuickPasteOverlay(storage, SemanticEngine(storage), config)
+    overlay.show_centered()
+    assert [item.preview for item in overlay._items] == ["旧的重要片段"]
+
+    # 浮层开着，用户又在别处复制了别的东西
+    storage.add(ClipboardItem(kind="text", content="刚刚复制的垃圾", preview="刚刚复制的垃圾", hash="h9"))
+
+    chosen = []
+    overlay.item_chosen.connect(lambda item_id, plain: chosen.append(item_id))
+    overlay.paste_nth(1)
+
+    assert len(chosen) == 1
+    resolved = storage.get_many(chosen)[chosen[0]]
+    assert resolved.preview == "旧的重要片段"
+
+
+def test_quick_paste_numbered_hotkey_survives_deleted_row(storage, config, qt_app):
+    """「看到的那条」若已被删掉，就什么都不做 —— 但**不能**粘成别的一条。
+
+    序号在原位置失效之后，把它当成「当前第 N 条」是最坏的一种兜底：
+    用户按下 1，取到的是完全无关的另一条内容，还粘了出去。
+    """
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.semantic import SemanticEngine
+    from linglong_clip.ui.quick_paste import QuickPasteOverlay
+
+    for index in range(3):
+        storage.add(ClipboardItem(kind="text", content=f"条目{index}", preview=f"条目{index}", hash=f"h{index}"))
+    overlay = QuickPasteOverlay(storage, SemanticEngine(storage), config)
+    overlay.show_centered()
+    assert overlay._row_ids, "浮层应已渲染出带 id 的行"
+    doomed_id = overlay._row_ids[0]
+    storage.delete(doomed_id)
+    storage.add(ClipboardItem(kind="text", content="新来的", preview="新来的", hash="hnew"))
+
+    chosen = []
+    missing = []
+    overlay.item_chosen.connect(lambda item_id, plain: chosen.append(item_id))
+    overlay.row_missing.connect(missing.append)
+    overlay.paste_nth(1)
+    # 既不能粘成别的一条，也不能静默 —— 静默会让人以为快捷键失灵
+    assert chosen == []
+    assert missing == [doomed_id]
+
+
+def test_quick_paste_numbered_hotkey_uses_current_list_after_reload(storage, config, qt_app):
+    """列表真的重排过（重新检索）之后，序号就该按新列表算 —— 别修过头。
+
+    上一条修的是「序号指的一直是那份已显示的列表」。若列表本身重新加载了，
+    屏幕上印的序号也跟着变了，此时取最新的才对。
+    """
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.semantic import SemanticEngine
+    from linglong_clip.ui.quick_paste import QuickPasteOverlay
+
+    storage.add(ClipboardItem(kind="text", content="旧的", preview="旧的", hash="hold"))
+    overlay = QuickPasteOverlay(storage, SemanticEngine(storage), config)
+    overlay.show_centered()
+    storage.add(ClipboardItem(kind="text", content="新的", preview="新的", hash="hnew"))
+    overlay._reload()  # 界面重新渲染，第 1 条已经是「新的」了
+
+    chosen = []
+    overlay.item_chosen.connect(lambda item_id, plain: chosen.append(item_id))
+    overlay.paste_nth(1)
+    assert storage.get_many(chosen)[chosen[0]].preview == "新的"
+
+
 # ---- 设置页：删除的同步 ----
 
 

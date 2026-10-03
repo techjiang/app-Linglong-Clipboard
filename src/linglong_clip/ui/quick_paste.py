@@ -4,7 +4,9 @@
 - 无边框 + 居中 + 跟随鼠标所在屏幕，减少视线移动；
 - 单个输入框既是搜索也是编号跳转（输入 `3` 直接取第三条）；
 - 列表只渲染一屏，用 `1-9` 与方向键操作，不引入滚动；
-- `Esc` 关闭，失焦自动关闭 —— 浮层最忌讳「关不掉」。
+- `Esc` 关闭，失焦自动关闭 —— 浮层最忌讳「关不掉」；
+- 数字既指「列表里的第 N 条」，就由**列表**决定它指向哪一条，
+  不拿序号去库里重取（见 `_choose`）。
 """
 
 from __future__ import annotations
@@ -95,6 +97,8 @@ class QuickPasteOverlay(QWidget):
     """快速粘贴浮层。"""
 
     item_chosen = Signal(int, bool)  # (item_id, plain_text_only)
+    #: 屏幕上那一行已经不在库里了（被删除、被限时清理、被对端同步删掉）
+    row_missing = Signal(int)  # 原样带出那个 id，便于提示里说清是哪一条
     closed = Signal()
 
     def __init__(
@@ -110,6 +114,13 @@ class QuickPasteOverlay(QWidget):
         self._config = config
         self._palette_theme = palette_for(config.get("ui.theme", "system"))
         self._items: List[ClipboardItem] = []
+        #: 屏幕上那一列序号实际指向的记录 id，与 `_items` 一一对应。
+        #:
+        #: 为什么要单独存一份 id：序号（1-9）是**界面上的位置**，
+        #: 而位置的意义只在「渲染出它的那一刻」成立。浮层是常驻组件，
+        #: 它显示着的时候监控线程仍在往库里写 —— 一旦拿序号去库里重新取
+        #: 「当前第 N 条」，取到的就是另一条，浮层上印的数字与粘出来的东西对不上。
+        self._row_ids: List[int] = []
         self._rows: List[QuickRow] = []
         self._active = 0
 
@@ -188,6 +199,7 @@ class QuickPasteOverlay(QWidget):
         else:
             fuzzy = bool(self._config.get("ui.fuzzy_search", True))
             self._items = self._engine.search(query, limit=MAX_ROWS, use_intent=fuzzy)
+        self._row_ids = [item.id for item in self._items if item.id is not None]
         self._render()
 
     def _render(self) -> None:
@@ -272,24 +284,41 @@ class QuickPasteOverlay(QWidget):
     def paste_nth(self, index: int) -> None:
         """直接粘贴第 N 条（1 起），供全局快速粘贴快捷键调用。
 
-        与 `_choose` 的区别：`_choose` 假定浮层已经渲染好了当前的
-        `self._items`，而快捷键可能在任何时刻按下 —— 浮层刚 `show_centered`
-        时列表是最新的，但为避免「按了没反应」，这里在序号越界时
-        重新按当前查询渲染一次再试。
+        与 `_choose` 的区别只在于「按下的那一刻屏幕上还是空的」这一种情况：
+        快捷键由 `Application` 注册，可能在浮层还没渲染出任何一行时按下
+        （回调里先 `show_quick_paste()` 再调这里，中间没有机会等一次渲染）。
+        此时先按当前查询渲染一次，避免「按了没反应」。
+
+        **不要写成「序号越界就重渲染」**：库里新增一条就会让旧列表的序号
+        整体错位，重渲染等于让序号指向一批新的记录 —— 用户按的是屏幕上
+        看到的第 1 条，粘出来的却是刚复制的那条垃圾。
         """
-        if not (1 <= index <= len(self._items)):
-            self._render()
+        if not self._row_ids and not self._items:
+            self._reload()
         self._choose(index)
 
     def _choose(self, index: int, plain_text_only: bool = False) -> None:
+        """取第 N 条 —— 序号由**屏幕上那份列表**解释，不去库里重取。
+
+        序号是界面上的位置，位置只在渲染它的那一刻有意义。已经显示的列表
+        不会自己变化（用户没搜索、没翻页），所以按序号取到的永远是
+        「他眼睛看到的那一条」；反过来，拿序号去库里重新查「当前第 N 条」，
+        结果会随后台入库漂移 —— 浮层开着时复制了别的东西就必然错位。
+
+        那条记录已经不在了（删除、限时清理、对端同步删除）时**什么都不做**，
+        只把 `row_missing` 报出去。退回成「当前第 N 条」是最坏的一种兜底：
+        用户按下 1，粘出去的是完全无关的另一条内容，而且他不会立刻发现。
+        """
         position = index - 1
-        if not (0 <= position < len(self._items)):
+        if not (0 <= position < len(self._row_ids)):
             return
-        item = self._items[position]
-        if item.id is None:
+        item_id = self._row_ids[position]
+        if not self._storage.get_many([item_id]):
+            self.close_overlay()
+            self.row_missing.emit(item_id)
             return
         self.close_overlay()
-        self.item_chosen.emit(item.id, plain_text_only)
+        self.item_chosen.emit(item_id, plain_text_only)
 
     def close_overlay(self) -> None:
         self.hide()

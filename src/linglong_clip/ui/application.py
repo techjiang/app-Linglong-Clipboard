@@ -389,6 +389,7 @@ class Application(QObject):
         window.transform_ready.connect(self._show_transform)
         window.form_ready.connect(self.copy_form)
         self.preview.item_chosen.connect(self._on_quick_chosen)
+        self.preview.row_missing.connect(self._on_quick_row_missing)
         self.preview.closed.connect(self._on_preview_closed)
         self.transformer.copy_result.connect(self.copy_text)
 
@@ -1062,6 +1063,18 @@ class Application(QObject):
             self.copy_item(item_id, plain_text_only=True)
         else:
             self.paste_item(item_id)
+
+    def _on_quick_row_missing(self, item_id: int) -> None:
+        """浮层上那一条已经不在了 —— 说清楚，而不是静默地什么都不发生。
+
+        `copy_item` 遇到不存在的记录会直接返回（这是对的：没有内容可写），
+        但那条返回路径在浮层场景里是**静默**的 —— 用户按了快捷键、浮层关了、
+        什么都没发生，只会以为快捷键失灵。删除、限时清理、对端同步删除
+        都能让一行在浮层显示期间消失，说一句比装没看见好。
+        """
+        _log.info("快速粘贴：记录 %s 已不存在，未写入剪贴板", item_id)
+        self.window.notify("那条记录已被删除，请重新选择")
+        self.window.reload()
 
     def _on_preview_closed(self) -> None:
         return None

@@ -108,7 +108,7 @@ def main() -> int:
     _render(window, OUT / "search-dark.png")
 
     # 快速粘贴浮层
-    from linglong_clip.ui.quick_paste import QuickPasteOverlay
+    from linglong_clip.ui.quick_paste import MAX_ROWS, QuickPasteOverlay
 
     overlay = QuickPasteOverlay(storage, engine, _config({}))
     # show_centered() 才会触发加载；无头环境里定位到屏幕中心，随后抓图
@@ -315,6 +315,13 @@ def main() -> int:
         title="linglong-clipboard — 图片按需补图",
     )
 
+    # 编号快捷键的解析：这个缺陷没有可截的界面状态，用真跑出来的 id 说明
+    _render_terminal(
+        _capture_numbered_hotkey(storage),
+        OUT / "cli-numbered-hotkey.png",
+        title="linglong-clipboard — 快速粘贴浮层的序号指向",
+    )
+
     storage.close()
     app.quit()
     print("完成。")
@@ -410,6 +417,99 @@ def _capture_image_cli(storage) -> list:
             cfg_path.write_text(saved, encoding="utf-8")
         elif cfg_path.exists():
             cfg_path.unlink()
+    return lines
+
+
+def _capture_numbered_hotkey(storage) -> list:
+    """真跑一遍「浮层显示期间又复制了东西，再按数字快捷键」的完整场景。
+
+    为什么要做成图：这个缺陷**在界面上没有可截的状态** —— 浮层上印着
+    「1」，而按下 1 之后浮层就关了，用户看到的只是「粘出来的是刚复制的垃圾」。
+    命令行没法复现（`--quick` 是交互式的），所以这里真造一个浮层、
+    真按一次 `paste_nth()`，把每一步**实际取到的 id 与内容**打出来。
+    图里的每一行都是程序刚算出来的，不是照着预期写好的字面量。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from linglong_clip.core.models import ClipboardItem, content_hash
+    from linglong_clip.core.semantic import SemanticEngine
+    from linglong_clip.core.storage import Storage
+    from linglong_clip.ui.quick_paste import MAX_ROWS, QuickPasteOverlay
+
+    lines: list = []
+    QApplication.instance() or QApplication([])
+
+    # 单独一份库：这个场景要的是「干净的初始状态」，混进 seed 数据会看不清
+    scratch = Storage(storage.path.parent / "hotkey-demo.db")
+    scratch.add(
+        ClipboardItem(
+            kind="text",
+            content="会议纪要：下周二评审设计稿，记得带上交互说明",
+            preview="会议纪要：下周二评审设计稿",
+            hash=content_hash("text", "meeting"),
+            source_app="chrome",
+        )
+    )
+    scratch.add(
+        ClipboardItem(
+            kind="text",
+            content="docker run -p 8080:80 -v $PWD:/app nginx:alpine",
+            preview="docker run -p 8080:80 -v $PWD:/app …",
+            hash=content_hash("text", "docker"),
+            source_app="terminal",
+        )
+    )
+
+    overlay = QuickPasteOverlay(scratch, SemanticEngine(scratch), _config({}))
+    overlay.item_chosen.connect(lambda item_id, plain: None)
+    overlay.show_centered()
+
+    lines.append("浮层已打开，屏幕上就是这么几行：")
+    for position, item in enumerate(overlay._items, start=1):
+        lines.append(f"    {position}  {item.preview}")
+    lines.append("")
+
+    # 浮层没关，用户在别处复制了一段垃圾 —— 监控线程照常入库
+    scratch.add(
+        ClipboardItem(
+            kind="text",
+            content="asdfgh",
+            preview="asdfgh",
+            hash=content_hash("text", "junk"),
+            source_app="unknown",
+        )
+    )
+    lines.append("此刻在别处复制了一段垃圾（浮层没关，采集线程已入库）：")
+    lines.append("    + asdfgh")
+    lines.append("")
+
+    # 屏幕上那几行此刻冻结在这里：下面无论发生什么，序号指的都是它们。
+    # 这里正是判据 —— 「列表中第 N 条」与「库里当前第 N 条」在入库之后
+    # 已经是两条不同的记录，而旧实现拿的是后者。
+    shown = [item.preview for item in overlay._items]
+    by_screen = list(overlay._row_ids)
+    by_storage = [item.preview for item in scratch.list(limit=MAX_ROWS)]
+
+    lines.append("按下 Ctrl+Shift+1（用户的本意：粘贴浮层上的第 1 条）")
+    lines.append("")
+    lines.append("    序号   屏幕上印的那一条            序号在库里对应的那一条")
+    for index in range(len(shown)):
+        lines.append(
+            f"    {index + 1}      {shown[index]:<24}  {by_storage[index]}"
+        )
+    lines.append("")
+    lines.append("按下之后实际取到的：")
+    for index in range(1, len(shown) + 1):
+        overlay._choose(index)
+        resolved = scratch.get(by_screen[index - 1])
+        lines.append(
+            f"    {index}  →  {resolved.preview if resolved else '（已不存在）'}"
+        )
+    lines.append("")
+    lines.append("    序号由屏幕上那份列表解释，不拿序号去库里重取：")
+    lines.append("    库里多了新记录之后，「当前第 1 条」已经换人，而屏幕上印的 1 没变。")
+
+    scratch.close()
     return lines
 
 

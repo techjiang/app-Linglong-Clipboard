@@ -26,6 +26,39 @@ def test_add_and_get(storage):
     assert storage.count() == 1
 
 
+def test_get_many_returns_only_existing(storage):
+    """批量取只返回存在的 id —— 界面按 id 取「屏幕上那一条」就靠它。
+
+    JSON 后端有等价用例（`test_repository.py`）：两个后端对同一份数据
+    要给出同一个答案，否则换个存储方式就会出现「按序号取不到」。
+    """
+    first = _add(storage, content="a", hash="a")
+    second = _add(storage, content="b", hash="b")
+    found = storage.get_many([first.id, second.id, 999999])
+    assert set(found) == {first.id, second.id}
+    assert found[second.id].content == "b"
+    assert storage.get_many([]) == {}
+
+
+def test_get_many_ignores_unusable_ids(storage):
+    """id 可能来自界面或同步日志，混着 `None` / 字符串也不能炸。"""
+    item = _add(storage, content="a", hash="a")
+    found = storage.get_many([None, "abc", item.id, str(item.id), item.id])
+    assert set(found) == {item.id}
+
+
+def test_get_many_handles_more_ids_than_sqlite_variables(storage):
+    """超出 SQLite 变量上限时要分块，不能直接报错。
+
+    界面一次只会问几条，但这个方法会被通用地调用（比如补图、
+    按 id 列表取），一次几千条并不夸张；不分块就会撞上
+    `too many SQL variables`，而那时症状是「整批都取不到」。
+    """
+    ids = [_add(storage, content=f"c{index}", hash=f"h{index}").id for index in range(1200)]
+    found = storage.get_many(ids)
+    assert len(found) == 1200
+
+
 def test_search_chinese_and_english(storage):
     _add(storage, content="玲珑剪切板的历史记录", hash="a")
     _add(storage, content="another clipboard entry", hash="b")
