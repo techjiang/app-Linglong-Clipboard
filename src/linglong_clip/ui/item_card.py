@@ -22,24 +22,27 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.models import ClipboardItem
+from ..core.theme_spec import (  # noqa: F401 - 转出给既有调用方
+    DEFAULT_DENSITY,
+    DENSITY_OPTIONS,
+    DENSITY_VALUES,
+    density_option,
+    is_valid_density,
+    normalize_density,
+)
 from .theme import KIND_COLORS, Palette
 
 #: 卡片里预览文本显示的最大行数
 PREVIEW_LINES = 2
 
-#: 卡片密度：
-#: - comfortable（默认）三行完整信息：类型徽标 + 摘要 + 来源/时间/标签
-#: - compact 只保留类型徽标与摘要，把每行高度压到最小，一屏能多看几条
+#: 密度档位与它们的含义定义在 `core/theme_spec.py`（单一来源）：
+#: 卡片、设置页下拉、配置校验、`--ui-status` 读的都是那一份。
+#: 这里只保留两个惯用别名，避免既有调用方全线改名。
 #:
 #: 密度只影响**展示**，不影响任何采集/检索行为 —— 切换后历史一条不少，
 #: 只是列表看起来更密。
-DENSITY_COMFORTABLE = "comfortable"
+DENSITY_COMFORTABLE = DEFAULT_DENSITY
 DENSITY_COMPACT = "compact"
-
-
-def normalize_density(value: object) -> str:
-    """把配置值收敛到两个合法值，非法值退回默认。"""
-    return DENSITY_COMPACT if str(value or "").strip().lower() == DENSITY_COMPACT else DENSITY_COMFORTABLE
 
 
 def humanize_time(timestamp: float, *, now: Optional[float] = None) -> str:

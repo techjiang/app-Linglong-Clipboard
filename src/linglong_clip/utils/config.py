@@ -25,6 +25,42 @@ SCHEMA_VERSION = 1
 _MIGRATIONS: Dict[int, Callable[[Dict[str, Any]], Dict[str, Any]]] = {}
 
 
+def _normalize_values(raw: Dict[str, Any]) -> tuple:
+    """就地清洗「有取值集合的枚举型配置」，返回 `(数据, 改动说明)`。
+
+    与 `_MIGRATIONS` 的分工：迁移管的是**结构**变化（键挪位置、改名），
+    这里管的是**取值**不合法。两者都不能靠消费点兜底 —— 消费点兜底
+    只能保证程序不崩，配置文件里那个不存在的值会一直躺着：
+
+        "card_density": "超级紧凑"   ← 用户手工编辑 / 从旧版复制配置留下的
+
+    界面照常（显示成默认档位）、日志里一行警告都没有，只有把配置文件
+    打开才会发现。所以打开时清洗一次并落盘，用户下次再看就已经是合法值。
+    """
+    from ..core.theme_spec import (
+        DEFAULT_DENSITY,
+        density_issue,
+        normalize_density,
+    )
+
+    notes: List[str] = []
+    ui = raw.get("ui")
+    if isinstance(ui, dict) and "card_density" in ui:
+        current = ui.get("card_density")
+        issue = density_issue(current)
+        normalized = normalize_density(current)
+        # 判据是「归一之后和原来不一样」，不是「体检报了问题」：
+        # `"COMPACT"` 是合法档位（大小写不敏感），但留着两种写法意味着
+        # 后续任何比较都得多带一层归一。统一成小写，代价为零。
+        if issue or normalized != current:
+            ui["card_density"] = normalized
+            if issue:
+                notes.append(f"ui.card_density：{issue}（已改为 {normalized}）")
+            else:
+                notes.append(f"ui.card_density：{current!r} 已统一为 {normalized!r}")
+    return raw, notes
+
+
 DEFAULTS: Dict[str, Any] = {
     "capture": {
         "enabled": True,
@@ -224,9 +260,14 @@ class Config:
             # 顺序反了迁移函数看到的就不是最终形状的配置。
             expanded = _expand_flat_keys(raw)
             migrated = _migrate(expanded)
-            self._data = _deep_merge(DEFAULTS, migrated)
-            # 迁移过或补过默认值都要落盘，否则下次启动重复做同一件事
-            if migrated is not raw:
+            # 取值清洗排在迁移之后：迁移可能把键挪到别的位置，
+            # 顺序反了就会去清洗一个已经不存在的旧键位。
+            normalized, notes = _normalize_values(migrated)
+            self._data = _deep_merge(DEFAULTS, normalized)
+            for note in notes:
+                get_logger("config").warning("配置取值已修正：%s", note)
+            # 迁移过、清洗过、补过默认值都要落盘，否则下次启动重复做同一件事
+            if migrated is not raw or notes:
                 self.save()
 
     def save(self) -> None:

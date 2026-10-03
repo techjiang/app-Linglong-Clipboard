@@ -27,6 +27,7 @@ from ..core.ocr import build_engine as build_ocr_engine
 from ..core.privacy import PrivacyGuard
 from ..core.search_index import SearchIndex
 from ..core.semantic import SemanticEngine
+from ..core.theme_spec import DEFAULT_DENSITY
 from ..core.repository import open_repository
 from ..core.lan_sync import LanSync, build_lan_sync
 from ..core.sync import FolderSync, SyncCipher

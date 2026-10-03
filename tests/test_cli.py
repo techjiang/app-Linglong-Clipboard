@@ -1443,6 +1443,115 @@ def test_every_cli_flag_is_dispatched():
     assert not unknown, f"CLI_DEST_NAMES 里有不存在的参数：{sorted(unknown)}"
 
 
+# ---- 界面配置的实际口径（--ui-status）----
+
+
+def test_ui_status_reports_effective_density(cli_env, capsys):
+    assert main(["--ui-status"]) == 0
+    out = capsys.readouterr().out
+    assert "列表密度" in out
+    assert "实际使用" in out
+    # 可选档位要逐个列出来，否则用户不知道该填什么
+    assert "comfortable" in out and "compact" in out
+
+
+def test_ui_status_json_is_machine_readable(cli_env, capsys):
+    assert main(["--ui-status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["effective"] in ("comfortable", "compact")
+    assert payload["valid"] is True
+    assert payload["issue"] == ""
+    assert {item["value"] for item in payload["options"]} == {"comfortable", "compact"}
+
+
+def test_ui_status_flags_dirty_config_value(cli_env, capsys, home):
+    """配置里躺着一个不存在的档位时，命令要报出来并把文件改回合法值。
+
+    这是本轮缺陷的**回归闸门**：修复前这个值会被原样读出来、
+    `--ui-status` 也不存在，于是「界面显示成默认档位、配置里写着别的」
+    这件事没有任何地方能查。
+    """
+    from linglong_clip.utils.paths import config_path
+
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"ui": {"card_density": "超级紧凑"}, "meta": {"schema_version": 1}}),
+        encoding="utf-8",
+    )
+
+    code = main(["--ui-status"])
+    out = capsys.readouterr().out
+    # 清洗发生在打开配置时，所以这里报出来的是「实际使用」，
+    # 而文件里那个不存在的档位已经被改写 —— 不是任由它躺着。
+    assert code == 0
+    assert "实际使用" in out
+    assert json.loads(path.read_text(encoding="utf-8"))["ui"]["card_density"] == "comfortable"
+
+
+def test_ui_status_heals_value_written_after_load(cli_env, capsys, home):
+    """运行期间被 `set()` 写脏的值，下一次打开配置时同样会被改写。
+
+    清洗挂在**打开**这一步，而不是挂在消费点上：消费点每处都要兜底
+    （必须的，界面不能崩），但兜底救不了文件里的值。
+    一条命令就能验证这条链路 —— 写完脏值、再跑一次命令、看文件。
+    """
+    from linglong_clip.utils.config import Config
+    from linglong_clip.utils.paths import config_path
+
+    config = Config(config_path())
+    config.set("ui.card_density", "超级紧凑")
+    assert json.loads(config_path().read_text(encoding="utf-8"))["ui"]["card_density"] == "超级紧凑"
+
+    assert main(["--ui-status"]) == 0
+    assert "实际使用" in capsys.readouterr().out
+    assert json.loads(config_path().read_text(encoding="utf-8"))["ui"]["card_density"] == "comfortable"
+
+
+def test_ui_status_exit_code_is_one_when_issue_is_reported(cli_env, capsys, monkeypatch):
+    """体检结论不受清洗影响：报告说有问题就退 1。
+
+    清洗与报告是两件事 —— 清洗让文件变正确，但**这一次**读到的值确实
+    曾经是错的。把两者混成一件，就会出现「改了文件所以退出码永远是 0」，
+    脚本再也拿不到信号。
+    """
+    from linglong_clip.utils.config import Config
+
+    # 模拟「值仍不合法」的那一刻：清洗函数被跳过（比如它自己不认这个键）
+    monkeypatch.setattr(
+        Config, "get", lambda self, key, default=None: "乱填" if key == "ui.card_density" else default
+    )
+    assert main(["--ui-status"]) == 1
+    assert "不是有效" in capsys.readouterr().out
+
+
+def test_ui_status_never_crashes_on_garbage(cli_env, capsys, home):
+    """`config.json` 被手工改成非字符串也要能给出结论。
+
+    体检类是「最需要它的时候最不能挂」的命令：配置被写坏时用户第一个
+    会去跑的就是它。
+    """
+    from linglong_clip.utils.paths import config_path
+
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"ui": {"card_density": [1, 2, 3]}, "meta": {"schema_version": 1}}),
+        encoding="utf-8",
+    )
+    assert main(["--ui-status"]) == 0
+    assert "列表密度" in capsys.readouterr().out
+
+
+def test_ui_status_flag_skips_gui_dispatch(cli_env, monkeypatch):
+    from linglong_clip.ui import application as app_module
+
+    monkeypatch.setattr(
+        app_module, "Application", lambda *a, **k: (_ for _ in ()).throw(AssertionError("不该启动 GUI"))
+    )
+    assert main(["--ui-status"]) == 0
+
+
 def test_formats_flag_skips_gui_dispatch(cli_env, monkeypatch):
     from linglong_clip.ui import application as app_module
 

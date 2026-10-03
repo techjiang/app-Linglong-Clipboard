@@ -162,6 +162,21 @@ def main() -> int:
                 break
     _render(ui_dialog, OUT / "settings-interface.png")
 
+    # 设置页「界面」页：配置里躺着一个不存在的档位时的样子。
+    # 这一张要证的是「界面会当场说明」，而不是像以前那样显示成默认档位、
+    # 一个字都不提 —— 那种情况只有打开 config.json 才看得出来。
+    dirty_dialog = SettingsDialog(
+        _config({"ui.theme": "dark", "ui.card_density": "超级紧凑"}), automation
+    )
+    dirty_dialog.resize(760, 640)
+    dirty_tabs = dirty_dialog.findChild(QTabWidget)
+    if dirty_tabs is not None:
+        for index in range(dirty_tabs.count()):
+            if "外观" in dirty_tabs.tabText(index):
+                dirty_tabs.setCurrentIndex(index)
+                break
+    _render(dirty_dialog, OUT / "settings-density-invalid.png")
+
     # 设置页「隐私」：出站防护的状态提示（本平台有什么机制、清空几秒）
     privacy_dialog = SettingsDialog(_config({}), automation)
     privacy_dialog.resize(760, 700)

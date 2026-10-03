@@ -232,6 +232,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="审计配置项：找出「声明了但没有读取方」的空转配置（改了不生效的那些）",
     )
     diagnose.add_argument(
+        "--ui-status",
+        action="store_true",
+        help="看界面配置的实际口径（如列表密度：配置值、实际使用、可选档位）",
+    )
+    diagnose.add_argument(
         "--rules",
         action="store_true",
         help="列出自动化规则及其触发时机，并标出不会生效的那些",
@@ -1209,6 +1214,9 @@ def _run_cli(args: argparse.Namespace) -> int:
         storage.close()
         return 0 if report.healthy else 1
 
+    if args.ui_status:
+        return _run_ui_status(args, config)
+
     if args.rules:
         from .core.automation import AutomationEngine, describe_rules, format_rules
 
@@ -1469,6 +1477,27 @@ def _run_cli(args: argparse.Namespace) -> int:
     return -1  # 未命中任何 CLI 模式，交给 GUI
 
 
+def _run_ui_status(args: argparse.Namespace, config) -> int:
+    """界面配置的实际口径。
+
+    这一项回答的是「配置里写的、界面上显示的、实际生效的」是不是同一件事。
+    列表密度这种枚举型配置此前三处口径都不一致：配置里可以是任意字符串、
+    下拉里只有那个选项、消费点自己兜底 —— 而兜底是静默的，于是配置里
+    躺着一个不存在的档位时，谁也发现不了。
+    """
+    from .core.theme_spec import density_report, format_density
+
+    report = density_report(config.get("ui.card_density"))
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print("玲珑剪切板 · 界面配置")
+        print()
+        print(format_density(report))
+    # 退出码：0 配置合法 / 1 配置需要修正（与 --config-audit 一致，便于脚本判断）
+    return 0 if report["valid"] else 1
+
+
 def _run_selfcheck(args: argparse.Namespace) -> int:
     """原生能力自检。
 
@@ -1611,6 +1640,7 @@ CLI_DEST_NAMES = (
     "where",
     "selfcheck",
     "config_audit",
+    "ui_status",
     "rules",
     "privacy_audit",
     "redact",

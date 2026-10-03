@@ -35,9 +35,10 @@ from PySide6.QtWidgets import (
 from ..core import automation as auto_mod
 from ..core.models import ClipboardItem
 from ..core.semantic import SemanticEngine
+from ..core.theme_spec import DEFAULT_DENSITY
 from ..core.storage import Storage
 from ..utils.logger import get_logger
-from .item_card import ItemCard, humanize_size, humanize_time, normalize_density
+from .item_card import ItemCard, humanize_size, humanize_time, normalize_density  # noqa: F401
 from .theme import Palette, build_stylesheet, palette_for
 
 _log = get_logger("main-window")
@@ -260,8 +261,10 @@ class MainWindow(QWidget):
         self._connected_external: List[Any] = []
         # 先定主题再建控件：卡片的类型色条在构造时就要用到色板
         self._palette_theme = palette_for(self._config.get("ui.theme", "system"))
-        # 卡片密度：comfortable（三行）/ compact（两行、更矮）
-        self._density = normalize_density(self._config.get("ui.card_density", "comfortable"))
+        # 卡片密度：comfortable（三行）/ compact（两行、更矮）。
+        # 档位清单与兜底规则都在 `core/theme_spec`，这里只负责取用；
+        # 配置里的值合不合法由 `density_issue()` 报出，不在消费点悄悄吃掉。
+        self._density = normalize_density(self._config.get("ui.card_density", DEFAULT_DENSITY))
 
         self.setWindowTitle("玲珑剪切板")
         self.setMinimumSize(QSize(880, 560))
@@ -330,7 +333,12 @@ class MainWindow(QWidget):
         self.reload()
 
     def apply_density(self, density: str) -> None:
-        """切换卡片密度。密度在卡片构造时就定下，同样需要重建列表。"""
+        """切换卡片密度。密度在卡片构造时就定下，同样需要重建列表。
+
+        非法值在这里被收敛到默认档位，但**不会**由此回写配置 ——
+        配置的清洗发生在打开时的迁移里（见 `core/theme_spec.density_issue`），
+        否则「谁最后调用了这个函数」会决定配置文件长什么样。
+        """
         normalized = normalize_density(density)
         if normalized == self._density:
             return

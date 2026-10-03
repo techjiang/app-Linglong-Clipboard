@@ -31,6 +31,13 @@ from PySide6.QtWidgets import (
 from ..core.automation import Rule
 from ..core.models import KIND_LABELS
 from ..utils.logger import get_logger
+from ..core.theme_spec import (
+    DEFAULT_DENSITY,
+    DENSITY_OPTIONS,
+    describe_density,
+    density_issue,
+    normalize_density,
+)
 
 _log = get_logger("settings")
 
@@ -927,14 +934,29 @@ class SettingsDialog(QDialog):
         form.addRow("", self._fuzzy)
 
         self._density = QComboBox()
-        # data 存配置值，显示的是人话
-        self._density.addItem("舒适（三行信息）", "comfortable")
-        self._density.addItem("紧凑（两行，一屏更多）", "compact")
-        current_density = str(self._config.get("ui.card_density", "comfortable") or "")
-        index = self._density.findData(current_density)
+        # 选项文案与说明来自 `core/theme_spec` 的同一份清单，
+        # 不再在这里手写一遍 —— 两处各写一份，迟早出现「下拉里有的档位
+        # 界面不认」或者反过来。
+        for option in DENSITY_OPTIONS:
+            self._density.addItem(option.label, option.value)
+        current_density = self._config.get("ui.card_density", DEFAULT_DENSITY)
+        index = self._density.findData(normalize_density(current_density))
         self._density.setCurrentIndex(index if index >= 0 else 0)
         self._density.setToolTip("只影响列表显示密度，不影响采集与检索结果")
         form.addRow("列表密度", self._density)
+
+        # 配置里若躺着一个不存在的档位（手工编辑、旧版复制而来），
+        # 下拉会显示成默认档位 —— 必须当场说明，否则用户以为自己选的就是
+        # 配置里写的那个，而「这个档位其实不存在」这件事永远查不出来。
+        self._density_hint = QLabel()
+        self._density_hint.setWordWrap(True)
+        form.addRow("", self._density_hint)
+        self._refresh_density_hint(current_density)
+        self._density.currentIndexChanged.connect(
+            lambda: self._refresh_density_hint(
+                self._density.currentData(), checked=True
+            )
+        )
 
         self._hotkey = QLineEdit(str(self._config.get("ui.global_hotkey", "Ctrl+Shift+V")))
         form.addRow("唤起快捷键", self._hotkey)
@@ -965,6 +987,21 @@ class SettingsDialog(QDialog):
         layout.addWidget(group)
         layout.addStretch(1)
         return page
+
+    def _refresh_density_hint(self, value, *, checked: bool = False) -> None:
+        """说明当前这一档到底改了什么，以及配置值是否需要修正。
+
+        `checked=True` 表示用户刚在界面上改过：此时下拉里取的必然是合法值，
+        不需要再谈「配置值不合法」，但配置里那个脏值仍会显示出来 ——
+        它要等保存时才被覆盖，用户得知道眼下写的和看到的不一致。
+        """
+        issue = density_issue(value)
+        if issue and not checked:
+            self._density_hint.setText(
+                f"⚠ {issue}\n保存后会被改写为合法值。"
+            )
+            return
+        self._density_hint.setText(describe_density(self._density.currentData()))
 
     def _build_automation_tab(self) -> QWidget:
         page = QWidget()

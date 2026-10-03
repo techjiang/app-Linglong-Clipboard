@@ -775,6 +775,73 @@ def test_dialog_has_card_density_control(dialog, config):
     assert "ui.card_density" in dialog.changes
 
 
+def test_dialog_lists_density_options_from_single_source(config, qt_app):
+    """下拉里的档位来自 `core/theme_spec` 的同一份清单。
+
+    此前文案是手写在这个构造函数里的，与「哪些值合法」两处各写一份 ——
+    漏掉一档的表现是「配置里能存、下拉里选不出来」。
+    """
+    from linglong_clip.core.theme_spec import DENSITY_VALUES
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+
+    dialog = SettingsDialog(config, AutomationEngine(), {})
+    values = [dialog._density.itemData(i) for i in range(dialog._density.count())]
+    assert values == list(DENSITY_VALUES)
+
+
+def test_dialog_reports_dirty_density_in_config(home, qt_app):
+    """配置里存着一个不存在的档位时，设置页要当场说明。
+
+    下拉会显示成默认档位（合法），但用户以为自己选的就是配置里那个 ——
+    不说明的话，「这个档位其实不存在」永远查不出来。
+    """
+    import json as _json
+
+    from linglong_clip.core.theme_spec import DEFAULT_DENSITY
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    path = home / "config.json"
+    path.write_text(
+        _json.dumps({"ui": {"card_density": "超级紧凑"}, "meta": {"schema_version": 1}}),
+        encoding="utf-8",
+    )
+    config = Config(path)
+    # 打开时已被清洗成默认值 —— 这里模拟「用户手工把值改回去后重开设置」，
+    # 验证界面不会因为拿到了脏值而崩，但也不会假装它是合法的。
+    config.set("ui.card_density", "超级紧凑", persist=False)
+
+    dialog = SettingsDialog(config, AutomationEngine(), {})
+    assert dialog._density.currentData() == DEFAULT_DENSITY
+    assert "不是有效" in dialog._density_hint.text()
+
+
+def test_dialog_density_hint_explains_selected_option(dialog):
+    """用户改档位时，说明要跟着换成新档位的说明。"""
+    dialog._density.setCurrentIndex(dialog._density.findData("compact"))
+    hint = dialog._density_hint.text()
+    assert "紧凑" in hint
+    assert "两行" in hint
+
+
+def test_dialog_save_always_writes_a_catalog_value(config, qt_app):
+    """保存时写回去的必须是清单里的值，不能是下拉里那串文案。
+
+    守的是一类很容易犯的错：`currentData()` 与 `currentText()` 用混。
+    写进配置的是「紧凑（两行，一屏更多）」这种展示文案时，
+    界面上一切正常，但下次打开就落到默认档位 —— 而用户明明选过。
+    """
+    from linglong_clip.core.theme_spec import DENSITY_VALUES, is_valid_density
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+
+    dialog = SettingsDialog(config, AutomationEngine(), {})
+    for index in range(dialog._density.count()):
+        dialog._density.setCurrentIndex(index)
+        dialog._save()
+        assert is_valid_density(config.get("ui.card_density"))
+        assert config.get("ui.card_density") in DENSITY_VALUES
+
+
 def test_card_density_compact_shrinks_card(storage, config, qt_app):
     """compact 模式下卡片少一行元信息、外边距更小，高度应真的更矮。"""
     from linglong_clip.core.models import ClipboardItem
