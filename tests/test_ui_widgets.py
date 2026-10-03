@@ -1667,3 +1667,66 @@ def test_settings_image_fetch_warns_outside_lan_mode(qt_app, home, monkeypatch):
     dialog._run_image_fetch()
     assert "共享文件夹" in shown["text"]
     storage.close()
+
+
+# ---- 设置页：真实占用 ----
+
+
+def test_settings_shows_real_footprint(qt_app, home):
+    """设置页「历史存储」要显示真实磁盘占用，而不是主文件大小。
+
+    和「图片附件」那块是同一个理由：磁盘在涨而用户看不见。
+    只报主文件更糟 —— `history.db` 后面的 `-wal` 里装着尚未并入主库的
+    全部改动，它可能比主文件还大。
+    """
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.storage import Storage
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    store = Storage(home / "history.db")
+    for index in range(40):
+        store.add(
+            ClipboardItem(kind="text", content=f"内容 {index} " + "x" * 3000, preview=f"{index}")
+        )
+
+    dialog = SettingsDialog(Config(home / "config.json"))
+    text = dialog._storage_size.text()
+    assert "统计中" not in text
+    assert "尚无" not in text
+    # 有伴随文件时要把「主库 + 待合并」拆开说
+    assert "主库" in text
+    assert "待合并" in text
+    store.close()
+
+
+def test_settings_footprint_without_history(qt_app, home):
+    """没有历史文件时说「尚无历史文件」，不谎报 0。"""
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    dialog = SettingsDialog(Config(home / "config.json"))
+    assert "尚无历史文件" in dialog._storage_size.text()
+
+
+def test_settings_footprint_follows_configured_backend(qt_app, home):
+    """显示的是**配置里选的后端**的占用，不是当前打开的那个。
+
+    用户在这里改的是「下次启动用哪个」，两边搞混会得到一个看着对、
+    其实说的不是同一件事的数字。
+    """
+    import json as _json
+
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    config.set("storage.backend", "json")
+    json_path = home / ".clipboard" / "clipboard.json"
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(_json.dumps({"version": 1, "items": []}), encoding="utf-8")
+
+    dialog = SettingsDialog(config)
+    assert dialog._storage_size.text() != "尚无历史文件"
+    # JSON 单文件没有伴随文件，不该出现「待合并」
+    assert "待合并" not in dialog._storage_size.text()

@@ -1178,7 +1178,7 @@ linglong-clipboard --get 12                  # 输出第 12 条完整内容
 linglong-clipboard --list --json             # JSON 输出，便于脚本处理
 linglong-clipboard --stats                   # 统计与检索能力
 linglong-clipboard --clear                   # 清理未固定记录
-linglong-clipboard --compact                 # 压缩数据库
+linglong-clipboard --compact                 # 压缩数据库（真的会收回磁盘）
 linglong-clipboard --merge-duplicates        # 合并重复内容（保留复制次数）
 linglong-clipboard --recanonicalize          # 按归一规则重算历史指纹
 linglong-clipboard --normalize '<文本>'      # 预览归一结果（排查为何没合并）
@@ -1314,8 +1314,31 @@ $ linglong-clipboard --config-audit
 
 | 存储方式 | 文件 | 适合谁 |
 | --- | --- | --- |
-| SQLite（默认） | `history.db` | 记录上万条以上、在意检索速度 |
+| SQLite（默认） | `history.db` **+ `history.db-wal`** | 记录上万条以上、在意检索速度 |
 | JSON 单文件 | `.clipboard/clipboard.json` | 想看数据长什么样、拷一个文件就搬走 |
+
+**SQLite 的历史不止一个文件。** 数据库跑在 WAL 模式下，主库后面还跟着：
+
+| 文件 | 是什么 | 什么时候消失 |
+| --- | --- | --- |
+| `history.db` | 主库 | —— |
+| `history.db-wal` | **尚未并入主库的全部改动 —— 内容就在这里** | 合并（checkpoint）后清零 |
+| `history.db-shm` | WAL 的共享内存索引 | 最后一个连接关闭时 |
+
+所以「`history.db` 多大」从来不是「历史占了多少磁盘」。`--stats` 与
+`--storage-status` 报的都是**三个文件加起来**的真实占用，和 `du` 对得上：
+
+```
+$ linglong-clipboard --stats
+记录总数：300
+历史占用：6.7 MB（主库 2.6 MB + 待合并 4.1 MB）
+全文检索：FTS5（trigram）
+```
+
+顺带说清 `--compact`：它现在会真的把磁盘收回去。此前它先做 checkpoint、
+再做 `VACUUM`，而 `VACUUM` 自己产生的改动会立刻写出一份新的 WAL ——
+终端说「数据库已压缩」，占用却几乎没变。把两步换个顺序就好了，
+代价是一行代码、收益是那个命令终于名实相符。
 
 数据目录按平台约定：
 

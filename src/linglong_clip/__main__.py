@@ -301,13 +301,22 @@ def _apply_storage_switch(args, config) -> int:
         return _migrate_storage(previous_backend=previous_backend, config=config)
 
     if args.storage_status:
+        from .core import storage_files
+
         backend = str(config.get("storage.backend", "sqlite") or "sqlite")
         target = json_path() if backend == "json" else database_path()
+        # SQLite 的历史**不是单个文件**：WAL 模式下 `-wal` 里装着尚未并入主库
+        # 的全部改动，`-shm` 在进程没退出时存在。只报主文件会让同一个数字
+        # 在 `--stats` 与 `du` 之间差一倍，用户无从判断该不该清理历史。
+        footprint = storage_files.measure(target)
         payload = {
             "backend": backend,
             "path": str(target),
             "exists": target.exists(),
-            "size": target.stat().st_size if target.exists() else 0,
+            "size": footprint.total_bytes,
+            "main_size": footprint.main_bytes,
+            "companion_size": footprint.companion_bytes,
+            "files": [entry.as_dict() for entry in footprint.files],
             "sqlite_path": str(database_path()),
             "json_path": str(json_path()),
         }
@@ -317,8 +326,17 @@ def _apply_storage_switch(args, config) -> int:
         label = "JSON 单文件" if backend == "json" else "SQLite 数据库"
         print(f"存储方式：{label}")
         print(f"历史文件：{target}{'' if target.exists() else '（尚未创建）'}")
-        if target.exists():
-            print(f"文件大小：{target.stat().st_size / 1024:.1f} KB")
+        if footprint.exists:
+            print(f"文件大小：{storage_files.format_bytes(footprint.total_bytes)}")
+            if footprint.companion_bytes:
+                # 逐个数出来，用户才能把「这个 -wal 是谁建的」对上号
+                names = "、".join(
+                    entry.name for entry in footprint.files if entry.companion
+                )
+                print(
+                    f"          其中 {storage_files.format_bytes(footprint.companion_bytes)}"
+                    f" 在 {names}（尚未并入主库的改动，启动时会自动合并）"
+                )
         other = database_path() if backend == "json" else json_path()
         if other.exists():
             print(f"另一种存储也有数据：{other}（可用 --storage-migrate 合并）")
@@ -433,6 +451,59 @@ def _print_items(items, *, as_json: bool, plain: bool, limit: int) -> None:
             f"{str(item.id):>5}  [{markers}] {stamp}  {item.kind_label:<4} "
             f"{count} {preview}"
         )
+
+
+def _footprint_line(stats: dict) -> str:
+    """一行说清「这份历史真实占了磁盘多少」。
+
+    主角是**总占用**，不是主文件大小 —— 只报主文件会少报 WAL 那一大截，
+    而用户正是拿这个数字决定要不要清理历史。
+    """
+    from .core import storage_files
+
+    info = stats.get("storage_files") or {}
+    total = int(info.get("bytes", stats.get("db_size") or 0))
+    companion = int(info.get("companion_bytes") or 0)
+    if not info.get("exists"):
+        return f"{storage_files.format_bytes(total)}（尚未创建）"
+    if companion:
+        return (
+            f"{storage_files.format_bytes(total)}"
+            f"（主库 {storage_files.format_bytes(int(info.get('main_bytes') or 0))}"
+            f" + 待合并 {storage_files.format_bytes(companion)}）"
+        )
+    return storage_files.format_bytes(total)
+
+
+def _footprint_details(stats: dict) -> list:
+    """占用里「哪些是能收回的」那几行。没有可说的就返回空列表。
+
+    两种「能收回」要分开讲，因为处理方式不同：
+
+    - WAL 里有改动没并进主库 → 跑一次自动合并即可，不需要 `VACUUM`
+    - 主库本身有空洞（删过大量记录）→ 需要 `VACUUM` 重建
+    """
+    from .core import storage_files
+
+    info = stats.get("storage_files") or {}
+    if not info.get("exists"):
+        return []
+    lines = []
+    companion = int(info.get("companion_bytes") or 0)
+    main_bytes = int(info.get("main_bytes") or 0)
+    # 几百字节的 shm 是恒有的，小到可以忽略时报出来只会让人疑神疑鬼
+    if companion > max(64 * 1024, main_bytes * 0.05):
+        lines.append(
+            f"          其中 {storage_files.format_bytes(companion)} 是尚未并入主库的改动"
+            "（下次启动或 --compact 会自动合并）"
+        )
+    holes = int(info.get("reclaimable_bytes") or 0)
+    if holes > 0:
+        lines.append(
+            f"          另有约 {storage_files.format_bytes(holes)} 是删过记录留下的空洞"
+            "，可用 --compact 收回"
+        )
+    return lines
 
 
 def _image_status(storage) -> dict:
@@ -929,7 +1000,9 @@ def _run_cli(args: argparse.Namespace) -> int:
             print(json.dumps(stats, ensure_ascii=False, indent=2))
         else:
             print(f"记录总数：{stats['items']}")
-            print(f"数据库大小：{stats['db_size'] / 1024:.1f} KB")
+            print(f"历史占用：{_footprint_line(stats)}")
+            for extra in _footprint_details(stats):
+                print(extra)
             print(f"全文检索：{'FTS5（' + stats['tokenizer'] + '）' if stats['fts'] else '未启用（退化为模糊匹配）'}")
             if stats["kinds"]:
                 print("类型分布：")

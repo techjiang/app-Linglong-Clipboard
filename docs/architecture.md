@@ -342,6 +342,27 @@ items_fts(content, preview, source_app, tags)   -- external content 表
 - **图片落盘策略**：PNG 存 `images/`，数据库只存相对路径；
   按内容哈希命名，同一张图重复复制只落一份文件。
 
+#### WAL：历史不止一个文件
+
+数据库跑在 `journal_mode=WAL` 下，所以「历史占了多少磁盘」不是
+`stat("history.db")`。主库后面还跟着两个文件，其中 `-wal` **装着内容**：
+
+| 文件 | 是什么 | 什么时候消失 |
+| --- | --- | --- |
+| `history.db` | 主库 | —— |
+| `history.db-wal` | 尚未 checkpoint 的全部改动 | 合并后清零 |
+| `history.db-shm` | WAL 的共享内存索引 | 最后一个连接关闭时 |
+
+早先只报主文件，结果同一个数字在两条路径上差一倍（实测 300 条记录：
+报 2.6 MB、磁盘上 6.7 MB），而用户正是拿它决定要不要清理历史。
+现在统一走 `core/storage_files.measure()`，`stats()['db_size']` 是总占用，
+`storage_files` 给出按文件的归因。两个后端这组键必须完全一致。
+
+`optimize()` 的顺序也有讲究：**先 `VACUUM` 再 `wal_checkpoint(TRUNCATE)`**。
+反过来会让 `VACUUM` 的改动立刻写出一份新 WAL，于是「数据库已压缩」
+打完收工、占用却几乎没变。也不在这里 `close()` ——
+`_closed` 置上之后，收尾和界面定时器拿到的是空历史。
+
 ### JSON 后端
 
 格式刻意做成一眼能读、能手改：空字段不落盘，中文不转义，

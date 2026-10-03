@@ -86,6 +86,33 @@ get_meta / set_meta / optimize / stats / close
 
 `tests/test_repository.py` 的用例可以照着抄一份给新后端。
 
+### 报告「历史占了多少磁盘」
+
+一个 SQLite 库从来不只是「那个 `.db` 文件」。所以**不要直接
+`stat()` 主文件**，走 `core/storage_files.measure()` / `format_bytes()`：
+
+- **WAL 模式下 `history.db-wal` 装着尚未并入主库的全部改动**，`-shm` 在
+  进程没退出时存在。只 stat 主文件会让同一个数字在 `--stats` 与 `du`
+  之间差一倍 —— 而用户正是拿它决定要不要清理历史。实测 300 条记录：
+  报「2.6 MB」，磁盘上躺着 6.7 MB。
+- **`stats()` 的 `db_size` 是总占用**，另有 `storage_files` 给出按文件的
+  归因（`main_bytes` / `companion_bytes` / `files` / `reclaimable_bytes`）。
+  两个后端的这组键**必须完全一致**（见 `StorageFootprint.DICT_KEYS`）：
+  JSON 单文件没有「空洞」的概念，但那个键仍要在、值为 0 ——
+  「没有这个概念」与「有、现在是 0」对调用方不该是两件事，否则它就得写分支。
+- **伴随文件按后缀精确匹配**，不能用 `glob("history.db*")`：用户目录里
+  出现 `history.db-wal-old`、`history.db-bak` 是很自然的，算进来会让占用虚高。
+- **`measure()` 不许抛异常**。取不到大小的文件按「不存在」处理而不是记
+  0 字节 —— 一个 0 字节的 `-wal` 会被下游当成「WAL 已清空」，而事实是
+  「我们不知道它在不在」。用户跑 `--stats` 往往正是因为磁盘出状况。
+- **`--compact` 的顺序是先 `VACUUM` 再 `wal_checkpoint(TRUNCATE)`，不能反过来。**
+  先 checkpoint 的话，`VACUUM` 自己产生的改动会立刻写出一份新 WAL，
+  用户看到的是「说压缩了、占用一点没动」。也不要顺手 `close()` 来清 WAL：
+  `_closed` 一旦置上，后面找上来的调用方（收尾、界面定时器）拿到的是空历史。
+  回归闸门：`tests/test_storage_files.py::test_optimize_shrinks_measured_footprint`
+  与 `tests/test_cli.py::test_compact_actually_shrinks` —— 断言的是
+  **测出来的占用变小**，不是「调用过 VACUUM」（后者两种写法都能过）。
+
 ### 新增转换器
 
 在 `core/automation.py` 里写一个纯函数，然后注册进 `_build_registry()`：

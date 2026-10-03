@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..utils.logger import get_logger
-from . import image_store
+from . import image_store, storage_files
 from .models import ClipboardItem, content_hash
 from .normalize import canonical_key
 
@@ -779,12 +779,17 @@ class JsonRepository:
         self.save()
 
     def stats(self) -> Dict[str, Any]:
-        size = self.path.stat().st_size if self.path.exists() else 0
+        # JSON 后端只有一份文件，但走同一个测量入口：两边形状一致，
+        # 调用方（CLI / 设置页）不必区分「这个后端有没有伴随文件」。
+        footprint = storage_files.measure(self.path)
         return {
             "items": self.count(),
             "kinds": self.count_by_kind(),
             "sources": self.top_sources(5),
-            "db_size": size,
+            "db_size": footprint.total_bytes,
+            # JSON 单文件没有「删过记录留下的空洞」这个概念（整份重写），
+            # 所以可回收量恒为 0 —— 但键要在，见 `StorageFootprint.DICT_KEYS`
+            "storage_files": footprint.as_dict(),
             "fts": False,
             "tokenizer": "json-scan",
             "backend": "json",

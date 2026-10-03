@@ -1748,3 +1748,165 @@ def test_sync_images_flag_is_dispatched_not_gui(cli_env, monkeypatch, capsys):
     monkeypatch.setattr("linglong_clip.__main__._run_gui", fake_gui, raising=False)
     main(["--sync-images"])
     assert "gui" not in called
+
+
+# ---- 真实磁盘占用 ----
+
+
+def test_stats_reports_real_footprint(home, capsys):
+    """`--stats` 报的必须是磁盘真实占用，不是主文件大小。
+
+    用户拿这个数字决定要不要清理历史，而 SQLite 在 WAL 模式下
+    `-wal` 里装着尚未并入主库的全部改动 —— 只 stat 主文件会少报一大截，
+    与 `du` 对不上。这条用例把「CLI 说的话」和「磁盘上的事实」钉在一起。
+    """
+    import os
+    from pathlib import Path
+
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.storage import Storage
+
+    store = Storage(home / "history.db")
+    for index in range(60):
+        store.add(
+            ClipboardItem(kind="text", content=f"内容 {index} " + "x" * 2000, preview=f"{index}")
+        )
+    # 先关掉连接：CLI 是另一个进程，它看到的只会有「已关闭的连接」那一份。
+    # 拿带 WAL 的现场去比会自欺欺人 —— 两边根本不在同一个时刻。
+    store.close()
+    disk = sum(
+        os.stat(p).st_size for p in Path(home).glob("history.db*") if p.is_file()
+    )
+
+    assert main(["--stats", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["db_size"] == payload["storage_files"]["bytes"]
+    # 量级要对得上。不写等号是因为 `--stats` 自己会打开一次库，
+    # 那次打开会往 WAL 里补一点东西 —— 差几十字节是正常的，
+    # 而旧实现（只 stat 主文件）会差出几倍。
+    assert abs(payload["db_size"] - disk) < 64 * 1024
+
+
+def test_stats_text_says_where_the_bytes_are(home, capsys):
+    """文本输出要能看出「主库之外还有多少」。"""
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.storage import Storage
+
+    store = Storage(home / "history.db")
+    for index in range(60):
+        store.add(
+            ClipboardItem(kind="text", content=f"内容 {index} " + "x" * 2000, preview=f"{index}")
+        )
+    assert main(["--stats"]) == 0
+    out = capsys.readouterr().out
+    assert "历史占用：" in out
+    store.close()
+
+
+def test_storage_status_reports_companion_files(home, capsys):
+    """`--storage-status` 要报出 WAL / shm，以及它们各占多少。"""
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.storage import Storage
+
+    store = Storage(home / "history.db")
+    for index in range(60):
+        store.add(
+            ClipboardItem(kind="text", content=f"内容 {index} " + "x" * 2000, preview=f"{index}")
+        )
+
+    assert main(["--storage-status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["size"] == payload["main_size"] + payload["companion_size"]
+    names = {entry["name"] for entry in payload["files"]}
+    assert "history.db" in names
+    assert "history.db-wal" in names
+
+    assert main(["--storage-status"]) == 0
+    out = capsys.readouterr().out
+    assert "history.db-wal" in out
+    store.close()
+
+
+def test_storage_status_without_a_database(home, capsys):
+    """库还没建时不谎报 0 字节，而是说「尚未创建」。"""
+    assert main(["--storage-status"]) == 0
+    assert "尚未创建" in capsys.readouterr().out
+
+
+def test_compact_actually_shrinks(home, capsys):
+    """`--compact` 之后占用必须真的变小。
+
+    此前 `VACUUM` 排在 checkpoint **之后**，它自己产生的改动会立刻写一份
+    新 WAL —— 终端打印「数据库已压缩」，占用却几乎没变。
+    断言结果而不是「调用了 VACUUM」：那种写法同样会执行那些语句。
+    """
+    from pathlib import Path
+
+    from linglong_clip.core import storage_files
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.storage import Storage
+
+    store = Storage(home / "history.db")
+    for index in range(200):
+        store.add(
+            ClipboardItem(kind="text", content=f"内容 {index} " + "x" * 3000, preview=f"{index}")
+        )
+    store.delete_many([item.id for item in store.list(limit=1000)][:150])
+    store.close()
+
+    before = storage_files.measure(Path(home) / "history.db").total_bytes
+    assert main(["--compact"]) == 0
+    capsys.readouterr()
+    after = storage_files.measure(Path(home) / "history.db").total_bytes
+    assert after < before
+
+
+def test_stats_flags_reclaimable_holes(home, capsys):
+    """删过大量记录之后，`--stats` 要指出「空洞可用 --compact 收回」。"""
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.storage import Storage
+
+    store = Storage(home / "history.db")
+    for index in range(200):
+        store.add(
+            ClipboardItem(kind="text", content=f"内容 {index} " + "x" * 3000, preview=f"{index}")
+        )
+    store.delete_many([item.id for item in store.list(limit=1000)][:180])
+    store.close()
+
+    assert main(["--stats"]) == 0
+    out = capsys.readouterr().out
+    assert "--compact" in out
+
+    assert main(["--stats", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["storage_files"]["reclaimable_bytes"] > 0
+
+
+def test_stats_counts_wal_of_a_live_database(home, capsys):
+    """库正在被写入（WAL 里还有东西）时，WAL 必须被算进占用。
+
+    这是本轮修掉的那个偏小的数字：只 stat 主文件时，用户看到的
+    是「2.6 MB」，而磁盘上真实躺着 6.7 MB。
+    """
+    from pathlib import Path
+
+    from linglong_clip.core import storage_files
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.storage import Storage
+
+    store = Storage(home / "history.db")
+    for index in range(60):
+        store.add(
+            ClipboardItem(kind="text", content=f"内容 {index} " + "x" * 2000, preview=f"{index}")
+        )
+    # 此刻 WAL 里还有未合并的改动
+    footprint = storage_files.measure(Path(home) / "history.db")
+    assert footprint.companion_bytes > 0
+    assert footprint.total_bytes > footprint.main_bytes
+
+    # 同一个进程里直接问 stats()，拿到的就是这份（含 WAL）
+    stats = store.stats()
+    assert stats["db_size"] == footprint.total_bytes
+    assert stats["storage_files"]["companion_bytes"] == footprint.companion_bytes
+    store.close()

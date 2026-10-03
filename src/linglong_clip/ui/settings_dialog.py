@@ -1100,6 +1100,14 @@ class SettingsDialog(QDialog):
         path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         form.addRow("存放位置", path_label)
 
+        # 真实占用。和「图片附件」那块是同一个理由：磁盘在涨而用户看不见 ——
+        # 只报主文件更糟，`history.db` 后面的 `-wal` 里装着尚未并入主库的
+        # 全部改动，它可能比主文件还大。
+        self._storage_size = QLabel("统计中…")
+        self._storage_size.setWordWrap(True)
+        form.addRow("占用", self._storage_size)
+        self._refresh_storage_size()
+
         self._storage_hint = QLabel()
         self._storage_hint.setWordWrap(True)
         form.addRow("", self._storage_hint)
@@ -1296,6 +1304,34 @@ class SettingsDialog(QDialog):
         if outcome.truncated:
             lines.append("达到单次上限提前停下，再点一次可以继续")
         QMessageBox.information(self, "取图完成", "\n".join(lines))
+
+    def _refresh_storage_size(self) -> None:
+        """显示当前后端的真实磁盘占用（含 SQLite 的 WAL / shm）。
+
+        按**配置里选的后端**去测量，而不是打开的那个 —— 用户在这里改的是
+        「下次启动用哪个」，两边搞混会得到一个看着对、其实说的不是同一件事
+        的数字。测量本身不打开数据库，所以随时可跑。
+        """
+        from ..core import storage_files
+        from ..utils.paths import database_path, json_path
+
+        backend = str(self._config.get("storage.backend", "sqlite") or "sqlite")
+        target = json_path() if backend == "json" else database_path()
+        try:
+            footprint = storage_files.measure(target)
+        except Exception:  # noqa: BLE001 - 统计失败不该让设置页打不开
+            self._storage_size.setText("当前无法统计")
+            return
+        if not footprint.exists:
+            self._storage_size.setText("尚无历史文件")
+            return
+        text = storage_files.format_bytes(footprint.total_bytes)
+        if footprint.companion_bytes:
+            text += (
+                f"（主库 {storage_files.format_bytes(footprint.main_bytes)}"
+                f" + 待合并 {storage_files.format_bytes(footprint.companion_bytes)}）"
+            )
+        self._storage_size.setText(text)
 
     def _refresh_storage_hint(self) -> None:
         is_json = self._storage_backend.currentData() == "json"

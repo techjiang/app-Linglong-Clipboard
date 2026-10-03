@@ -17,7 +17,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from ..utils.logger import get_logger
 from ..utils.paths import data_dir
-from . import image_store
+from . import image_store, storage_files
 from .models import ClipboardItem, content_hash
 from .normalize import canonical_key
 
@@ -78,6 +78,19 @@ def _order_sql(alias: str = "") -> str:
 
 
 _ORDER_SQL = _order_sql()
+
+
+
+def _footprint_dict(footprint, connection=None) -> Dict[str, Any]:
+    """把占用信息整理成给 CLI / 设置页的形状，顺带带上可回收量。
+
+    连接关了（`_usable()` 为假）时不去碰它 —— 那时读 `freelist_count`
+    会抛。字段仍然存在、值为 0：调用方不该为了「连接还在不在」写分支。
+    """
+    reclaimable = 0
+    if connection is not None:
+        reclaimable = storage_files.reclaimable_bytes(connection)
+    return footprint.as_dict(reclaimable=reclaimable)
 
 
 class Storage:
@@ -862,23 +875,44 @@ class Storage:
         return row["value"] if row else default
 
     def optimize(self) -> None:
+        """回收磁盘占用。
+
+        顺序有两处讲究，都是实测出来的：
+
+        **一、先 `VACUUM` 再 `wal_checkpoint(TRUNCATE)`，不能反过来。**
+        先 checkpoint 的情况下，`VACUUM` 自己产生的改动会立刻写一份新 WAL ——
+        实测 300 条记录：先 checkpoint 后 VACUUM，主库 4.4MB + WAL 4.5MB；
+        反过来只有主库 1.6MB 加几十字节的 WAL。
+        用户看到的差别是「终端说压缩了，占用一点没变」。
+
+        **二、`close()` 这里不调用。** 关连接会顺带把 WAL 清干净，看起来更彻底，
+        但 `Storage.close()` 还会置上 `_closed`，而后面仍有调用方会来找上来
+        （`finally` 里的收尾、界面上的定时器）—— 那之后它们拿到的是「空历史」。
+        磁盘上的清扫有一条便宜的兜底：WAL 里没有未 checkpoint 的内容时，
+        最后一个连接关闭会自动删掉 `-wal` / `-shm`。主库本身也已经整理过了。
+        """
         if not self._usable():
             return
         with self._lock:
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             self._conn.execute("VACUUM")
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             self._conn.commit()
 
     def stats(self) -> Dict[str, Any]:
-        size = self.path.stat().st_size if self.path.exists() else 0
+        footprint = storage_files.measure(self.path)
         if not self._usable():
-            return {"items": 0, "kinds": {}, "sources": [], "db_size": size,
+            return {"items": 0, "kinds": {}, "sources": [], "db_size": footprint.total_bytes,
+                    "storage_files": footprint.as_dict(),
                     "fts": False, "tokenizer": "", "closed": True}
         return {
             "items": self.count(),
             "kinds": self.count_by_kind(),
             "sources": self.top_sources(5),
-            "db_size": size,
+            # 真实占用 = 主库 + WAL/journal/shm。只报主文件会少报一大截，
+            # 而且与 `du` 对不上 —— 用户正是拿这个数字决定要不要清理历史。
+            "db_size": footprint.total_bytes,
+            "storage_files": _footprint_dict(footprint, self._conn),
+
             "fts": self.fts_enabled,
             "tokenizer": self.fts_tokenizer,
         }
