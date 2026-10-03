@@ -1,0 +1,886 @@
+"""JSON 单文件存储：把历史记录落到 `<数据目录>/.clipboard/clipboard.json`。
+
+与 `storage.Storage`（SQLite）的关系是**并列**而非替代：两者实现同一组方法，
+`Application` 与 CLI 按配置选一个用，上层代码不需要知道底下是哪种落盘方式。
+
+为什么要有它：
+
+- 用户对「我的数据长什么样」有知情权。SQLite 文件打开是一堆二进制，
+  而 JSON 文本可以直接看、直接备份、直接粘到另一台机器。
+- 便携场景（U 盘、同步盘）下，拷一个文本文件比连带 `-wal`/`-shm` 三个文件省心。
+- DB 文件损坏时只能整库丢，JSON 里其余字段还能人工抢救。
+
+取舍与代价（都写清楚，不藏着）：
+
+- **每次写入重写整份文件**。剪贴板采集是秒级低频操作，几 MB 的文件重写无感；
+  但记录量到十万级时这是错误的存储选择，那时应当用 SQLite。
+- **检索退化为进程内扫描 + 打分**。没有 FTS5，就没有 BM25；
+  这里用「子串命中 + 字段权重」近似，够用于几千条记录。
+- **图片内联成 data URI 而不是另存文件**。单文件才谈得上「一个文件搬走就完事」；
+  代价是体积膨胀（base64 约 +33%），所以默认把单张图压到 1.5MB 以内再内联。
+
+写入一律「临时文件 + 原子替换」：进程被 Ctrl+C 打断也不会留下半截 JSON，
+这是相比直接 `write_text` 唯一值得多写十行的理由。
+"""
+
+from __future__ import annotations
+
+import base64
+import copy
+import json
+import os
+import re
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from ..utils.logger import get_logger
+from . import image_store, storage_files
+from .models import ClipboardItem, content_hash
+from .normalize import canonical_key
+
+_log = get_logger("jsonstore")
+
+#: 落盘格式版本，将来结构变更时用它做迁移判断
+SCHEMA_VERSION = 1
+
+#: 内联图片前允许的最大字节数，超过则放弃内联（只留尺寸信息）
+MAX_INLINE_IMAGE_BYTES = 2 * 1024 * 1024
+
+#: `source_app` 等字段在检索时的权重，用来近似 FTS 的相关度
+_FIELD_WEIGHTS = (("content", 3.0), ("preview", 2.0), ("tags", 1.5), ("source_app", 1.0))
+
+_MIME_BY_SUFFIX = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "webp": "image/webp",
+    "bmp": "image/bmp",
+    "gif": "image/gif",
+}
+
+
+def is_data_uri(value: str) -> bool:
+    return bool(value) and value.startswith("data:") and ";base64," in value
+
+
+def split_data_uri(uri: str) -> Tuple[str, str]:
+    """把 `data:image/png;base64,xxxx` 拆成 `(mime, base64 载荷)`。"""
+    header, _, payload = uri.partition(",")
+    mime = header[5:].split(";")[0] or "image/png"
+    return mime, payload
+
+
+def suffix_for_mime(mime: str) -> str:
+    for suffix, candidate in _MIME_BY_SUFFIX.items():
+        if candidate == mime:
+            return suffix
+    return "png"
+
+
+def encode_file_as_data_uri(path: Path, *, max_bytes: int = MAX_INLINE_IMAGE_BYTES) -> Optional[str]:
+    """把图片文件读成 data URI；读不了或超限时返回 None（调用方保留原路径）。"""
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        _log.debug("图片读取失败 %s: %s", path, exc)
+        return None
+    if len(raw) > max_bytes:
+        _log.info("图片 %.1fMB 超过内联上限，仅保留本地路径", len(raw) / 1024 / 1024)
+        return None
+    mime = _MIME_BY_SUFFIX.get(path.suffix.lstrip(".").lower(), "image/png")
+    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+
+
+class JsonRepository:
+    """以单个 JSON 文件为后端的剪贴板历史仓库。
+
+    公开方法与 `Storage` 对齐，因此两者可互换。
+    """
+
+    def __init__(self, path: Optional[Path] = None, *, autosave: bool = True) -> None:
+        from ..utils.paths import json_path
+
+        self.path = Path(path) if path else json_path()
+        self.autosave = autosave
+        self._lock = threading.RLock()
+        self._items: Dict[int, ClipboardItem] = {}
+        self._meta: Dict[str, str] = {}
+        self._next_id = 1
+        #: 图片相对路径 -> data URI，用于 `Storage.images_dir` 之外的第二来源
+        self._images: Dict[str, str] = {}
+        self._dirty = False
+        #: 是否已 `close()`。关闭后再来的写入一律忽略：`close()` 本身会落盘，
+        #: 之后再写只会凭空多出一次文件操作，而持久化任务（限时清空、退出
+        #: 收尾）本来就可能晚一步到达。
+        self._closed = False
+        self._load()
+
+    # ---- 落盘格式 ----
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            self._write()  # 先落一份空骨架，让用户能立刻看到文件在哪
+            return
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _log.warning("JSON 历史损坏，已另存备份并重新开始: %s", exc)
+            self._backup_broken()
+            self._write()
+            return
+
+        if not isinstance(raw, dict):
+            _log.warning("JSON 历史结构不是对象，按空历史处理")
+            self._write()
+            return
+
+        for entry in raw.get("items") or []:
+            if not isinstance(entry, dict):
+                continue
+            item = self._from_json(entry)
+            if item is None:
+                continue
+            self._items[item.id] = item
+            self._next_id = max(self._next_id, item.id + 1)
+        meta = raw.get("meta")
+        if isinstance(meta, dict):
+            self._meta = {str(key): str(value) for key, value in meta.items()}
+
+    def _backup_broken(self) -> None:
+        target = self.path.with_suffix(".json.broken")
+        try:
+            self.path.replace(target)
+        except OSError as exc:
+            _log.debug("损坏文件备份失败: %s", exc)
+
+    def _to_json(self, item: ClipboardItem) -> Dict[str, Any]:
+        """序列化一条记录；对空值省略键，让文件保持人类可读。"""
+        payload: Dict[str, Any] = {
+            "id": item.id,
+            "kind": item.kind,
+            "content": item.content,
+            "created_at": round(float(item.created_at), 3),
+        }
+        for key, value in (
+            ("preview", item.preview),
+            ("html", item.html),
+            ("rtf", item.rtf),
+            ("source_app", item.source_app),
+            ("source_title", item.source_title),
+            ("hash", item.hash),
+            ("device", item.device),
+        ):
+            if value:
+                payload[key] = value
+        for key, value in (
+            ("image_width", item.image_width),
+            ("image_height", item.image_height),
+            ("size", item.size),
+            ("use_count", item.use_count),
+        ):
+            if value:
+                payload[key] = value
+        if item.used_at:
+            payload["used_at"] = round(float(item.used_at), 3)
+        for key, value in (
+            ("pinned", item.pinned),
+            ("favorite", item.favorite),
+            ("sensitive", item.sensitive),
+        ):
+            if value:
+                payload[key] = bool(value)
+        if item.files:
+            payload["files"] = list(item.files)
+        if item.tags:
+            payload["tags"] = list(item.tags)
+        if item.metadata:
+            payload["metadata"] = item.metadata
+
+        image = self._image_field(item)
+        if image:
+            payload["image"] = image
+        return payload
+
+    def _image_field(self, item: ClipboardItem) -> str:
+        """返回可供落盘/还原的图片来源：data URI 或相对路径。"""
+        if not item.image_path:
+            return ""
+        if is_data_uri(item.image_path):
+            return item.image_path
+        cached = self._images.get(item.image_path)
+        if cached:
+            return cached
+        return item.image_path
+
+    def _from_json(self, entry: Dict[str, Any]) -> Optional[ClipboardItem]:
+        try:
+            item = ClipboardItem(
+                id=int(entry.get("id") or 0),
+                kind=str(entry.get("kind") or "text"),
+                content=str(entry.get("content") or ""),
+                preview=str(entry.get("preview") or ""),
+                html=str(entry.get("html") or ""),
+                rtf=str(entry.get("rtf") or ""),
+                image_path=str(entry.get("image") or ""),
+                image_width=int(entry.get("image_width") or 0),
+                image_height=int(entry.get("image_height") or 0),
+                files=[str(one) for one in entry.get("files") or []],
+                metadata=dict(entry.get("metadata") or {}),
+                source_app=str(entry.get("source_app") or ""),
+                source_title=str(entry.get("source_title") or ""),
+                hash=str(entry.get("hash") or ""),
+                size=int(entry.get("size") or 0),
+                pinned=bool(entry.get("pinned")),
+                favorite=bool(entry.get("favorite")),
+                sensitive=bool(entry.get("sensitive")),
+                tags=[str(one) for one in entry.get("tags") or []],
+                device=str(entry.get("device") or ""),
+                created_at=float(entry.get("created_at") or time.time()),
+                used_at=float(entry.get("used_at") or 0.0),
+                use_count=int(entry.get("use_count") or 0),
+            )
+        except (TypeError, ValueError) as exc:
+            _log.debug("跳过一条无法解析的 JSON 记录: %s", exc)
+            return None
+        if item.id <= 0:
+            return None
+        return item
+
+    def save(self) -> None:
+        """把内存状态原子地写回文件。关闭之后不做任何事。"""
+        if self._closed:
+            return
+        with self._lock:
+            self._write()
+
+    def _write(self) -> None:
+        payload = {
+            "version": SCHEMA_VERSION,
+            "updated_at": round(time.time(), 3),
+            "items": [self._to_json(self._items[key]) for key in sorted(self._items)],
+            "meta": self._meta,
+        }
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".json.tmp")
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, self.path)
+            self._dirty = False
+        except OSError as exc:
+            # 磁盘满或权限不足：不能把异常抛进采集线程，下次写入再试
+            _log.error("JSON 历史写入失败: %s", exc)
+            self._dirty = True
+
+    def _maybe_save(self) -> None:
+        if self.autosave:
+            self._write()
+
+    # ---- 兼容 Storage 的接口 ----
+
+    @property
+    def images_dir(self) -> Path:
+        return self.path.parent / "images"
+
+    def set_image_data(self, relative: str, uri: str) -> None:
+        """登记「图片相对路径 -> data URI」，落盘时内联，读取时可还原。"""
+        if relative and is_data_uri(uri):
+            self._images[relative] = uri
+
+    def _remove_image(self, relative: str) -> None:
+        """删掉某条记录独占的那张图。
+
+        只在这张图**不再被任何记录引用**时才删。图片按内容哈希命名，
+        同一张图被复制多次只有一份文件、多条记录共用它 —— 无条件
+        `unlink` 会让其它记录的图片平白失联。SQLite 后端同此语义。
+        """
+        name = image_store.basename_of(relative)
+        if not name:
+            return
+        with self._lock:
+            still_used = any(
+                image_store.basename_of(item.image_path) == name
+                for item in self._items.values()
+            )
+        if still_used:
+            return
+        try:
+            (self.path.parent / "images" / name).unlink(missing_ok=True)
+        except OSError as exc:
+            _log.debug("图片清理失败 %s: %s", name, exc)
+
+    def discard_unreferenced_image(self, relative: str) -> bool:
+        """收下一份「没能成为记录」的图片文件；仍被别的记录引用时不动它。"""
+        name = image_store.basename_of(relative)
+        if not name:
+            return False
+        with self._lock:
+            used = any(
+                image_store.basename_of(item.image_path) == name
+                for item in self._items.values()
+            )
+        if used:
+            return False
+        self._remove_image(relative)
+        return True
+
+    def referenced_images(self) -> set:
+        """全库正在引用哪些图片文件（文件名集合），供回收前比对。"""
+        with self._lock:
+            paths = [item.image_path for item in self._items.values() if item.image_path]
+        return image_store.referenced_names(paths)
+
+    def sweep_images(self, *, dry_run: bool = True, limit: int = image_store.DEFAULT_LIMIT):
+        """回收 `images/` 里不再被任何记录引用的文件。"""
+        return image_store.sweep(
+            self.images_dir, self.referenced_images(), dry_run=dry_run, limit=limit
+        )
+
+    def image_usage(self):
+        """图片目录的占用、文件数，以及「记录引用了但文件不在」的数量。"""
+        return image_store.usage(self.images_dir, self.referenced_images())
+
+    def add(self, item: ClipboardItem) -> Optional[ClipboardItem]:
+        if self._closed:
+            return None
+        with self._lock:
+            if item.id is None or item.id in self._items:
+                item.id = self._next_id
+            self._next_id = max(self._next_id, item.id + 1)
+            self._items[item.id] = item
+            self._maybe_save()
+        return item
+
+    def touch(self, item_id: int) -> None:
+        if self._closed:
+            return
+        with self._lock:
+            item = self._items.get(item_id)
+            if item is None:
+                return
+            item.used_at = time.time()
+            item.use_count += 1
+            self._maybe_save()
+
+    def update_fields(
+        self,
+        item_id: int,
+        *,
+        merge_metadata: bool = True,
+        **fields: Any,
+    ) -> None:
+        """更新指定字段，`metadata` 默认按键合并（语义与 `Storage` 一致）。
+
+        两个后端必须逐条对齐，否则「同一个动作在 SQLite 下不丢字段、
+        在 JSON 下丢字段」，而用户只是换了个存储方式就踩到 —— 这类
+        只在其中一个后端出现的不一致，是最难被发现的一种。
+        """
+        # `image_path` 参与其中，语义与 SQLite 后端一致：同步只带图片摘要，
+        # 字节按需拉取到位后才回填路径。两个后端不一致的话，
+        # 「换个存储方式就有的图打不开、有的打得开」。
+        allowed = {
+            "pinned",
+            "favorite",
+            "sensitive",
+            "tags",
+            "metadata",
+            "kind",
+            "image_path",
+        }
+        payload = {key: value for key, value in fields.items() if key in allowed}
+        if not payload or self._closed:
+            return
+        with self._lock:
+            item = self._items.get(item_id)
+            if item is None:
+                return
+            if merge_metadata and isinstance(payload.get("metadata"), dict):
+                merged = dict(item.metadata)
+                for key, value in payload["metadata"].items():
+                    # 值为 None 表示「删掉这个键」，语义与 `Storage` 一致
+                    if value is None:
+                        merged.pop(key, None)
+                    else:
+                        merged[key] = value
+                payload["metadata"] = merged
+            for key, value in payload.items():
+                setattr(item, key, value)
+            self._maybe_save()
+
+    def delete(self, item_id: int) -> None:
+        if self._closed:
+            return
+        with self._lock:
+            item = self._items.pop(item_id, None)
+            if item is not None:
+                self._maybe_save()
+        if item is not None:
+            self._remove_image(item.image_path)
+
+    def delete_many(self, ids: Iterable[int]) -> int:
+        if self._closed:
+            return 0
+        with self._lock:
+            removed = 0
+            images: List[str] = []
+            for item_id in list(ids):
+                item = self._items.pop(item_id, None)
+                if item is not None:
+                    removed += 1
+                    images.append(item.image_path)
+            self._maybe_save()
+        for relative in images:
+            self._remove_image(relative)
+        return removed
+
+    def clear(self, keep_pinned: bool = True) -> int:
+        if self._closed:
+            return 0
+        with self._lock:
+            doomed = [
+                item_id
+                for item_id, item in self._items.items()
+                if not (keep_pinned and item.pinned)
+            ]
+            images = [self._items[item_id].image_path for item_id in doomed]
+            for item_id in doomed:
+                self._items.pop(item_id, None)
+            self._maybe_save()
+        for relative in images:
+            self._remove_image(relative)
+        return len(doomed)
+
+    def get(self, item_id: int) -> Optional[ClipboardItem]:
+        with self._lock:
+            item = self._items.get(item_id)
+            return copy.deepcopy(item) if item is not None else None
+
+    def get_many(self, ids: Iterable[int]) -> Dict[int, ClipboardItem]:
+        """按 id 批量取记录，返回 `{id: 记录}`。语义与 `Storage.get_many` 一致。
+
+        两个后端对同一份数据要给出同一个答案 —— 界面不该因为用户换了
+        存储方式就取不到某一条。
+        """
+        result: Dict[int, ClipboardItem] = {}
+        with self._lock:
+            for raw in ids:
+                try:
+                    key = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                item = self._items.get(key)
+                if item is not None:
+                    result[key] = copy.deepcopy(item)
+        return result
+
+    def find_by_hash(self, digest: str) -> Optional[ClipboardItem]:
+        """同哈希可能有多条（历史遗留），按排序优先级返回第一条。"""
+        if not digest:
+            return None
+        with self._lock:
+            candidates = [item for item in self._items.values() if item.hash == digest]
+        if not candidates:
+            return None
+        candidates.sort(key=_sort_key, reverse=True)
+        return copy.deepcopy(candidates[0])
+
+    def latest(self) -> Optional[ClipboardItem]:
+        with self._lock:
+            if not self._items:
+                return None
+            item = max(self._items.values(), key=lambda one: one.created_at)
+            return copy.deepcopy(item)
+
+    def list(
+        self,
+        *,
+        kind: Optional[str] = None,
+        pinned_only: bool = False,
+        favorite_only: bool = False,
+        source_app: Optional[str] = None,
+        since: Optional[float] = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> List[ClipboardItem]:
+        selected: List[ClipboardItem] = []
+        with self._lock:
+            for item in self._items.values():
+                if kind and item.kind != kind:
+                    continue
+                if pinned_only and not item.pinned:
+                    continue
+                if favorite_only and not item.favorite:
+                    continue
+                if source_app and item.source_app != source_app:
+                    continue
+                if since and item.created_at < since:
+                    continue
+                selected.append(copy.deepcopy(item))
+        selected.sort(key=_sort_key, reverse=True)
+        return selected[offset : offset + limit]
+
+    def iter_all(self, *, batch: int = 500):
+        """按 `id DESC` 遍历全部记录，与 `Storage.iter_all` 同语义。
+
+        `batch` 在这里只是接口对齐 —— JSON 后端整库都在内存里，
+        逐条产出即可。保留参数是为了让 `FolderSync.export` 不必区分后端。
+
+        存在的理由与 Storage 那边一致：`list(limit=N)` 只给最新 N 条，
+        同步导出拿它当「全部历史」会让更老的记录永远发不出去。
+        """
+        del batch  # 内存后端无需分批
+        with self._lock:
+            items = sorted(self._items.values(), key=lambda one: int(one.id or 0), reverse=True)
+            for item in items:
+                yield copy.deepcopy(item)
+
+    def iter_since(self, since: float = 0.0, *, since_id: int = 0, batch: int = 500):
+        """按 `(created_at, id)` 升序遍历严格晚于 `(since, since_id)` 的记录。
+
+        与 `Storage.iter_since` 同语义：局域网对端用时间戳做游标，
+        需要按时间升序读才能把游标稳步往前推。
+
+        `since_id` 同样是游标的一部分：同一时刻的记录多到塞满一页时，
+        只看时间戳的游标推进不了，剩下那些「一样新」的记录会被永久跳过。
+        字典序比较见 `Storage.iter_since` 的说明。
+        """
+        del batch  # 内存后端无需分批
+        first = float(since or 0.0)
+        first_id = max(0, int(since_id or 0))
+
+        def _after(item) -> bool:
+            """严格晚于 `(since, since_id)` 的字典序判断。
+
+            `since_id == 0` 时退化为**只比时间**（`created_at > since`）——
+            这不是偷懒，是为了与 `Storage.iter_since` 逐条同语义：
+            那边第一页的 `WHERE created_at > ?` 就是这个意思。
+            两边一旦分叉，同刻记录塞满一页时 JSON 后端会静默丢记录。
+            """
+            created = float(item.created_at or 0.0)
+            if created > first:
+                return True
+            if first_id == 0 or created < first:
+                return False
+            return int(item.id or 0) > first_id
+
+        with self._lock:
+            items = [item for item in self._items.values() if _after(item)]
+            items.sort(key=lambda one: (float(one.created_at or 0.0), int(one.id or 0)))
+            for item in items:
+                yield copy.deepcopy(item)
+
+    def search(
+        self,
+        query: str,
+        *,
+        kind: Optional[str] = None,
+        limit: int = 60,
+        use_fts: bool = True,  # 与 Storage 签名一致；这里恒为子串匹配
+    ) -> List[ClipboardItem]:
+        query = (query or "").strip()
+        if not query:
+            return self.list(kind=kind, limit=limit)
+
+        tokens = [token for token in re.split(r"\s+", query.lower()) if token]
+        scored: List[Tuple[float, ClipboardItem]] = []
+        with self._lock:
+            for item in self._items.values():
+                if kind and item.kind != kind:
+                    continue
+                score = self._score(item, tokens)
+                if score > 0:
+                    scored.append((score, copy.deepcopy(item)))
+        scored.sort(key=lambda pair: (pair[0], _sort_key(pair[1])), reverse=True)
+        return [item for _, item in scored[:limit]]
+
+    @staticmethod
+    def _score(item: ClipboardItem, tokens: List[str]) -> float:
+        """朴素相关度：任一 token 命中即可，按字段权重与出现次数累加。
+
+        权重差异来自实际检索习惯 —— 正文命中比来源应用命中更有意义。
+        """
+        haystacks = {
+            "content": (item.content or "").lower(),
+            "preview": (item.preview or "").lower(),
+            "tags": " ".join(item.tags).lower(),
+            "source_app": (item.source_app or "").lower(),
+        }
+        total = 0.0
+        for token in tokens:
+            for field, weight in _FIELD_WEIGHTS:
+                text = haystacks[field]
+                if token and token in text:
+                    total += weight * (1.0 + 0.2 * (text.count(token) - 1))
+        if total == 0:
+            return 0.0
+        # 越近的记录略占优势，避免同分时顺序随机
+        return total + 1.0 / (1.0 + max(0.0, time.time() - item.created_at) / 86400)
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+    def count_by_kind(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        with self._lock:
+            for item in self._items.values():
+                counts[item.kind] = counts.get(item.kind, 0) + 1
+        return counts
+
+    def top_sources(self, limit: int = 10) -> List[Tuple[str, int]]:
+        counts: Dict[str, int] = {}
+        with self._lock:
+            for item in self._items.values():
+                if item.source_app:
+                    counts[item.source_app] = counts.get(item.source_app, 0) + 1
+        ranked = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))
+        return ranked[:limit]
+
+    def recanonicalize(self, options: Optional[dict] = None) -> int:
+        """按当前归一规则重算历史记录的指纹，返回被改写的条数。
+
+        与 SQLite 后端同一套语义：老数据的指纹是拿原始内容算的，
+        不重算的话「同一页面被不同渠道分享出的多条链接」永远合不到一起。
+        只改 `hash`，`content` 原样保留。
+        """
+        options = options or {}
+        changed = 0
+        with self._lock:
+            for item in self._items.values():
+                payload = canonical_key(
+                    item.kind or "",
+                    item.content or "",
+                    files=item.files or None,
+                    options=options,
+                )
+                digest = content_hash(item.kind or "", payload)
+                if digest and digest != item.hash:
+                    item.hash = digest
+                    changed += 1
+            if changed:
+                self._maybe_save()
+        return changed
+
+    def dedupe(self) -> int:
+        """合并重复内容（保留排序最高的一条）。
+
+        与 SQLite 后端保持同样的语义：删除前先把重复项的使用次数与
+        最近使用时间折算到保留项上，否则「复制过多次」这个信号会随重复行
+        一起被丢掉，高频片段反而排到低频片段后面。
+        """
+        groups: Dict[str, List[int]] = {}
+        with self._lock:
+            for item_id, item in self._items.items():
+                if item.hash:
+                    groups.setdefault(item.hash, []).append(item_id)
+
+            removed = 0
+            for ids in groups.values():
+                if len(ids) < 2:
+                    continue
+                # 保留排序靠前（最近使用/固定）的那条，与列表展示一致
+                keeper_id = max(ids, key=lambda i: _sort_key(self._items[i]))
+                keeper = self._items[keeper_id]
+                # 频次 = 各行显式 use_count 之和 + 「多出来的行数」。
+                # 后者不可省：重复行本身就代表「又复制了一次」，只是没记在
+                # use_count 上（`merge_duplicates` 关闭期间的老数据就是这样）。
+                total_use = 0
+                last_seen = 0.0
+                for item_id in ids:
+                    other = self._items[item_id]
+                    total_use += int(other.use_count or 0)
+                    # `used_at` 提到组内最新的时间戳（含 created_at）：
+                    # 合并后这一条代表「最近一次见到这段内容」，
+                    # 否则保留的可能最旧时刻，在按最近使用排序时直接沉底。
+                    last_seen = max(
+                        last_seen,
+                        float(other.used_at or 0.0),
+                        float(other.created_at or 0.0),
+                    )
+                total_use += max(0, len(ids) - 1)
+                keeper.use_count = total_use
+                keeper.used_at = last_seen
+                for item_id in ids:
+                    if item_id != keeper_id:
+                        self._items.pop(item_id, None)
+                        removed += 1
+            if removed:
+                self._maybe_save()
+            return removed
+
+    def enforce_limits(
+        self, max_items: int, max_days: int = 0, pin_immune: bool = True
+    ) -> int:
+        """与 SQLite 版语义逐条对齐（含 `pin_immune`）。"""
+        removed = 0
+        with self._lock:
+            images: List[str] = []
+            if max_days > 0:
+                cutoff = time.time() - max_days * 86400
+                doomed = [
+                    item_id
+                    for item_id, item in self._items.items()
+                    if item.created_at < cutoff and not (pin_immune and item.pinned)
+                ]
+                removed += len(doomed)
+                for item_id in doomed:
+                    images.append(self._items[item_id].image_path)
+                    self._items.pop(item_id, None)
+
+            if max_items > 0:
+                # 排序把固定项排前，所以只有历史远超上限时固定项才会被裁掉
+                candidates = [item for item in self._items.values()
+                              if not (pin_immune and item.pinned)]
+                survivors = sorted(candidates, key=_sort_key, reverse=True)[:max_items]
+                keep = {item.id for item in survivors}
+                doomed = [item.id for item in candidates if item.id not in keep]
+                removed += len(doomed)
+                for item_id in doomed:
+                    images.append(self._items[item_id].image_path)
+                    self._items.pop(item_id, None)
+
+            if removed:
+                self._maybe_save()
+        for relative in images:
+            self._remove_image(relative)
+        return removed
+
+    def purge_expired_sensitive(self, ttl_seconds: int) -> int:
+        if ttl_seconds <= 0:
+            return 0
+        cutoff = time.time() - ttl_seconds
+        with self._lock:
+            doomed = [
+                item_id
+                for item_id, item in self._items.items()
+                if item.sensitive and item.created_at < cutoff
+            ]
+            images = [self._items[item_id].image_path for item_id in doomed]
+            for item_id in doomed:
+                self._items.pop(item_id, None)
+            if doomed:
+                self._maybe_save()
+        for relative in images:
+            self._remove_image(relative)
+        return len(doomed)
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock:
+            self._meta[str(key)] = str(value)
+            self._maybe_save()
+
+    def get_meta(self, key: str, default: str = "") -> str:
+        with self._lock:
+            return self._meta.get(str(key), default)
+
+    def optimize(self) -> None:
+        self.save()
+
+    def stats(self) -> Dict[str, Any]:
+        # JSON 后端只有一份文件，但走同一个测量入口：两边形状一致，
+        # 调用方（CLI / 设置页）不必区分「这个后端有没有伴随文件」。
+        footprint = storage_files.measure(self.path)
+        return {
+            "items": self.count(),
+            "kinds": self.count_by_kind(),
+            "sources": self.top_sources(5),
+            "db_size": footprint.total_bytes,
+            # JSON 单文件没有「删过记录留下的空洞」这个概念（整份重写），
+            # 所以可回收量恒为 0 —— 但键要在，见 `StorageFootprint.DICT_KEYS`
+            "storage_files": footprint.as_dict(),
+            "fts": False,
+            "tokenizer": "json-scan",
+            "backend": "json",
+            "path": str(self.path),
+        }
+
+    def close(self) -> None:
+        """落盘并标记关闭。可重复调用，关闭后再写不再落盘。"""
+        if self._closed:
+            return
+        self.save()
+        with self._lock:
+            self._closed = True
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    # ---- 图片 ----
+
+    def read_image_bytes(self, relative: str) -> Optional[bytes]:
+        """取回图片原始字节。
+
+        查找顺序：参数本身就是 data URI -> 登记表 -> 记录里内联的 data URI
+        -> 同名独立文件。最后一项是必要的：导入一份在别处生成、图片未内联的
+        JSON 时，`images/` 目录里的文件才是唯一来源。
+
+        记录里内联的图片只能按记录本身取，不按文件名模糊匹配 ——
+        否则「取一张已经不存在的图」会拿到别人的数据。
+        """
+        if not relative:
+            return None
+        uri = relative if is_data_uri(relative) else None
+        if uri is None:
+            with self._lock:
+                uri = self._images.get(relative)
+            if uri is None:
+                for item in self._items.values():
+                    if item.image_path == relative and is_data_uri(item.image_path):
+                        uri = item.image_path
+                        break
+        if uri is None:
+            for item in self._items.values():
+                if is_data_uri(item.image_path) and item.content == Path(relative).name:
+                    uri = item.image_path
+                    break
+        if uri is None:
+            return self._read_image_file(relative)
+        try:
+            _, payload = split_data_uri(uri)
+            return base64.b64decode(payload)
+        except (ValueError, TypeError) as exc:
+            _log.debug("内联图片解码失败 %s: %s", relative, exc)
+            return None
+
+    def _read_image_file(self, relative: str) -> Optional[bytes]:
+        """回退到独立图片文件，兼容未内联与从旧版本迁入的数据。"""
+        from ..utils.paths import data_dir
+
+        raw = Path(relative)
+        candidates = [raw] if raw.is_absolute() else [self.path.parent / raw, data_dir() / raw]
+        for candidate in candidates:
+            if candidate.is_file():
+                try:
+                    return candidate.read_bytes()
+                except OSError as exc:
+                    _log.debug("图片读取失败 %s: %s", candidate, exc)
+        return None
+
+
+def _sort_key(item: ClipboardItem) -> Tuple[int, int, float]:
+    """排序键：固定 > 收藏 > 最近使用/创建。与 SQLite 版保持同一优先级。"""
+    return (
+        1 if item.pinned else 0,
+        1 if item.favorite else 0,
+        item.used_at or item.created_at,
+    )
+
+
+def open_repository(config=None):
+    """按配置返回历史仓库：`storage.backend` 为 `json` 时用 JSON 单文件。
+
+    统一入口的价值在于调用方（GUI、CLI）不必各自判分支，
+    也因此两者永远指向同一份数据。
+    """
+    from ..utils.config import Config
+    from ..utils.paths import database_path
+    from .storage import Storage
+
+    config = config or Config()
+    kind = str(config.get("storage.backend", "sqlite") or "sqlite").lower()
+    if kind == "json":
+        return JsonRepository()
+    return Storage(database_path())

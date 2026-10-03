@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "linglong-clipboard"
+version = "1.0.0"
+description = "玲珑剪切板 —— 跨平台智能剪切板：本地优先、语义检索、可编程转换"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Linglong Clipboard Contributors" }]
+keywords = ["clipboard", "productivity", "cross-platform", "pyside6", "privacy"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Desktop Environment",
+    "Topic :: Utilities",
+]
+
+# 运行时只依赖 PySide6；同步加密用的 cryptography 是可选增强
+dependencies = ["PySide6>=6.5"]
+
+[project.optional-dependencies]
+# 开启加密同步（见 core/sync.py 的 SyncCipher）
+encrypt = ["cryptography>=41"]
+# 把 JSON 转成 YAML 时用更可靠的实现，缺失时走内置的极简序列化
+yaml = ["pyyaml>=6"]
+# macOS 全局快捷键需要 pyobjc
+macos-hotkeys = ["pyobjc-framework-Quartz>=9"]
+dev = [
+    "pytest>=7",
+    "pytest-cov>=4",
+    "pyinstaller>=6",
+]
+
+[project.scripts]
+linglong-clipboard = "linglong_clip.__main__:main"
+llclip = "linglong_clip.__main__:main"
+
+[project.gui-scripts]
+# 打包成无控制台窗口的 GUI 程序时用这个入口
+linglong-clipboard-gui = "linglong_clip.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["linglong_clip"]
+omit = ["*/tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    'if __name__ == "__main__":',
+]

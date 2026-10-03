@@ -1,16 +1,33 @@
+# Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
 .venv/
 venv/
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# 打包
+*.spec.bak
+packaging/*.spec.bak
+
+# 运行时数据（用户数据应落在系统数据目录，不该进仓库）
 *.db
 *.db-wal
 *.db-shm
 logs/
 images/
-.pytest_cache/
-.coverage
-htmlcov/
-build/
-dist/
+
+# 编辑器与系统
+.idea/
+.vscode/
+*.swp
 .DS_Store
 Thumbs.db
