@@ -71,6 +71,45 @@ def test_merge_counts_agree_with_use_count(collector, storage):
     assert storage.count() == 1
 
 
+def test_duplicate_capture_does_not_resurrect_deleted_metadata_key(collector, storage):
+    """重复采集只该补 `last_source`，不该把别人刚删掉的键写回来。
+
+    `metadata` 是按键合并的补丁。此前这里传的是「整份拷出来的字典」，
+    等于做了一次读—改—写：读到之后、写回之前，若有别的写方删掉了某个键
+    （取消固定的 `pinned_by`、图片摘要 `image_digest`），写回就会把它**复活**。
+
+    窗口在单线程下不好碰，所以这里把「另一个写方」精确插在
+    `find_by_hash()` 返回之后 —— 那一份 `existing.metadata` 已被读出来，
+    正是整份字典会被写回去的时刻。
+    """
+    from linglong_clip.core.models import PINNED_BY_KEY
+
+    collector.process(_item("重复复制"))
+    item_id = storage.list()[0].id
+    storage.update_fields(item_id, pinned=True, metadata={PINNED_BY_KEY: "another-device"})
+
+    real_find = storage.find_by_hash
+    injected = {"done": False}
+
+    def find_with_concurrent_delete(digest):
+        item = real_find(digest)
+        # 模拟「读之后、写回之前」另一个写方删掉了这个键
+        if not injected["done"] and item is not None:
+            injected["done"] = True
+            storage.update_fields(item.id, pinned=False, metadata={PINNED_BY_KEY: None})
+        return item
+
+    storage.find_by_hash = find_with_concurrent_delete
+    try:
+        collector.process(_item("重复复制", source_app="chrome"))
+    finally:
+        storage.find_by_hash = real_find
+
+    meta = storage.get(item_id).metadata
+    assert meta.get("last_source") == "chrome"
+    assert PINNED_BY_KEY not in meta, f"被删掉的键又被写回来了：{meta}"
+
+
 def test_dedupe_disabled_keeps_new_row(storage, config):
     config.set("history.merge_duplicates", False)
     instance = Collector(storage, config)

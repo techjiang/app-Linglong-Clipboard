@@ -47,6 +47,7 @@ from .sync import (
     SyncCipher,
     SyncRecord,
     _apply_resolved_flags,
+    _pinned_by_patch,
     _resolved_flags,
     apply_flags,
     pin_is_stale,
@@ -900,8 +901,6 @@ class LanSyncClient:
         `apply_flags` 永远碰不到它。本地没有这条内容时无处可落，
         等它随内容记录一起来时再处理。
         """
-        from .models import PINNED_BY_KEY
-
         existing = self._storage.find_by_hash(target_hash)
         if existing is None:
             return False
@@ -920,16 +919,17 @@ class LanSyncClient:
             and merged.pinned_by == existing.pinned_by
         ):
             return False
-        metadata = dict(existing.metadata)
-        if merged.pinned and merged.pinned_by:
-            metadata[PINNED_BY_KEY] = merged.pinned_by
-        else:
-            metadata.pop(PINNED_BY_KEY, None)
+        # `metadata` 是**合并补丁**，传 `None` 才表示删掉该键。
+        # 这里此前传的是「整份拷出来的字典」：合并语义下「少了一个键」与
+        # 「没提到这个键」无法区分，于是 `pinned_by` 一旦写上就再也清不掉 ——
+        # 取消固定后来源仍留着，删除保护会据此把本设备的删除判成「非过期残留」
+        # 而拒绝执行。与共享文件夹模式共用同一个 `_pinned_by_patch`，
+        # 两条路径不能各写一套（这是它们第 N 次分叉，见 CONTRIBUTING）。
         self._storage.update_fields(
             existing.id,
             pinned=merged.pinned,
             favorite=merged.favorite,
-            metadata=metadata,
+            metadata=_pinned_by_patch(merged),
         )
         seen.add(target_hash)
         return True

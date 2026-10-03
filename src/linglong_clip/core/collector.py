@@ -128,13 +128,15 @@ class Collector:
                 # 早期这里另写过一个 `metadata["copies"]` 计数，它没人读、
                 # 还和 `use_count` 差一位，成了两个互相打脸的频次口径 —— 已移除。
                 self._storage.touch(existing.id)
-                # 重复内容也要更新来源：同一段文本可能被不同应用复制过
+                # 重复内容也要更新来源：同一段文本可能被不同应用复制过。
+                #
+                # 这里只交「我要改的这一个键」。`metadata` 是按键合并的补丁，
+                # 传整份拷出来的字典会做一次「读—改—写」：读与写之间若有别的
+                # 写方删掉了某个键（取消固定的 `pinned_by: None`、清理图片摘要），
+                # 写回时会把那个已被删掉的键**复活**，而且是静默的。
                 self._storage.update_fields(
                     existing.id,
-                    metadata={
-                        **existing.metadata,
-                        "last_source": item.source_app,
-                    },
+                    metadata={"last_source": item.source_app},
                 )
                 merged = self._storage.get(existing.id)
                 self._emit(merged, MERGED)

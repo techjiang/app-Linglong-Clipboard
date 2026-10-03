@@ -774,6 +774,90 @@ def lan_pair(storage, home):
     other.close()
 
 
+def _advance_cursor_past_content(client, peer_spec, server_port):
+    """把对端游标推过现有内容，模拟「内容只发过一次、之后只有标记变更」。
+
+    为什么必须这么做：默认情况下对端每次都会把内容一起重发（游标带 1 秒
+    安全窗口），于是「取消固定」会从内容记录那条路顺带被修正，
+    `_apply_flag_change` 里的缺陷就被掩盖了。而它存在的意义恰恰是
+    「内容已发过、标记之后才变」——只测前者等于没测。
+    """
+    from linglong_clip.core.lan_sync import PeerInfo as _PeerInfo, parse_peer as _parse
+
+    host, port = _parse(peer_spec, server_port)
+    key = client.cursor_key(_PeerInfo(host=host, port=port))
+    client.cursors.advance(key, time.time() + 100)
+
+
+def test_lan_cancel_clears_origin_device(lan_pair):
+    """取消固定后来源设备要一起清掉 —— 与共享文件夹路径同一套语义。
+
+    这里走的是「内容不再重发、只有 `flag_change` 到达」的那条路。
+    此前 `_apply_flag_change` 传的是整份 `metadata` 而不是合并补丁，
+    而 `metadata` 的合并语义下「少了一个键」与「没提到这个键」无法区分，
+    于是 `pinned_by` 一旦写上就永远清不掉。
+
+    后果不是显示不干净：`pin_is_stale()` 读的正是这个来源，
+    残留的旧来源会让「来源设备的删除」被判成非过期残留而拒绝执行 ——
+    也就是这个字段本来要修的那个「删了又复活」重新出现。
+    """
+    from linglong_clip.core.flag_changes import FLAG_PINNED
+    from linglong_clip.core.models import PINNED_BY_KEY
+
+    a, b, local, remote = lan_pair
+    digest = _add_flagged(local, "取消要连来源一起清", pinned=True)
+    local.update_fields(local.find_by_hash(digest).id, metadata={PINNED_BY_KEY: "laptop"})
+
+    b.sync_all()
+    assert remote.find_by_hash(digest).pinned is True
+    assert remote.find_by_hash(digest).metadata.get(PINNED_BY_KEY) == "laptop"
+
+    # 让内容不再重发，只留标记变更这一条通道
+    _advance_cursor_past_content(b._client, b.peers[0], a.status()["port"])
+
+    local.update_fields(
+        local.find_by_hash(digest).id, pinned=False, metadata={PINNED_BY_KEY: None}
+    )
+    a.flag_changes.record(digest, FLAG_PINNED, False, at=2000.0)
+    b.sync_all()
+
+    target = remote.find_by_hash(digest)
+    assert target.pinned is False, "取消必须传过去"
+    assert PINNED_BY_KEY not in target.metadata, f"来源没被清掉：{target.metadata}"
+
+
+def test_lan_unpin_from_other_device_keeps_valid_pin(lan_pair):
+    """另一台设备设过的固定，不该被第三方的取消清掉 —— 并集语义仍成立。
+
+    守住上一轮那种「对齐两条路径」时最容易带偏的一条：修「取消要清来源」
+    时顺手把并集改成「最后写入者」，会让一台设备的取消抹掉另一台的显式固定。
+    """
+    from linglong_clip.core.flag_changes import FLAG_PINNED
+    from linglong_clip.core.models import PINNED_BY_KEY
+
+    a, b, local, remote = lan_pair
+    digest = _add_flagged(local, "两台设备都固定过", pinned=True)
+    local.update_fields(local.find_by_hash(digest).id, metadata={PINNED_BY_KEY: "laptop"})
+
+    # 对端也显式固定过这条（来源是自己）
+    b.flag_changes.record(digest, FLAG_PINNED, True, at=1500.0)
+    b.sync_all()
+    remote.update_fields(
+        remote.find_by_hash(digest).id, pinned=True, metadata={PINNED_BY_KEY: "desktop"}
+    )
+
+    # 本机取消自己的固定
+    _advance_cursor_past_content(b._client, b.peers[0], a.status()["port"])
+    local.update_fields(
+        local.find_by_hash(digest).id, pinned=False, metadata={PINNED_BY_KEY: None}
+    )
+    a.flag_changes.record(digest, FLAG_PINNED, False, at=2000.0)
+    b.sync_all()
+
+    # 对端自己的固定意图仍有效 —— 取消只撤销发起取消的那台设备的意图
+    assert remote.find_by_hash(digest).pinned is True, "不该被别的设备的取消抹掉"
+
+
 def test_lan_cancel_propagates(lan_pair):
     """**本轮主场景**：A 固定后取消，B 端要看到取消。"""
     from linglong_clip.core.flag_changes import FLAG_PINNED
@@ -848,10 +932,31 @@ def test_lan_cancel_arrives_without_content_record(lan_pair):
     assert outcome.flag_changes >= 1
 
 
+def _wait_until(predicate, *, timeout=2.0, interval=0.01):
+    """等服务端线程把「写出之后的确认」做完。
+
+    为什么需要它：HTTP 由 `ThreadingHTTPServer` 在工作线程里处理，
+    确认（`ack_delivered`）排在 `wfile.write` **之后**。客户端读到响应就可能
+    返回，而服务端那一行还没执行完 —— 直接断言就是一处竞态，
+    负载高时必现、本地单跑却看不出来，典型的「只红在 CI 上」。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
 def test_lan_flag_changes_are_acked_after_serve(lan_pair):
     """服务端写出响应之后要确认送达 —— 否则每轮都在重传全部历史事件。
 
     这正是「已送达的不再复述」在局域网模式下从未生效的那个洞。
+
+    确认发生在**服务端线程**里、且排在 `wfile.write` 之后。客户端读到响应
+    就可能已经返回，而服务端那一行还没执行 —— 所以这里要等一下再断言。
+    设计上「宁可重发也不能漏」，晚一轮确认是允许的；断言的是「最终会确认」，
+    不是「客户端返回的瞬间就已确认」（后者是一处每次都靠运气的竞态）。
     """
     from linglong_clip.core.flag_changes import FLAG_PINNED
 
@@ -861,7 +966,7 @@ def test_lan_flag_changes_are_acked_after_serve(lan_pair):
 
     b.sync_all()
     # 已经交付过，不该再待发
-    assert a.flag_changes.pending() == []
+    assert _wait_until(lambda: a.flag_changes.pending() == []), "写出后应最终确认送达"
 
 
 def test_lan_tombstones_are_acked_after_serve(lan_pair):
@@ -874,7 +979,8 @@ def test_lan_tombstones_are_acked_after_serve(lan_pair):
     a.tombstones.record(digest)
 
     assert b.sync_all() == 0  # 对方没有新内容，只有一条删除
-    assert a.tombstones.pending() == [], "写出成功后不该还待发"
+    # 同上：确认在服务端线程里、排在写出之后，要等它跑完
+    assert _wait_until(lambda: a.tombstones.pending() == []), "写出成功后不该还待发"
 
 
 # ---------- 整库传输：记录数超过一页时不能丢 ----------

@@ -374,6 +374,16 @@ _MIGRATIONS = {
 8. **取消固定要连来源一起清掉**。留着旧来源，后续重设或判过期时会串味。
 9. **比对「标记有没有变化」时只看布尔位，不看来源**。来源变化（先本机
    固定、后来对端也固定）不该单独触发重发，否则每轮同步都反复补发。
+10. **写 `metadata` 一律交「合并补丁」，不要交「整份拷出来的字典」**。
+    两条路径都要用 `sync._pinned_by_patch()` 这一个实现，不要各自拼一遍。
+    合并语义下「字典里少了一个键」与「没提到这个键」无法区分，所以
+    整份字典**删不掉任何键** —— `_apply_flag_change()` 曾经这么写，
+    于是取消固定后 `pinned_by` 永远清不掉，删除保护据此把来源设备的
+    删除判成「非过期残留」而拒绝执行（正是这个字段要修的那个 bug）。
+    整份字典还有第二个窗口：它是「读—改—写」，读与写之间别的写方删掉的键
+    会被静默写回（采集路径补 `last_source` 时踩过同一个坑）。
+    回归闸门：`tests/test_lan_sync.py::test_lan_cancel_clears_origin_device`、
+    `tests/test_collector.py::test_duplicate_capture_does_not_resurrect_deleted_metadata_key`。
 
 ### 修改脱敏规则（内置或自定义）
 
