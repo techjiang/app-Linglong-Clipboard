@@ -747,17 +747,26 @@ class FolderSync:
         numbered = self._read_journal_numbered(path)
 
         # 对端把日志裁剪/重写过之后，条目序号会整体前移 —— 此时本地游标
-        # 指向的是**别人的**位置。判据：日志比游标短了，说明这条位置已经
-        # 不可信，退回全量重扫（hash 会去重，代价只是一轮多读）。
+        # 指向的是**别人的**位置，必须退回全量重扫（hash 会去重，代价只是
+        # 一轮多读）。
         #
-        # 这里必须**显式清零**，不能只把 `position` 局部改成 0：
-        # `advance_entry()` 是只增不减的（多来源互相覆盖时要防倒退），
-        # 局部改 0 之后推上去的仍是旧的大值，游标就永远卡在失效位置上。
-        if position > len(numbered):
+        # 判据**不能只看长度**。「日志比游标短」只是重写的一种结果，而
+        # 裁剪到上限附近的日志会长期保持在上限上下，长度**恰好等于**游标是
+        # 最常见的那种重写：序号 2 在裁剪前指 c1、裁剪后指 n0，长度一样。
+        # 这时只看长度会判成「位置仍然有效」，于是从第 2 条之后开始读，
+        # 而每条新记录都落在那之前 —— 一轮一轮跳过，界面上写着「同步成功」。
+        # 所以位置旁边存了锚点（读到第几条时那条的指纹），读之前先核对。
+        if not self.cursors.entry_is_valid(
+            key, len(numbered), lambda index: _anchor_of(numbered, index)
+        ):
             _log.info(
-                "对端日志 %s 比游标短（%d < %d），游标已失效，退回全量重扫",
+                "对端日志 %s 已被重写（长度 %d，游标 %d，锚点对不上），"
+                "游标已失效，退回全量重扫",
                 path.name, len(numbered), position,
             )
+            # 这里必须**显式清零**，不能只把 `position` 局部改成 0：
+            # `advance_entry()` 是只增不减的（多来源互相覆盖时要防倒退），
+            # 局部改 0 之后推上去的仍是旧的大值，游标就永远卡在失效位置上。
             self.cursors.reset_entry(key)
             position = 0
 
@@ -838,8 +847,9 @@ class FolderSync:
             seen_local.add(record.hash)
             apply_flags(self._storage, record, seen_local, self.flag_changes)
             outcome.imported += 1
-        # 只有在完整读完后才推进游标：解析中途出错不该跳过剩余记录
-        self.cursors.advance_entry(key, newest)
+        # 只有在完整读完后才推进游标：解析中途出错不该跳过剩余记录。
+        # 锚点跟着一起写：下一轮靠它核对「这个序号还指同一条记录吗」。
+        self.cursors.advance_entry(key, newest, anchor=_anchor_of(numbered, newest))
         return outcome
 
     def _apply_flag_change(
@@ -1140,6 +1150,19 @@ def apply_flags(
     if seen_local is not None:
         seen_local.add(record.hash)
     return True
+
+
+def _anchor_of(numbered: List[tuple], index: int) -> str:
+    """日志里第 `index` 条（从 1 起）的指纹；越界或没有指纹时返回空串。
+
+    唯一用途是给游标当锚点：回答「这个序号现在还指同一条记录吗」。
+    返回空串表示**无从核对**，调用方会退回只比长度 —— 这与没有锚点时
+    的行为一致，所以这里不必造一个假的指纹出来。
+    """
+    if index <= 0 or index > len(numbered):
+        return ""
+    record = numbered[index - 1][1]
+    return str(getattr(record, "hash", "") or "")
 
 
 def _pinned_by_patch(merged: FlagSnapshot) -> dict:

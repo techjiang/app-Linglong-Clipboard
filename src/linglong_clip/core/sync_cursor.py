@@ -25,6 +25,15 @@
   | `lan:` | `(时间戳, id)`（见 `position_for`） | 这是协议的一部分，对端按它翻页 |
 
   合成一个数会得出一个对两种来源都不对的答案。
+- **位置旁边还要存一份「锚点」**，因为序号会被重写。日志裁剪/重写之后，
+  同一个序号指向的是**另一条**记录，而序号本身没有任何自证能力：
+  「读到第 2 条」在裁剪前指 c1、裁剪后指 n0，两个位置长得一模一样。
+  只比长度（`position > len`）挡不住长度恰好相等的重写 —— 那是最常见的
+  稳态：日志被裁到上限之后就一直在上限附近打转。此时导入侧看到
+  「游标 2 ≤ 长度 2」，安心地从第 2 条之后开始读，于是**每条新记录都被跳过**，
+  而且一轮一轮地跳过，界面上写着「同步成功、0 条」。
+  锚点就是「我读完时最后那条是什么」，读之前先拿它核对；
+  对不上就退回全量重扫（hash 会去重，代价只是一轮多读）。
 - **共享文件夹为什么不能用时间戳**：时间戳由写入方给、**不保证单调**
   （系统剪贴板历史导入、存储迁移、任何显式构造 `created_at=过去` 的路径
   都会写下更早的时间）。按它过滤时，新追加的记录恰好在游标之前，
@@ -58,8 +67,9 @@ from ..utils import paths
 
 _log = get_logger("sync-cursor")
 
-#: 游标文件格式版本。2 起每项是 `[时间戳, id]`，1 是裸时间戳（仍可读）。
-SCHEMA_VERSION = 2
+#: 游标文件格式版本。3 起条目游标带锚点，2 起每项是 `[时间戳, id]`，
+#: 1 是裸时间戳（仍可读）。旧版读到新字段会忽略它并退回全量重扫，只是慢一轮。
+SCHEMA_VERSION = 3
 
 #: 推进游标时回退的安全窗口（秒）。覆盖「同一时刻多条记录」的边界情况，
 #: 代价只是下次多拉几条已被 hash 去重的记录。
@@ -85,6 +95,10 @@ class SyncCursorStore:
         #: 与 `_cursors` 分开：前者是**协议**位置（向对端请求到哪），
         #: 后者是**本地**位置（哪些记录已处理）。两个不同的问题。
         self._entries: Dict[str, int] = {}
+        #: `key -> 读到第 entries 条时，第 entries 条的指纹`。
+        #: 用来回答「这个序号现在还指同一条记录吗」—— 序号本身回答不了。
+        #: 空串表示「当时那条没有指纹」，退化为旧行为（只比长度）。
+        self._anchors: Dict[str, str] = {}
         self._loaded = False
 
     # ---- 载入 / 落盘 ----
@@ -96,6 +110,7 @@ class SyncCursorStore:
             if not self.path.exists():
                 self._cursors = {}
                 self._entries = {}
+                self._anchors = {}
                 return
             try:
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
@@ -104,11 +119,13 @@ class SyncCursorStore:
                 _log.warning("同步游标文件无法解析，已重置：%s", exc)
                 self._cursors = {}
                 self._entries = {}
+                self._anchors = {}
                 return
             cursors = raw.get("cursors") if isinstance(raw, dict) else None
             if not isinstance(cursors, dict):
                 self._cursors = {}
                 self._entries = {}
+                self._anchors = {}
                 return
             cleaned: Dict[str, Tuple[float, int]] = {}
             for key, value in cursors.items():
@@ -123,6 +140,14 @@ class SyncCursorStore:
             self._entries = (
                 {str(k): max(0, int(v or 0)) for k, v in entries.items()}
                 if isinstance(entries, dict)
+                else {}
+            )
+            #: 老版本没有锚点：缺了就当「无从核对」，等价于只比长度。
+            #: 这会让升级后的第一轮把可疑的位置重扫一遍，之后锚点就补齐了。
+            anchors = raw.get("anchors") if isinstance(raw, dict) else None
+            self._anchors = (
+                {str(k): str(v or "") for k, v in anchors.items()}
+                if isinstance(anchors, dict)
                 else {}
             )
 
@@ -185,20 +210,73 @@ class SyncCursorStore:
         with self._lock:
             return max(0, int(self._entries.get(key, 0) or 0))
 
-    def advance_entry(self, key: str, value: int) -> int:
-        """推进条目游标，只增不减。"""
+    def anchor_for(self, key: str) -> str:
+        """读到 `entry_for(key)` 时，那一条的指纹。空串表示无从核对。"""
+        self._ensure_loaded()
+        with self._lock:
+            return str(self._anchors.get(key, "") or "")
+
+    def advance_entry(self, key: str, value: int, *, anchor: Optional[str] = None) -> int:
+        """推进条目游标，只增不减。
+
+        ``anchor`` 是「第 value 条」的指纹，用来在下一轮回答
+        「这个序号现在还指同一条记录吗」。不传时保留原有锚点 ——
+        本地日志的追加不会改变已读过那些条目，锚点仍然成立。
+        """
         self._ensure_loaded()
         target = max(0, int(value or 0))
         with self._lock:
             current = max(0, int(self._entries.get(key, 0) or 0))
-            updated = max(current, target)
-            self._entries[key] = updated
-            if updated != current:
+            if target < current:
+                # 只增不减。调用方若想回退，走 `reset_entry` ——
+                # 那条路径会连带清掉锚点，语义是完整的「回到起点」。
+                return current
+            if anchor is None:
+                self._anchors.setdefault(key, "")
+            else:
+                self._anchors[key] = str(anchor or "")
+            self._entries[key] = target
+            if target != current:
                 self._save_locked()
-            return updated
+            return target
+
+    def entry_is_valid(self, key: str, total: int, anchor_at) -> bool:
+        """游标指向的位置是否仍然成立。
+
+        ``total`` 是对端日志当前的条目总数，``anchor_at`` 接受一个
+        「给序号、返回指纹」的可调用对象（``anchor_at(index) -> str``），
+        由调用方提供 —— 日志怎么读是同步层的事，游标只管位置。
+
+        三种情况：
+
+        - 还没读过（位置 0）→ 天然有效，从头读就是全量。
+        - 日志比游标短 → 一定失效。重写过的日志整体前移，序号已经
+          指不到原来的位置了。
+        - 长度相等或更长 → **不能只看长度**。裁剪之后长度可能恰好
+          和游标相等，此时序号指向的是另一条记录，而长度判据看不出来。
+          拿锚点核对：对得上才算位置仍成立。
+
+        锚点为空（老版本文件、或当时那条没有指纹）时退回只比长度 ——
+        这是升级路径上的必要让步，不是判定逻辑的一部分。
+        """
+        self._ensure_loaded()
+        with self._lock:
+            position = max(0, int(self._entries.get(key, 0) or 0))
+            if position <= 0:
+                return True
+            if position > max(0, int(total or 0)):
+                return False
+            expected = str(self._anchors.get(key, "") or "")
+            if not expected:
+                return True
+            try:
+                actual = str(anchor_at(position) or "")
+            except Exception:  # noqa: BLE001 - 拿不到锚点就不敢判失效
+                return True
+            return actual == expected
 
     def reset_entry(self, key: str) -> int:
-        """条目游标退回 0。
+        """条目游标退回 0，并清掉锚点。
 
         对端日志被裁剪或重写之后必须这么做 —— 否则条目序号会整体前移，
         本地游标就会指向错误的位置，把没读过的记录判成「已读过」。
@@ -207,6 +285,7 @@ class SyncCursorStore:
         with self._lock:
             previous = max(0, int(self._entries.get(key, 0) or 0))
             self._entries[key] = 0
+            self._anchors.pop(key, None)
             if previous:
                 self._save_locked()
             return previous
@@ -243,7 +322,12 @@ class SyncCursorStore:
             return existed
 
     def reset(self, *, persist: bool = True) -> None:
-        """清空全部游标（下一轮回到全量重扫）。"""
+        """清空全部游标（下一轮回到全量重扫）。
+
+        只清 `cursors`（局域网那套）。条目游标是共享文件夹的本地进度，
+        它由 `reset_entry` 按来源单独回退 —— 这两种位置回答的是两个不同
+        的问题，一次全清会让两种模式互相牵连。
+        """
         with self._lock:
             self._loaded = True
             self._cursors = {}
@@ -284,6 +368,7 @@ class SyncCursorStore:
                         "since_id": value[1],
                         "since_text": _format_ts(value[0]),
                         "entries": entries,
+                        "anchor": str(self._anchors.get(key, "") or ""),
                         "position_text": (
                             f"第 {entries} 条" if key.startswith("folder:")
                             else _format_ts(value[0])
@@ -310,6 +395,11 @@ class SyncCursorStore:
             # 条目游标单独一格：它与 `cursors` 回答的是两个不同的问题
             # （本地处理到哪 / 向对端请求到哪），合并会让两者互相干扰。
             "entries": {key: int(value) for key, value in self._entries.items() if value},
+            # 锚点与 entries 一一对应：少了它，「读到第几条」在日志被重写后
+            # 就是个无法核对的数字（见 `entry_is_valid`）。
+            "anchors": {
+                key: anchor for key, anchor in self._anchors.items() if anchor
+            },
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)

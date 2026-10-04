@@ -279,6 +279,25 @@ def test_sync_cursor_json(cli_env, capsys, home):
     assert payload["cursors"][0]["key"] == "lan:127.0.0.1:48620"
 
 
+def test_sync_cursor_json_includes_anchor(cli_env, capsys, home):
+    """共享文件夹的游标要连锚点一起报出来。
+
+    排查「同步成功但没东西过来」时，第一个要问的是「位置还成立吗」——
+    而位置是否成立看的是锚点与日志第 N 条是否一致，不是一个数字。
+    只报「第几条」的话，等长重写这种情况在 CLI 上完全看不出来。
+    """
+    from linglong_clip.core.sync_cursor import build_cursor_store
+
+    store = build_cursor_store()
+    store.advance_entry("folder:peer.llsync", 3, anchor="abc123")
+
+    assert main(["--sync-cursor", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    row = next(one for one in payload["cursors"] if one["key"] == "folder:peer.llsync")
+    assert row["entries"] == 3
+    assert row["anchor"] == "abc123"
+
+
 def test_sync_cursor_reset(cli_env, capsys):
     from linglong_clip.core.sync_cursor import build_cursor_store
 
