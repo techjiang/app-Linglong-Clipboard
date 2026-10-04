@@ -286,12 +286,11 @@ def test_folder_cursor_isolated_per_peer(tmp_path):
         FolderSync(source, shared, device_name=name).export()
 
     assert importer.import_all() == 2
-    keys = sorted(importer.cursors.snapshot().keys())
-    assert keys == ["folder:laptop.llsync", "folder:phone.llsync"]
-    # 两个对端各自推进到自己的时间戳，互不覆盖
-    cursors = importer.cursors.snapshot()
-    assert cursors["folder:laptop.llsync"] == 1000.0
-    assert cursors["folder:phone.llsync"] == 1001.0
+    # 两个对端各自推进，互不覆盖。位置是「读到日志第几条」，
+    # 不是时间戳 —— 时间戳由写入方给、不保证单调，
+    # 拿它当位置判据会让带过去时间戳的新记录被永久跳过。
+    assert importer.cursors.entry_for("folder:laptop.llsync") == 1
+    assert importer.cursors.entry_for("folder:phone.llsync") == 1
 
 
 def test_folder_no_cursor_store_still_works(tmp_path):
@@ -317,7 +316,7 @@ def test_folder_status_reports_cursor_progress(tmp_path):
     details = importer.status()["device_details"]
     row = next(item for item in details if item["device"] == "laptop")
     assert row["synced"] is True
-    assert row["since"] == 1000.0
+    assert row["entries"] == 1
     assert "cursor_file" in importer.status()
 
 

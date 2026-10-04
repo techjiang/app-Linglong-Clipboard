@@ -10,24 +10,36 @@
 - 客户端把全部记录重新解析、解密、建 hash 集合
 - 真正的新增可能只有一两条
 
-游标把「已同步到的时间点」持久化下来，下一轮只请求晚于该时间点的记录。
+游标把「已经拉到哪」持久化下来，下一轮只处理后面的记录。
 收益随记录量线性放大，而代价只是一个几十字节的 JSON。
 
 设计取舍：
 
 - **按来源分别记游标**，而不是全局一个。同一个设备可能同时面对多个对端，
   每个对端的进度互不相干，共用一个游标会互相拖后腿。
-- **时间游标而非序号游标**。对端的记录量与本地的 `max_items` 淘汰策略无关，
-  用自增序号会在对端清理日志后错位；时间戳单调且跨设备语义一致。
-- **只在导入成功后推进**。失败时保留旧游标，下轮重试；否则对端短暂不可达
-  就会永久跳过那段时间里的记录。
-- **游标是 `(时间戳, id)` 复合值，不是单独的时间戳**。同一时刻写入的多条
-  记录共享 `created_at`（紧密循环写库、批量导入系统历史都会这样）。只记时间戳
-  时，若这一时刻的记录多到塞满一页，游标就推不动了：下一页请求
+- **两种来源的「位置」含义不同，所以分开存**：
+
+  | 来源 | 位置 | 为什么 |
+  | --- | --- | --- |
+  | `folder:` | 日志条目序号（第几条，见 `entry_for`） | 日志是追加式的，序号天然单调 |
+  | `lan:` | `(时间戳, id)`（见 `position_for`） | 这是协议的一部分，对端按它翻页 |
+
+  合成一个数会得出一个对两种来源都不对的答案。
+- **共享文件夹为什么不能用时间戳**：时间戳由写入方给、**不保证单调**
+  （系统剪贴板历史导入、存储迁移、任何显式构造 `created_at=过去` 的路径
+  都会写下更早的时间）。按它过滤时，新追加的记录恰好在游标之前，
+  被永久跳过 —— 而导出侧只看 `hash` 去重、照发不误：
+  两台机器各有一套自洽的说法（B 说「发了」，C 说「没收到」）。
+  条目序号与记录里任何字段无关，是「这条是新的吗」唯一可靠的判据。
+- **`lan:` 的游标是 `(时间戳, id)` 复合值，不是单独的时间戳**。同一时刻写入的
+  多条记录共享 `created_at`（紧密循环写库、批量导入系统历史都会这样）。只记
+  时间戳时，若这一时刻的记录多到塞满一页，游标就推不动了：下一页请求
   `created_at > T` 返回空，而剩下的记录并不是「更旧」，是**一样新** ——
   它们既不在这一页、也永远不在下一页，且没有任何报错。
   `id` 是 `(created_at, id)` 全序里的次级键，补上它翻页就总能前进。
   安全窗口（`SAFETY_MARGIN`）解决不了这个问题：回退一秒只会反复重读同一页。
+- **只在导入成功后推进**。失败时保留旧游标，下轮重试；否则对端短暂不可达
+  就会永久跳过那段时间里的记录。
 - **文件损坏不阻断同步**。解析失败时丢弃游标从 0 重来，只是慢一轮，
   而不是让同步直接报错。
 """
@@ -69,6 +81,10 @@ class SyncCursorStore:
         self._lock = threading.RLock()
         #: `key -> (created_at, id)`。id 为 0 表示「只按时间对齐」的旧记录。
         self._cursors: Dict[str, Tuple[float, int]] = {}
+        #: `key -> 已读到的日志条目序号`（从 1 起，0 表示还没读）。
+        #: 与 `_cursors` 分开：前者是**协议**位置（向对端请求到哪），
+        #: 后者是**本地**位置（哪些记录已处理）。两个不同的问题。
+        self._entries: Dict[str, int] = {}
         self._loaded = False
 
     # ---- 载入 / 落盘 ----
@@ -79,6 +95,7 @@ class SyncCursorStore:
             self._loaded = True
             if not self.path.exists():
                 self._cursors = {}
+                self._entries = {}
                 return
             try:
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
@@ -86,10 +103,12 @@ class SyncCursorStore:
                 # 损坏就重来，不抛异常：同步只是慢一轮，不应因此失败
                 _log.warning("同步游标文件无法解析，已重置：%s", exc)
                 self._cursors = {}
+                self._entries = {}
                 return
             cursors = raw.get("cursors") if isinstance(raw, dict) else None
             if not isinstance(cursors, dict):
                 self._cursors = {}
+                self._entries = {}
                 return
             cleaned: Dict[str, Tuple[float, int]] = {}
             for key, value in cursors.items():
@@ -98,6 +117,14 @@ class SyncCursorStore:
                     continue
                 cleaned[str(key)] = parsed
             self._cursors = cleaned
+            #: 缺失即「还没读过」：老版本没有这个字段，退回全量重扫一轮
+            #: 是安全的（hash 会去重），而不是把历史判成「已读过」。
+            entries = raw.get("entries") if isinstance(raw, dict) else None
+            self._entries = (
+                {str(k): max(0, int(v or 0)) for k, v in entries.items()}
+                if isinstance(entries, dict)
+                else {}
+            )
 
     def _ensure_loaded(self) -> None:
         if not self._loaded:
@@ -152,6 +179,43 @@ class SyncCursorStore:
                 self._save_locked()
             return updated
 
+    def entry_for(self, key: str) -> int:
+        """该来源的「已读到第几条」。0 表示还没读过。"""
+        self._ensure_loaded()
+        with self._lock:
+            return max(0, int(self._entries.get(key, 0) or 0))
+
+    def advance_entry(self, key: str, value: int) -> int:
+        """推进条目游标，只增不减。"""
+        self._ensure_loaded()
+        target = max(0, int(value or 0))
+        with self._lock:
+            current = max(0, int(self._entries.get(key, 0) or 0))
+            updated = max(current, target)
+            self._entries[key] = updated
+            if updated != current:
+                self._save_locked()
+            return updated
+
+    def reset_entry(self, key: str) -> int:
+        """条目游标退回 0。
+
+        对端日志被裁剪或重写之后必须这么做 —— 否则条目序号会整体前移，
+        本地游标就会指向错误的位置，把没读过的记录判成「已读过」。
+        """
+        self._ensure_loaded()
+        with self._lock:
+            previous = max(0, int(self._entries.get(key, 0) or 0))
+            self._entries[key] = 0
+            if previous:
+                self._save_locked()
+            return previous
+
+    def entry_snapshot(self) -> Dict[str, int]:
+        self._ensure_loaded()
+        with self._lock:
+            return dict(self._entries)
+
     def since_for(self, key: str) -> float:
         """返回该来源的请求起点：游标回退安全窗口后的值。"""
         return max(0.0, self.get(key) - SAFETY_MARGIN)
@@ -198,17 +262,32 @@ class SyncCursorStore:
             return dict(self._cursors)
 
     def status(self) -> Dict[str, object]:
-        """给 CLI / 设置页看的摘要。"""
+        """给 CLI / 设置页看的摘要。
+
+        两种来源**位置的含义不同**，所以一起报出来、由上层按前缀各自表述：
+
+        - `folder:` 按「读到日志第几条」推进（`entries`）
+        - `lan:` 按 `(时间戳, id)` 推进（`since` / `since_id`），那是协议的一部分
+
+        合成一个数会得出一个对两种来源都不对的答案。
+        """
         self._ensure_loaded()
         with self._lock:
             rows = []
-            for key, value in sorted(self._cursors.items()):
+            for key in sorted(set(self._cursors) | set(self._entries)):
+                value = self._cursors.get(key, (0.0, 0))
+                entries = max(0, int(self._entries.get(key, 0) or 0))
                 rows.append(
                     {
                         "key": key,
                         "since": value[0],
                         "since_id": value[1],
                         "since_text": _format_ts(value[0]),
+                        "entries": entries,
+                        "position_text": (
+                            f"第 {entries} 条" if key.startswith("folder:")
+                            else _format_ts(value[0])
+                        ),
                     }
                 )
             return {
@@ -228,6 +307,9 @@ class SyncCursorStore:
             # 写成 `[时间戳, id]`：旧版程序读到列表会解析失败并重置游标，
             # 结果只是慢一轮全量重扫，不会读错位置。
             "cursors": {key: [pair[0], pair[1]] for key, pair in self._cursors.items()},
+            # 条目游标单独一格：它与 `cursors` 回答的是两个不同的问题
+            # （本地处理到哪 / 向对端请求到哪），合并会让两者互相干扰。
+            "entries": {key: int(value) for key, value in self._entries.items() if value},
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)

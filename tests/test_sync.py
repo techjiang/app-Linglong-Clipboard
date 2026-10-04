@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from linglong_clip.core.models import ClipboardItem
+from linglong_clip.core.models import ClipboardItem, content_hash
 from linglong_clip.core.privacy import PrivacyGuard
 from linglong_clip.core.storage import Storage
 from linglong_clip.core.sync import FolderSync, SyncCipher, SyncRecord
@@ -36,7 +36,7 @@ def test_export_then_import_between_devices(tmp_path, home):
     assert contents == {"hello", "https://cnb.cool/x"}
 
 
-def test_import_marks_records_as_synced(tmp_path):
+def test_import_marks_records_as_synced(tmp_path, home):
     shared = tmp_path / "shared"
     source, target = Storage(tmp_path / "a.db"), Storage(tmp_path / "b.db")
     _seed(source, [("x", "text")])
@@ -49,7 +49,7 @@ def test_import_marks_records_as_synced(tmp_path):
     assert item.device == "a"
 
 
-def test_reimport_is_idempotent(tmp_path):
+def test_reimport_is_idempotent(tmp_path, home):
     shared = tmp_path / "shared"
     source, target = Storage(tmp_path / "a.db"), Storage(tmp_path / "b.db")
     _seed(source, [("x", "text")])
@@ -176,7 +176,7 @@ def test_device_name_is_sanitized_in_filename(tmp_path):
     assert ":" not in sync.journal_path.name
 
 
-def test_multiple_exports_are_appendable(tmp_path):
+def test_multiple_exports_are_appendable(tmp_path, home):
     shared = tmp_path / "shared"
     source, target = Storage(tmp_path / "a.db"), Storage(tmp_path / "b.db")
     sync = FolderSync(source, shared, device_name="a")
@@ -281,7 +281,7 @@ def test_cipher_wrong_password_returns_none():
     assert second.decrypt(first.encrypt(b"x")) is None
 
 
-def test_encrypted_export_import_roundtrip(tmp_path):
+def test_encrypted_export_import_roundtrip(tmp_path, home):
     shared = tmp_path / "shared"
     source, target = Storage(tmp_path / "a.db"), Storage(tmp_path / "b.db")
     _seed(source, [("secret-ish", "text")])
@@ -463,3 +463,291 @@ def test_unread_image_digest_is_not_advertised(tmp_path):
     by_hash = {r.hash: r for r in sync._read_journal(sync.journal_path)}
     assert by_hash["unread"].image_digest == ""
     assert by_hash["read"].image_digest == read
+
+
+def test_record_with_past_timestamp_is_still_imported(tmp_path, home):
+    """新记录的时间戳可能早于上一次同步的时刻，它仍然必须被导入。
+
+    位置原先只按 `created_at` 过滤，而时间戳**由写入方给、不保证单调**：
+    从系统剪贴板历史导入、从别处迁移、以及任何显式构造
+    `ClipboardItem(created_at=过去)` 的路径都会写下比位置更早的时间。
+
+    这类记录恰好落在位置之前，于是被永久跳过 —— 而导出侧只看 `hash`
+    去重，照发不误。两边都觉得自己是对的：B 说「发了」，C 说「没收到」。
+    """
+    import time
+
+    shared = tmp_path / "shared"
+    source, target = Storage(tmp_path / "a.db"), Storage(tmp_path / "b.db")
+    now = time.time()
+
+    _seed(source, [("first", "text")])
+    exporter = FolderSync(source, shared, device_name="a")
+    importer = FolderSync(target, shared, device_name="b")
+    assert exporter.export() == 1
+    assert importer.import_all() == 1
+
+    # 新记录，但时间戳在过去（历史导入的典型形状）
+    source.add(
+        ClipboardItem(
+            kind="text", content="imported", preview="imported",
+            hash="h-imported", created_at=now - 3600,
+        )
+    )
+    assert exporter.export() == 1
+    assert importer.import_all() == 1, "带过去时间戳的新记录被位置过滤掉了"
+    assert {item.content for item in target.iter_all()} == {"first", "imported"}
+
+
+def test_past_timestamp_record_arrives_in_later_round(tmp_path, home):
+    """同一件事的第二轮：位置已经推过该时刻之后，才追加这条老时间戳记录。
+
+    第一版用例里「过去的时间戳」仍然晚于首次导入的时刻，于是恰好落在
+    安全窗口能覆盖的范围内、被顺带捞回来 —— 看起来是绿的，其实没测到。
+    这里让位置先推进到现在，再追加一条一小时前的记录。
+    """
+    import time
+
+    shared = tmp_path / "shared"
+    source, target = Storage(tmp_path / "a.db"), Storage(tmp_path / "b.db")
+
+    _seed(source, [("early", "text")])
+    exporter = FolderSync(source, shared, device_name="a")
+    importer = FolderSync(target, shared, device_name="b")
+    exporter.export()
+    assert importer.import_all() == 1
+
+    # 先让这一对同步到「现在」的位置
+    source.add(ClipboardItem(kind="text", content="now", preview="now", hash="h-now"))
+    exporter.export()
+    assert importer.import_all() == 1
+
+    # 现在追加一条一小时前的记录 —— 位置已经在它之后了
+    source.add(
+        ClipboardItem(
+            kind="text", content="late-old", preview="late-old",
+            hash="h-late-old", created_at=time.time() - 3600,
+        )
+    )
+    assert exporter.export() == 1
+    assert importer.import_all() == 1, "位置推进过之后，老时间戳的新记录被漏掉了"
+    assert "late-old" in {item.content for item in target.iter_all()}
+
+
+def test_import_is_incremental_by_record_not_by_clock(tmp_path, home):
+    """增量语义是「只拉没见过的记录」，不是「只拉时间戳更晚的」。
+
+    反方向守一条：别为了不漏而退化成每轮全量重扫 —— 重复导入仍须为 0。
+    """
+    shared = tmp_path / "shared"
+    source, target = Storage(tmp_path / "a.db"), Storage(tmp_path / "b.db")
+    _seed(source, [("a", "text"), ("b", "text")])
+
+    FolderSync(source, shared, device_name="s").export()
+    importer = FolderSync(target, shared, device_name="t")
+    assert importer.import_all() == 2
+    assert importer.import_all() == 0
+    assert importer.import_all() == 0
+
+
+def test_trimmed_remote_journal_rescans_instead_of_skipping(tmp_path, home):
+    """对端把日志裁剪过之后，条目序号会整体前移。
+
+    此时本地游标指向的是**别人的**位置 —— 必须退回全量重扫，
+    而不是照着旧序号往下读（那会把没读过的记录判成「已读过」）。
+    """
+    shared = tmp_path / "shared"
+    source, target = Storage(tmp_path / "a.db"), Storage(tmp_path / "b.db")
+    exporter = FolderSync(source, shared, device_name="a")
+    importer = FolderSync(target, shared, device_name="b")
+
+    _seed(source, [("one", "text"), ("two", "text")])
+    exporter.export()
+    assert importer.import_all() == 2
+    assert importer.cursors.entry_for("folder:a.llsync") == 2
+
+    # 对端裁到只剩最后一条
+    assert exporter.compact(keep=1) is True
+    assert importer.import_all() == 0  # 剩下那条已经见过
+
+    # 再新增一条，位置仍然要对得上
+    source.add(ClipboardItem(kind="text", content="three", preview="three", hash="h3"))
+    exporter.export()
+    assert importer.import_all() == 1
+    assert "three" in {item.content for item in target.iter_all()}
+
+
+def test_folder_cursor_is_entry_based_not_time_based(tmp_path, home):
+    """文件夹模式的位置是「读到第几条」，不是一个时间点。
+
+    `status()` 里给出的也是条目数 —— 报一个恒为 0 的时间戳会让人误以为
+    「一直没同步过」，而这正是这一轮要消灭的那类误导。
+    """
+    shared = tmp_path / "shared"
+    source, target = Storage(tmp_path / "a.db"), Storage(tmp_path / "b.db")
+    exporter = FolderSync(source, shared, device_name="a")
+    importer = FolderSync(target, shared, device_name="b")
+
+    _seed(source, [("one", "text")])
+    exporter.export()
+    importer.import_all()
+
+    assert importer.cursors.entry_for("folder:a.llsync") == 1
+    row = next(
+        item for item in importer.status()["device_details"] if item["device"] == "a"
+    )
+    assert row["entries"] == 1
+    assert row["synced"] is True
+    assert "since" not in row
+
+
+def test_two_devices_do_not_share_sidecar_files(tmp_path, home):
+    """同一个进程里模拟两台设备时，辅助文件必须各自独立。
+
+    游标 / 墓碑 / 标记变更此前默认落在全局数据目录，两台设备于是共用
+    同一份文件：A 的动作被当成 B 的，标记互相抵消。真机上两台设备是
+    两个进程、两个数据目录，所以这个坑只在测试与「一台机器模拟两台」时
+    才踩得到 —— 而它踩下去是静默的（标记永远同步不过去）。
+    """
+    shared = tmp_path / "shared"
+    (tmp_path / "dev-a").mkdir()
+    (tmp_path / "dev-b").mkdir()
+
+    first = FolderSync(
+        Storage(tmp_path / "dev-a" / "h.db"), shared, device_name="a"
+    )
+    second = FolderSync(
+        Storage(tmp_path / "dev-b" / "h.db"), shared, device_name="b"
+    )
+
+    assert first.flag_changes.path != second.flag_changes.path
+    assert first.tombstones.path != second.tombstones.path
+    assert first.cursors.path != second.cursors.path
+
+
+def test_flag_propagates_with_independent_sidecars(tmp_path, home):
+    """上一条的功能面：辅助文件独立之后，收藏真的传得过去。
+
+    同进程共用标记变更文件时，B 的收藏会被记成「本机动作」并被 A
+    当成自己的意图 —— 于是永远不会有「对端发生了这个动作」这件事，
+    收藏停在 B 上不动。
+    """
+    shared = tmp_path / "shared"
+    (tmp_path / "dev-a").mkdir()
+    (tmp_path / "dev-b").mkdir()
+    left, right = Storage(tmp_path / "dev-a" / "h.db"), Storage(tmp_path / "dev-b" / "h.db")
+
+    digest = content_hash("text", "共享片段")
+    left.add(
+        ClipboardItem(kind="text", content="共享片段", preview="共享片段", hash=digest)
+    )
+    sync_a = FolderSync(left, shared, device_name="a")
+    sync_b = FolderSync(right, shared, device_name="b")
+
+    sync_a.export()
+    sync_b.import_all()
+    right.update_fields(right.find_by_hash(digest).id, favorite=True)
+
+    sync_b.export()
+    sync_a.import_all()
+    assert left.find_by_hash(digest).favorite is True
+
+
+def test_compacted_journal_does_not_resend_old_records(tmp_path, home):
+    """裁掉日志之后，不再重发那些已经发过的记录。
+
+    `compact()` 每轮同步都会调（`Application` 里就是 `export → import → compact`），
+    它把旧条目从日志里移除。而「发过没发过」此前只读日志 ——
+    于是裁掉的记录被当成「没发过」重新导出。
+
+    这在按时间过滤的年代只是浪费带宽（对端靠 hash 去重）；位置改成
+    「读到第几条」之后它会**丢数据**：重发的旧记录追加在日志末尾，
+    对端的位置却已经推过去了，那条记录于是永远读不到。
+    """
+    shared = tmp_path / "shared"
+    source = Storage(tmp_path / "a.db")
+    sync = FolderSync(source, shared, device_name="a")
+
+    for index in range(6):
+        source.add(
+            ClipboardItem(
+                kind="text", content=f"c{index}", preview=f"c{index}",
+                hash=f"h{index}", created_at=1000 + index,
+            )
+        )
+    assert sync.export() == 6
+    assert sync.compact(keep=3) is True
+    assert len(list(sync._read_journal(sync.journal_path))) == 3
+
+    # 裁掉的三条不该被重新发出去
+    assert sync.export() == 0, "裁掉的旧记录被重发了"
+    assert len(list(sync._read_journal(sync.journal_path))) == 3
+
+
+def test_resend_after_compaction_does_not_lose_records(tmp_path, home):
+    """上一条的端到端后果：裁剪 + 新增之后，对端仍能收到新增的那条。"""
+    shared = tmp_path / "shared"
+    source, target = Storage(tmp_path / "a.db"), Storage(tmp_path / "b.db")
+    exporter = FolderSync(source, shared, device_name="a")
+    importer = FolderSync(target, shared, device_name="b")
+
+    for index in range(6):
+        source.add(
+            ClipboardItem(
+                kind="text", content=f"c{index}", preview=f"c{index}",
+                hash=f"h{index}", created_at=1000 + index,
+            )
+        )
+    exporter.export()
+    assert importer.import_all() == 6
+
+    exporter.compact(keep=3)
+    assert importer.import_all() == 0  # 什么都没变
+
+    source.add(
+        ClipboardItem(kind="text", content="new", preview="new", hash="h-new")
+    )
+    assert exporter.export() == 1
+    assert importer.import_all() == 1, "裁剪之后新增的记录没传过去"
+    assert "new" in {item.content for item in target.iter_all()}
+
+
+def test_sent_ledger_stays_out_of_the_shared_folder(tmp_path, home):
+    """「已发过」的账本是本机私有的，不该写进共享目录。
+
+    共享目录可能是一个同步盘（OneDrive / iCloud / Syncthing），
+    放进去会被带到别的机器上 —— 对方会看到一个自己看不懂的文件，
+    而它对别的机器毫无意义（记的是「**我**发过什么」）。
+    共享目录里只该有 `*.llsync` 这些对端要读的东西。
+    """
+    shared = tmp_path / "shared"
+    (tmp_path / "dev-a").mkdir()
+    sync = FolderSync(
+        Storage(tmp_path / "dev-a" / "h.db"), shared, device_name="a"
+    )
+    _seed(sync._storage, [("x", "text")])
+    assert sync.export() == 1
+
+    # 账本落在数据目录，与数据库同级
+    assert sync._sent_ledger_path.parent == tmp_path / "dev-a"
+    assert not str(sync._sent_ledger_path).startswith(str(shared))
+    # 共享目录里只有对端日志
+    assert sorted(p.name for p in shared.iterdir()) == ["a.llsync"]
+
+
+def test_sent_ledger_corruption_does_not_break_export(tmp_path, home):
+    """账本损坏时不该让导出失败 —— 它只是「防止重发」的辅助信息。
+
+    丢了最坏是多发一轮，对端靠 `hash` 去重。为它抛异常会把整轮同步带下去，
+    代价与收益完全不成比例。
+    """
+    shared = tmp_path / "shared"
+    sync = FolderSync(
+        Storage(tmp_path / "a.db"), shared, device_name="a"
+    )
+    sync._sent_ledger_path.write_text("{ 这不是 JSON", encoding="utf-8")
+
+    _seed(sync._storage, [("x", "text")])
+    assert sync.export() == 1
+    # 损坏被当成「还没发过」，于是下轮会重发一次 —— 可接受
+    assert sync.export() == 0  # 日志里已有，仍不该重发

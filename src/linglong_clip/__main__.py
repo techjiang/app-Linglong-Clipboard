@@ -1385,7 +1385,9 @@ def _run_cli(args: argparse.Namespace) -> int:
             if not status["count"]:
                 print("尚无同步记录（或从未同步过）")
             for row in status["cursors"]:
-                print(f"  {row['key']:<32} {row['since_text']}")
+                # 位置的含义按来源不同：共享文件夹按「读到第几条」，
+                # 局域网按时间戳。混着报会让人以为两者是同一个数。
+                print(f"  {row['key']:<32} {row['position_text']}")
         storage.close()
         return 0
 
