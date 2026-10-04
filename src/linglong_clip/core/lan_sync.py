@@ -19,6 +19,11 @@
   且用 `hmac.compare_digest` 做定时安全比较。
 - **只暴露读接口**。接收方主动拉取，发送方不接收写入，
   攻击面因此只剩「读数」一条路径。
+- **版本要协商，不能只是印在产品上**。`/ping` 报出本机的协议版本，
+  `/records` 校验对端的版本，说不拢时用 426 明确拒绝并给出理由。
+  此前 `PROTOCOL_VERSION` 这个常量出现在四个地方、**没有一处会读它**，
+  于是版本不一致的表现不是报错，而是「同步成功、一条都没有」——
+  详见 `core/protocol.py`。
 """
 
 from __future__ import annotations
@@ -36,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..utils.logger import get_logger
-from . import image_transfer
+from . import image_transfer, protocol
 from .models import ClipboardItem
 from .privacy import PrivacyGuard
 from .storage import Storage
@@ -58,8 +63,10 @@ from .flag_changes import FlagChangeStore
 
 _log = get_logger("lan_sync")
 
-#: 协议版本，出现在 URL 与响应里，便于将来做兼容分支
-PROTOCOL_VERSION = "1"
+#: 协议版本。定义在 `core/protocol.py` —— 它要同时被服务端、客户端、
+#: 发现广播与 CLI 读到，四处各持一份是前几轮反复出事的结构。
+#: 这里转发一次只是为了不破坏 `from .lan_sync import PROTOCOL_VERSION` 的既有用法。
+PROTOCOL_VERSION = protocol.PROTOCOL_VERSION
 
 #: 单次拉取的最大记录数，防止一台设备一次把对端整库拉空
 DEFAULT_PAGE_SIZE = 500
@@ -82,10 +89,28 @@ class PeerInfo:
     last_seen: float = 0.0
     ok: bool = False
     error: str = ""
+    #: 对端自报的协议版本（``""`` 表示还没握过手，或对端没报）。
+    #:
+    #: 它是**握手拿到的**，不是猜的：`/ping` 与 UDP 广播都带这个字段。
+    #: 没有它的时候，「版本不一致」只能表现成「同步成功、一条都没有」。
+    protocol: str = ""
+    #: 兼容性判定，取值见 `core/protocol.py`。空串表示尚未判定。
+    compatibility: str = ""
 
     @property
     def base_url(self) -> str:
         return f"http://{self.host}:{self.port}"
+
+    @property
+    def usable(self) -> bool:
+        """这个对端能不能按本机的语义去读。
+
+        「还没握手」不算不能用 —— 握手是同步第一步会做的事，
+        在这里拦会把「首次同步」也一起拦掉。
+        """
+        if not self.compatibility:
+            return True
+        return protocol.is_usable(self.compatibility)
 
     def to_json(self) -> Dict[str, object]:
         return {
@@ -95,6 +120,9 @@ class PeerInfo:
             "last_seen": self.last_seen,
             "ok": self.ok,
             "error": self.error,
+            "protocol": self.protocol,
+            "compatible": self.usable,
+            "compatibility": self.compatibility,
         }
 
 
@@ -179,16 +207,16 @@ class _PeerHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
 
         if path == "/ping":
-            # 探测接口不校验口令：只回设备名与版本，不含任何内容
-            self._send_json(
-                200,
-                {
-                    "ok": True,
-                    "protocol": PROTOCOL_VERSION,
-                    "device": owner.device_name,
-                    "auth_required": bool(owner.token),
-                },
-            )
+            # 探测接口不校验口令：只回设备名与版本，不含任何内容。
+            # 这是**握手**：客户端从这里知道对端说的是哪个协议版本，
+            # 从而在拉数据之前就能判断「我能不能读懂它」。
+            payload = {
+                "ok": True,
+                "device": owner.device_name,
+                "auth_required": bool(owner.token),
+            }
+            payload.update(protocol.advertised_payload())
+            self._send_json(200, payload)
             return
 
         if not self._authorized():
@@ -198,6 +226,29 @@ class _PeerHandler(BaseHTTPRequestHandler):
 
         if path == "/records":
             params = urllib.parse.parse_qs(parsed.query)
+            # 版本协商必须排在**前面**：一份我们读不懂的载荷，无论后面
+            # 怎么解析都不会变对，而「解析出来 0 条」会被当成「对端没东西」。
+            # 所以这里先问版本，说不拢就直接拒掉，并且说清拒的原因。
+            verdict = protocol.peer_speaks_our_version(params.get("protocol", [""])[0])
+            if not protocol.is_usable(verdict):
+                detail = protocol.describe(params.get("protocol", [""])[0], verdict)
+                _log.warning(
+                    "拒绝 %s 的同步请求：%s", self.client_address[0], detail
+                )
+                self._send_json(
+                    # 426 Upgrade Required：语义正是「你的协议对不上，请换一个」。
+                    # 用 400 会让客户端以为是它把参数写错了，而这件事
+                    # 客户端自己改不了 —— 得人去把两台机器升到同一版本。
+                    426,
+                    {
+                        "ok": False,
+                        "error": "protocol-mismatch",
+                        "detail": detail,
+                        "server_protocol": PROTOCOL_VERSION,
+                        "client_protocol": str(params.get("protocol", [""])[0] or ""),
+                    },
+                )
+                return
             try:
                 since = float(params.get("since", ["0"])[0])
             except ValueError:
@@ -218,10 +269,10 @@ class _PeerHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "ok": True,
-                    "protocol": PROTOCOL_VERSION,
                     "device": owner.device_name,
                     "encrypted": owner.encrypted,
                     "records": records,
+                    **protocol.advertised_payload(),
                 },
             )
             # 写出成功之后才确认送达：`_send_json` 里的 `wfile.write` 失败会
@@ -683,6 +734,49 @@ class LanSyncClient:
         #: 正常情况下服务端某页不满就会让循环退出。
         self._max_pages = max(1, int((MAX_SYNC_ENTRIES // DEFAULT_PAGE_SIZE) + 2))
 
+    def handshake(self, peer: PeerInfo) -> bool:
+        """向对端要一次协议版本，判定双方能不能说上话。
+
+        为什么要单独一步而不是「拉数据的时候顺带看看」：拉回来的一份
+        读不懂的载荷，长得和「对端没有东西可同步」**一模一样** ——
+        解密成功、每行都是合法 JSON、字段读不到，于是逐条跳过，
+        导入 0 条、HTTP 200、`peer.ok = True`。用户看到的是
+        「同步成功了」，而不是「这两台机器说的不是同一种话」。
+
+        所以版本判定必须发生在**读数据之前**，并且能单独回答
+        「是不兼容，还是真的没东西」。
+
+        `/ping` 不需要口令，所以握手在口令配错时也能成功 —— 那是有意的：
+        「口令不对」和「版本不对」是两件事，不该互相掩盖。
+        """
+        request = urllib.request.Request(f"{peer.base_url}/ping", method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            peer.error = f"握手失败：HTTP {exc.code}"
+            _log.debug("握手 %s 失败：HTTP %s", peer.host, exc.code)
+            return False
+        except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError) as exc:
+            peer.error = f"握手失败：{exc}"
+            _log.debug("握手 %s 失败：%s", peer.host, exc)
+            return False
+
+        raw_version = data.get("protocol", "")
+        peer.protocol = str(raw_version or "")
+        peer.device = str(data.get("device", peer.device))
+        peer.compatibility = protocol.peer_speaks_our_version(raw_version)
+        if not protocol.is_usable(peer.compatibility):
+            # 这句话要能直接印给用户看：谁、什么版本、差在哪、该干什么
+            peer.error = protocol.describe(raw_version, peer.compatibility)
+            _log.warning("对端 %s 协议不兼容：%s", peer.host, peer.error)
+        else:
+            peer.error = ""
+        # 登记排在 `error` 之后：说明也要一起记，只记版本的话，
+        # 下次枚举出来的对端会写着「协议 2、不兼容」而错误栏是空的。
+        self._note_protocol(peer)
+        return not peer.error
+
     def fetch(
         self,
         peer: PeerInfo,
@@ -692,8 +786,24 @@ class LanSyncClient:
         limit: int = DEFAULT_PAGE_SIZE,
     ) -> Optional[List[SyncRecord]]:
         """拉取一个对端的记录；不可达或鉴权失败时返回 `None`。"""
+        # 报上自己的版本，并在读数据**之前**判定兼容性：
+        # 一份读不懂的载荷解析出来是 0 条，而那会被当成「对端没东西」。
+        known_version, known_verdict, known_error = self.peer_protocol(peer)
+        if known_verdict and not protocol.is_usable(known_verdict):
+            peer.ok = False
+            peer.protocol = peer.protocol or known_version
+            peer.compatibility = known_verdict
+            peer.error = peer.error or known_error or protocol.describe(
+                known_version, known_verdict
+            )
+            return None
         query = urllib.parse.urlencode(
-            {"since": f"{since:.6f}", "since_id": max(0, int(since_id or 0)), "limit": limit}
+            {
+                "since": f"{since:.6f}",
+                "since_id": max(0, int(since_id or 0)),
+                "limit": limit,
+                "protocol": PROTOCOL_VERSION,
+            }
         )
         url = f"{peer.base_url}/records?{query}"
         request = urllib.request.Request(url, method="GET")
@@ -705,6 +815,14 @@ class LanSyncClient:
                 code = response.status
         except urllib.error.HTTPError as exc:
             peer.ok = False
+            if exc.code == 426:
+                # 服务端明确说了「协议对不上」—— 把它的理由原样带出来，
+                # 比自己编一句「HTTP 426」有用得多。
+                peer.error = self._read_mismatch_detail(exc) or (
+                    f"对端拒绝：协议版本不一致（本机 {PROTOCOL_VERSION}）"
+                )
+                _log.warning("对端 %s 拒绝同步：%s", peer.host, peer.error)
+                return None
             peer.error = f"HTTP {exc.code}"
             if exc.code == 401:
                 _log.warning("对端 %s 拒绝访问：口令不匹配", peer.host)
@@ -731,7 +849,60 @@ class LanSyncClient:
         peer.last_seen = time.time()
         peer.ok = True
         peer.error = ""
+        # 对端在响应里也报了版本。握手已经判定过一次，这里只是兜底：
+        # 万一调用方绕过 `handshake()` 直接 `fetch()`，「说的是哪个版本」
+        # 这个事实也不该丢 —— 丢了它，下次排查又得从头猜。
+        raw_version = data.get("protocol", "")
+        if raw_version and not peer.protocol:
+            peer.protocol = str(raw_version)
+            peer.compatibility = protocol.peer_speaks_our_version(raw_version)
+        self._note_protocol(peer)
         return self._decode_records(data.get("records") or [])
+
+    def _note_protocol(self, peer: PeerInfo) -> None:
+        """把「这台对端说的是哪个版本」记下来。
+
+        记在客户端自己的字典里，而不是只写在传进来的 `PeerInfo` 上 ——
+        对端对象是**每次枚举现造**的，只写对象等于写在便签上然后扔掉。
+        键与游标一致（``host:port``），因为排查问题时这两张表要对得上。
+
+        **连 `error` 一起记**。只记版本的话，下次枚举出来的对端会写着
+        「协议 2、不兼容」而错误栏是空的 —— 状态页于是显示成一台
+        「不兼容但一切正常」的机器，用户不知道该改什么。
+        """
+        known = getattr(self, "_known_protocols", None)
+        if known is None:
+            known = {}
+            self._known_protocols = known
+        if peer.protocol or peer.compatibility:
+            known[f"{peer.host}:{peer.port}"] = (
+                peer.protocol,
+                peer.compatibility,
+                peer.error,
+            )
+
+    def peer_protocol(self, peer: PeerInfo) -> tuple:
+        """这台对端的「版本事实」：先看对象上有没有，没有就查登记表。
+
+        返回 ``(版本, 判定, 说明)``，三者都可能为空串。
+        """
+        if peer.protocol or peer.compatibility:
+            return peer.protocol, peer.compatibility, peer.error
+        return getattr(self, "_known_protocols", {}).get(
+            f"{peer.host}:{peer.port}", ("", "", "")
+        )
+
+    @staticmethod
+    def _read_mismatch_detail(exc: urllib.error.HTTPError) -> str:
+        """从 426 响应里取出对端写的那句人话；取不到就返回空串。"""
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001 - 拿不到理由不该影响主流程
+            return ""
+        if isinstance(payload, dict):
+            detail = payload.get("detail") or payload.get("error") or ""
+            return str(detail)
+        return ""
 
     def fetch_image(self, peer: PeerInfo, digest: str) -> Optional[bytes]:
         """向对端按需拉一张图。返回**已通过摘要校验**的字节，失败返回 `None`。
@@ -984,6 +1155,10 @@ class LanSyncClient:
         `since` 显式传入时按传入值拉取（并同步推进游标），为 `None` 时
         取自持久化游标——这是「每轮只拉新记录」的关键。
 
+        **先握手，再拉数据**。握手失败（版本说不拢、对端不可达）时一条不拉，
+        理由写进 `peer.error` —— 「不兼容」必须和「对端没东西」分得开，
+        否则用户看到的永远是后者。
+
         **翻页直到对端给完**。此前只拉一页：对端可外发记录超过
         `DEFAULT_PAGE_SIZE` 时，第一页之后的部分**永远不会再来第二趟** ——
         游标被推到第一页的最大时间戳，而剩余记录都比它旧，于是被永久跳过。
@@ -999,6 +1174,15 @@ class LanSyncClient:
         翻页于是总能前进。持久化游标只在**整轮翻页结束**后推进一次：
         中途失败保留旧位置，下轮从同一处重来（重复由 hash 去重吃掉）。
         """
+        # 先握手：说不拢就**一条都不拉**，并把理由写在 `peer.error` 上。
+        # 不握手的话，不兼容的对端会返回一份本机读不懂的载荷，解析结果
+        # 是 0 条 —— 那看起来和「对端没有东西可同步」完全一样。
+        if not self.handshake(peer):
+            peer.ok = False
+            if not peer.error:
+                peer.error = protocol.describe(peer.protocol, peer.compatibility)
+            return LanImportOutcome()
+
         key = self.cursor_key(peer)
         if since is None:
             requested, requested_id = self.cursors.since_pair_for(key)
@@ -1131,15 +1315,16 @@ class DiscoveryService:
             return list(self._peers.values())
 
     def _payload(self) -> bytes:
-        return json.dumps(
-            {
-                "magic": DISCOVERY_MAGIC,
-                "protocol": PROTOCOL_VERSION,
-                "device": self.device_name,
-                "port": self.port,
-                "auth_required": self.token_required,
-            }
-        ).encode("utf-8")
+        payload = {
+            "magic": DISCOVERY_MAGIC,
+            "device": self.device_name,
+            "port": self.port,
+            "auth_required": self.token_required,
+        }
+        # 与 `/ping` 同一份字段：广播说协议 2、握手说协议 1 这种自相矛盾
+        # 是无从排查的，所以两处共用 `protocol.advertised_payload()`。
+        payload.update(protocol.advertised_payload())
+        return json.dumps(payload).encode("utf-8")
 
     def announce(self) -> None:
         """主动广播一次自身信息（也用于让对端知道我们在线）。"""
@@ -1184,7 +1369,19 @@ class DiscoveryService:
             return None
         if port <= 0:
             return None
-        return PeerInfo(host=addr[0], port=port, device=device, last_seen=time.time(), ok=True)
+        # 广播里也带协议版本，所以**没握手也能先知道**对端说的是哪个版本 ——
+        # 状态页因此能在同步发生之前就提示「这台机器和你不是一个版本」。
+        raw_version = payload.get("protocol", "")
+        verdict = protocol.peer_speaks_our_version(raw_version)
+        return PeerInfo(
+            host=addr[0],
+            port=port,
+            device=device,
+            last_seen=time.time(),
+            ok=True,
+            protocol=str(raw_version or ""),
+            compatibility=verdict,
+        )
 
 
 @dataclass
@@ -1277,9 +1474,16 @@ class LanSync:
         return self._server is not None
 
     def discover(self) -> List[PeerInfo]:
-        """返回当前可用的对端列表：配置里显式给的 + 广播发现的。"""
+        """返回当前可用的对端列表：配置里显式给的 + 广播发现的。
+
+        每次调用都会重新构造 `PeerInfo`，所以**上次握手得到的版本信息
+        会由这里补回去**：不然一轮同步结束后再问状态，屏幕上写的是
+        「协议未知、兼容」—— 而刚才明明已经查明它不兼容。
+        握过手的结论是这台设备的事实，不该因为重新枚举一次对端就丢掉。
+        """
         found: List[PeerInfo] = []
         seen = set()
+        known = getattr(self, "_known_protocols", {})
         assert self._server is not None
         for spec in self.peers:
             parsed = parse_peer(spec, self._server.bound_port)
@@ -1289,7 +1493,9 @@ class LanSync:
             if key in seen:
                 continue
             seen.add(key)
-            found.append(PeerInfo(host=parsed[0], port=parsed[1]))
+            peer = PeerInfo(host=parsed[0], port=parsed[1])
+            self._remember_protocol(key, peer)
+            found.append(peer)
         if self._discovery is not None:
             for peer in self._discovery.peers:
                 key = f"{peer.host}:{peer.port}"
@@ -1298,6 +1504,24 @@ class LanSync:
                 seen.add(key)
                 found.append(peer)
         return found
+
+    def _remember_protocol(self, key: str, peer: PeerInfo) -> None:
+        """把「这台对端说的是哪个版本」记下来，供后续重新枚举时补回。
+
+        登记表就放在客户端上（`LanSyncClient._known_protocols`）——
+        门面自己再存一份的话，两边迟早分叉：一处记着「协议 2、不兼容」，
+        另一处什么都不知道，而屏幕上最终印出来的是**后者**。
+        """
+        assert self._client is not None
+        if peer.protocol or peer.compatibility:
+            self._client._note_protocol(peer)
+            return
+        version, verdict, reason = self._client.peer_protocol(peer)
+        if version or verdict:
+            peer.protocol, peer.compatibility = version, verdict
+            # 说明也要补回：否则状态页会出现「不兼容但错误栏是空的」，
+            # 用户能看到有问题、却看不到问题是哪一台机器的哪个版本。
+            peer.error = peer.error or reason
 
     def sync_all(self, *, since: Optional[float] = None) -> int:
         """对所有已知对端拉取一轮，返回导入总条数。
@@ -1323,6 +1547,10 @@ class LanSync:
             except Exception as exc:  # noqa: BLE001 - 单个对端异常不影响其它对端
                 _log.debug("同步对端 %s 出错：%s", peer.host, exc)
                 continue
+            # 对端下的结论（尤其「协议不兼容」）要带回门面里登记：
+            # 这里每轮都新建 `PeerInfo`，不登记的话下一次问状态时
+            # 屏幕上又会写成「协议未知、兼容」—— 而刚刚才查明它不兼容。
+            self._remember_protocol(f"{peer.host}:{peer.port}", peer)
             total.imported += outcome.imported
             total.removed += outcome.removed
             total.tombstones += outcome.tombstones
@@ -1409,7 +1637,12 @@ class LanSync:
         return count
 
     def probe(self, peer: PeerInfo) -> bool:
-        """探测某对端是否在线（用 `/ping`，不需要口令）。"""
+        """探测某对端是否在线（用 `/ping`，不需要口令）。
+
+        `/ping` 同时也是握手，所以这里顺手把协议版本判定下来 ——
+        状态页因此能在**同步发生之前**就说清「这台机器和你不是一个版本」，
+        而不是等用户发现「同步永远是 0 条」之后才回头猜。
+        """
         url = f"{peer.base_url}/ping"
         try:
             with urllib.request.urlopen(url, timeout=2.0) as response:
@@ -1420,6 +1653,15 @@ class LanSync:
         peer.ok = True
         peer.device = str(data.get("device", ""))
         peer.last_seen = time.time()
+        raw_version = data.get("protocol", "")
+        peer.protocol = str(raw_version or "")
+        peer.compatibility = protocol.peer_speaks_our_version(raw_version)
+        if not protocol.is_usable(peer.compatibility):
+            peer.error = protocol.describe(raw_version, peer.compatibility)
+        elif not peer.error:
+            peer.error = ""
+        assert self._client is not None
+        self._client._note_protocol(peer)
         return True
 
     def status(self, *, probe: bool = True) -> Dict[str, object]:

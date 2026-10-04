@@ -324,6 +324,55 @@ def test_sync_status_lan_json(cli_env, capsys, config):
     assert isinstance(payload["port"], int)
 
 
+def test_sync_status_flags_a_peer_that_speaks_another_protocol(cli_env, capsys, config, home):
+    """版本对不上的对端，必须在状态里**明说**，而不是显示成「在线、正常」。
+
+    这是缺陷的用户可见面：不兼容时同步永远是 0 条，而 0 条和
+    「对端最近没复制东西」长得一模一样。不提示的话，用户没有任何
+    线索，只能一直以为「同步开着，只是没东西」。
+
+    用一个只回固定 `/ping` 的假对端，不依赖第二台真机器。
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class FuturePeer(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # noqa: A003
+            pass
+
+        def do_GET(self):  # noqa: N802
+            body = json.dumps(
+                {"ok": True, "protocol": "2", "device": "future-desktop", "auth_required": False}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FuturePeer)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        config.update(
+            {
+                "sync.enabled": True,
+                "sync.mode": "lan",
+                "sync.lan_port": 0,
+                "sync.encrypt": False,
+                "sync.lan_peers": [f"127.0.0.1:{server.server_address[1]}"],
+            },
+            persist=True,
+        )
+        assert main(["--sync-status"]) == 0
+        out = capsys.readouterr().out
+        assert "协议：2" in out, "要报出对端说的是哪个版本"
+        assert "不兼容" in out
+        assert "升到同一版本" in out, "还要说清该干什么，否则用户只知道坏了"
+        assert "1 个对端与本机协议版本不一致" in out, "这是一条不会自愈的状态，要单独点出来"
+    finally:
+        server.shutdown()
+
+
 def test_sync_status_lan_disabled(cli_env, capsys, config):
     config.update({"sync.enabled": False, "sync.mode": "lan"}, persist=True)
     assert main(["--sync-status"]) == 1

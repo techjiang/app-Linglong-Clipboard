@@ -1391,6 +1391,7 @@ def _run_cli(args: argparse.Namespace) -> int:
 
     if args.sync_status:
         from .core.lan_sync import build_lan_sync
+        from .core.protocol import PROTOCOL_VERSION
         from .core.sync_cursor import build_cursor_store
 
         cursors = build_cursor_store()
@@ -1412,6 +1413,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                     print(f"加密：{'已启用' if status['encrypted'] else '未启用'}")
                     peers = status.get("peers") or []
                     print(f"对端：{len(peers)} 个")
+                    incompatible = []
                     for peer in peers:
                         label = f"{peer['host']}:{peer['port']}"
                         if peer.get("device"):
@@ -1423,6 +1425,26 @@ def _run_cli(args: argparse.Namespace) -> int:
 
                             label += f" · 已同步至 {_time.strftime('%m-%d %H:%M', _time.localtime(since))}"
                         print(f"  {label}")
+                        # 协议版本要**逐对端**报出来。不报的话，一台版本对不上的
+                        # 对端在屏幕上和「在线但最近没复制东西」长得一模一样 ——
+                        # 而它其实永远不会同步成功。
+                        if peer.get("protocol"):
+                            print(f"     协议：{peer['protocol']}（本机 {PROTOCOL_VERSION}）")
+                        elif peer.get("compatibility") == "unreported":
+                            print("     协议：对端未报版本，按本机版本处理")
+                        if peer.get("compatible") is False:
+                            incompatible.append(peer)
+                            print(f"     ⚠ 不兼容：{peer.get('error') or '版本不一致'}")
+                        elif peer.get("error"):
+                            print(f"     ⚠ {peer['error']}")
+                    if incompatible:
+                        # 这是一条**不会自愈**的状态：不提示的话，用户会一直
+                        # 以为「同步是开着的，只是没什么可同步」。
+                        print(
+                            f"⚠ 有 {len(incompatible)} 个对端与本机协议版本不一致，"
+                            "本轮不会从它们那里同步任何记录。"
+                            "请把两台机器升到同一版本。"
+                        )
                     _print_pending_event_summary()
                 node.stop()
             else:
