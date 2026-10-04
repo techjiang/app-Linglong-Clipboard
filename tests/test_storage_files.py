@@ -62,6 +62,79 @@ def test_companion_files_are_counted(tmp_path):
     ]
 
 
+def test_shm_is_not_counted_as_pending_content(tmp_path):
+    """`-shm` 是索引，不是「还没并进主库的改动」。
+
+    这个缺陷的形状：`-shm` 在 Linux 上**恒为 32 KB**（SQLite 的
+    `SQLITE_SHM_*` 常量定死），与库里有多少数据无关。此前它被并进
+    `companion_bytes`，而三处调用方都拿那个数当「待合并」报出来 ——
+    于是 WAL 明明是 0 字节，屏幕上却写着「待合并 32.0 KB ·
+    尚未并入主库的改动（下次启动会自动合并）」。
+
+    没有东西会合并，也没有东西需要合并。用户只能得出
+    「我的历史是不是一直没落盘」。
+    """
+    main = tmp_path / "history.db"
+    main.write_bytes(b"x" * 4096)
+    # WAL 空着（全部改动已并入主库），shm 是索引
+    (tmp_path / "history.db-wal").write_bytes(b"")
+    (tmp_path / "history.db-shm").write_bytes(b"z" * 32768)
+
+    footprint = storage_files.measure(main)
+    assert footprint.content_bytes == 0, "WAL 空着，不该有任何待合并的内容"
+    assert footprint.index_bytes == 32768
+    # 但总占用仍要如实算上索引 —— `du` 会看到这些字节
+    assert footprint.companion_bytes == 32768
+    assert footprint.total_bytes == 4096 + 32768
+
+
+def test_wal_content_is_counted_as_pending(tmp_path):
+    """WAL 里有真东西时才是「待合并」，且只算 WAL 那部分。"""
+    main = tmp_path / "history.db"
+    main.write_bytes(b"x" * 4096)
+    (tmp_path / "history.db-wal").write_bytes(b"y" * 5000)
+    (tmp_path / "history.db-shm").write_bytes(b"z" * 32768)
+
+    footprint = storage_files.measure(main)
+    assert footprint.content_bytes == 5000
+    assert footprint.index_bytes == 32768
+
+
+def test_journal_counts_as_pending(tmp_path):
+    """非 WAL 模式下的回滚日志同样是「装内容的」伴随文件。"""
+    main = tmp_path / "history.db"
+    main.write_bytes(b"x" * 100)
+    (tmp_path / "history.db-journal").write_bytes(b"j" * 777)
+
+    footprint = storage_files.measure(main)
+    assert footprint.content_bytes == 777
+    assert footprint.index_bytes == 0
+
+
+def test_companion_kind_matches_exact_suffixes():
+    """归类按后缀精确匹配，用户自己的同名备份文件不算任何一种。"""
+    assert storage_files.companion_kind("history.db-wal") == "content"
+    assert storage_files.companion_kind("history.db-journal") == "content"
+    assert storage_files.companion_kind("history.db-shm") == "index"
+    assert storage_files.companion_kind("history.db-wal-old") == "other"
+    assert storage_files.companion_kind("history.db-bak") == "other"
+
+
+def test_file_entry_reports_its_kind(tmp_path):
+    """每个文件条目自己说得清是「主 / 内容 / 索引」。"""
+    main = tmp_path / "history.db"
+    main.write_bytes(b"x" * 10)
+    (tmp_path / "history.db-wal").write_bytes(b"y" * 10)
+    (tmp_path / "history.db-shm").write_bytes(b"z" * 10)
+
+    kinds = {entry.name: entry.kind for entry in storage_files.measure(main).files}
+    assert kinds == {
+        "history.db": "main",
+        "history.db-wal": "content",
+        "history.db-shm": "index",
+    }
+
+
 def test_only_owned_companions_are_included(tmp_path):
     """主库名字只是前缀，不能把用户自己的同类文件算进来。
 

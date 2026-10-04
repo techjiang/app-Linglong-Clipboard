@@ -20,6 +20,7 @@
 | `density-comfortable.png` / `density-compact.png` | 列表两档密度对比 |
 | `cli-image-fetch.png` | 「图片按需补图」命令行的真实输出（两台设备、真实 socket） |
 | `cli-numbered-hotkey.png` | 浮层显示期间又复制了东西时，序号实际指向哪一条（真实 id 与内容） |
+| `cli-storage-footprint.png` | 占用里哪部分是索引、哪部分才是待合并（WAL 清零时的真实归因） |
 
 重新生成：
 

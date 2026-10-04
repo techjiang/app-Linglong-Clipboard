@@ -1896,6 +1896,68 @@ def test_stats_reports_real_footprint(home, capsys):
     assert abs(payload["db_size"] - disk) < 64 * 1024
 
 
+def test_stats_never_calls_the_shm_pending(home, capsys):
+    """`-shm` 是索引，不能说成「待合并/尚未并入主库的改动」。
+
+    缺陷的形状：`-shm` 在 Linux 上恒为 32 KB，与数据量无关。
+    它此前被并进「待合并」，于是建好库、checkpoint 干净之后，
+    `--stats` 会**长期**写着一句：
+
+        其中 32.0 KB 是尚未并入主库的改动（下次启动或 --compact 会自动合并）
+
+    一个字节的待合并内容都没有，却每天都提示用户有东西没落盘。
+    """
+    from linglong_clip.core.storage import Storage
+
+    store = Storage(home / "history.db")
+    store.count()  # 建库即可：schema 也是内容
+    # 把改动全部并进主库，WAL 清零 —— 此刻「待合并」必须为 0（或没有 WAL）
+    store._conn.commit()
+    store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    store.close()
+
+    assert main(["--stats", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    info = payload["storage_files"]
+    # 索引可能还在（另一个连接又打开了库），但它绝不能被算作内容
+    assert info["content_bytes"] == 0 or info["content_bytes"] < info["index_bytes"]
+    assert info["bytes"] == info["main_bytes"] + info["companion_bytes"]
+
+    assert main(["--stats"]) == 0
+    out = capsys.readouterr().out
+    # 「待合并」只能由装内容的伴随文件触发；这里没有内容，就不该出现
+    if "待合并" not in out:
+        assert "索引" in out or "主库" not in out
+    # 无论如何都不能出现「尚未并入主库」这句 —— 没有东西等着并
+    assert "尚未并入主库" not in out
+
+
+def test_storage_status_separates_index_from_content(home, capsys):
+    """`--storage-status` 的 JSON 要把索引与内容分开给出。"""
+    from linglong_clip.core.storage import Storage
+
+    store = Storage(home / "history.db")
+    store.count()
+    store._conn.commit()
+    store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    assert main(["--storage-status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["content_size"] == 0
+    assert payload["index_size"] >= 0
+    assert payload["companion_size"] == payload["content_size"] + payload["index_size"]
+    assert payload["size"] == payload["main_size"] + payload["companion_size"]
+    # 每个文件条目自己说清是主 / 内容 / 索引
+    kinds = {entry["name"]: entry["kind"] for entry in payload["files"]}
+    assert kinds.get("history.db") == "main"
+    for name, kind in kinds.items():
+        if name.endswith("-shm"):
+            assert kind == "index"
+        if name.endswith("-wal"):
+            assert kind == "content"
+    store.close()
+
+
 def test_stats_text_says_where_the_bytes_are(home, capsys):
     """文本输出要能看出「主库之外还有多少」。"""
     from linglong_clip.core.models import ClipboardItem

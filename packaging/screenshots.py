@@ -337,6 +337,14 @@ def main() -> int:
         title="linglong-clipboard — 快速粘贴浮层的序号指向",
     )
 
+    # 占用归因：`-shm` 被冒充成「待合并」这件事在界面上没有可截的状态
+    # （它只在 checkpoint 干净之后才现形），用真跑出来的两段输出并排说明。
+    _render_terminal(
+        _capture_storage_footprint(),
+        OUT / "cli-storage-footprint.png",
+        title="linglong-clipboard — 占用里哪部分是索引、哪部分才是待合并",
+    )
+
     storage.close()
     app.quit()
     print("完成。")
@@ -433,6 +441,91 @@ def _capture_image_cli(storage) -> list:
         elif cfg_path.exists():
             cfg_path.unlink()
     return lines
+
+
+def _capture_storage_footprint() -> list:
+    """真跑一遍「改动已全部并入主库」的现场，看占用是怎么被报出来的。
+
+    为什么要做成图：这个缺陷**在界面上没有可截的状态**。它只在
+    「checkpoint 走完、WAL 清零」之后才现形，而那一刻屏幕上印出来的
+    是一句读起来毫无破绽的话 ——「其中 32.0 KB 是尚未并入主库的改动」。
+    用户没有任何办法发现那 32 KB 其实是 `-shm`（索引，一个字节的内容都不装）。
+
+    所以这里真建一个库、真把改动 checkpoint 掉、再真跑两条命令，
+    把输出原样打出来。图里的每一行都是程序刚说的，不是照着预期写的。
+    """
+    import contextlib
+    import io
+    import sqlite3
+
+    from linglong_clip.core import storage_files
+    from linglong_clip.core.storage import Storage
+
+    lines: list = []
+
+    def run(args):
+        from linglong_clip.__main__ import main as cli_main
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            try:
+                cli_main(args)
+            except SystemExit:
+                pass
+        lines.append(f"$ linglong-clipboard {' '.join(args)}")
+        lines.extend(buffer.getvalue().splitlines())
+        lines.append("")
+
+    scratch_dir = Path(os.environ["LINGLONG_CLIPBOARD_HOME"]) / "footprint-demo"
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+    db = scratch_dir / "history.db"
+
+    # 建库 + 写入，然后**把改动全部并进主库**：此刻 WAL 清零，
+    # 没有任何东西在等着合并 —— 正是缺陷会现形的那一刻
+    store = Storage(db)
+    store.add(_footprint_demo_item())
+    store._conn.commit()
+    store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    footprint = storage_files.measure(db)
+    lines.append("（此刻磁盘上各文件是这样：）")
+    for entry in footprint.files:
+        where = {"main": "主库", "content": "装内容", "index": "纯索引"}[entry.kind]
+        lines.append(f"  {entry.name:<22} {entry.size:>8} B   {where}")
+    lines.append("")
+    lines.append("仅看 WAL：它现在是 0 字节 —— 没有任何改动没进主库。")
+    lines.append("")
+
+    # 这一份必须留在同进程里量：CLI 是另一个进程，它跑起来会重新开一次库、
+    # 又写出新的 WAL，那就看不到「干净」的现场了。
+    from linglong_clip.__main__ import _footprint_details, _footprint_line
+
+    stats = store.stats()
+    lines.append("$ linglong-clipboard --stats（只看占用那几行）")
+    lines.append(_footprint_line(stats))
+    lines.extend(_footprint_details(stats))
+    lines.append("")
+
+    # 连接关掉之后 `-shm` 自己消失，占用随之变小 —— 它本来就不是数据
+    store.close()
+    after = storage_files.measure(db)
+    lines.append("（连接关闭后：）")
+    lines.append(f"  history.db-shm 还在吗：{after.index_bytes != 0}")
+    lines.append(f"  总占用 {storage_files.format_bytes(footprint.total_bytes)}"
+                 f" → {storage_files.format_bytes(after.total_bytes)}")
+    return lines
+
+
+def _footprint_demo_item():
+    from linglong_clip.core.models import ClipboardItem, content_hash
+
+    return ClipboardItem(
+        kind="text",
+        content="会议纪要：下周二评审设计稿，记得带上交互说明",
+        preview="会议纪要：下周二评审设计稿",
+        hash=content_hash("text", "footprint-demo"),
+        source_app="chrome",
+    )
 
 
 def _capture_numbered_hotkey(storage) -> list:

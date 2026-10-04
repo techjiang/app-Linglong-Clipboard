@@ -24,11 +24,36 @@ history.db-shm    共享内存索引，进程没退出时存在
 查询都会打开）会把一份新的 WAL 写回去 —— 于是终端打印「数据库已压缩」，
 占用却几乎没变。用户只能得出「这功能是假的」。
 
+但「把它们加起来」只解决了一半。另一半是**别把索引当成内容**：
+
+```
+history.db-wal    0 字节        ← 没有任何改动没进主库
+history.db-shm   32768 字节     ← 索引，一个字节的内容都不装
+```
+
+WAL 空着、`-shm` 也不小的时候，此前会输出「待合并 32.0 KB · 尚未并入主库
+的改动（下次启动会自动合并）」—— 每一个字都是错的：没有待合并的东西，
+也没有任何事情会发生。而 `-shm` 在 Linux 上**恒为 32 KB**（SQLite 的
+`SQLITE_SHM_*` 常量定死，与库里有多少数据无关），所以这句话会**永远**挂着，
+用户会一直以为自己的历史没写完盘。
+
+`-shm` 之所以不能当内容：它是 WAL 的共享内存索引，回答的是「哪些页在 WAL 里、
+在什么位置」，本身不存数据。它与内容量的关系是零 —— 空库开着连接也是 32 KB。
+
 这个模块只做两件事，都是纯计算，不碰任何数据库连接：
 
 - `database_files(path)` —— 枚举 SQLite 库的全部伴随文件（存在即算）。
-- `measure(...)` —— 按「主文件」与「伴随文件」分别归因字节数，
-  并给出「需要自动 checkpoint 才能收回」的那部分。
+- `measure(...)` —— 按「主库 / 装内容的伴随 / 只有索引的伴随」三层归因字节数。
+
+三层对应三种不同的用户动作，所以不能合并成一个数：
+
+| 归因 | 是什么 | 用户该做什么 |
+| --- | --- | --- |
+| `main_bytes` | 主库 | 里面有空洞（`reclaimable`）才需要 `VACUUM` |
+| `content_bytes` | `-wal` / `-journal` 里没说进主库的内容 | 等自动合并，或跑 `--compact` |
+| `index_bytes` | `-shm`（纯索引） | **什么都不用做** |
+
+总占用仍是三层之和（`total_bytes`），因为用户 `du` 看到的正是这个数。
 
 伴随文件的命名规则由 SQLite 定死：主库后面直接拼 `-wal` / `-journal` / `-shm`。
 与同目录下的 `history.db-bak`、`history.db-wal-old` 这类**用户自己的文件**
@@ -40,7 +65,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 #: SQLite 会自己创建、并算作「这个库的一部分」的后缀。
 #:
@@ -50,8 +75,42 @@ from typing import Dict, List, Optional, Tuple
 #: - `-shm`：WAL 的共享内存索引，最后一个连接关闭时消失。
 COMPANION_SUFFIXES: Tuple[str, ...] = ("-wal", "-journal", "-shm")
 
+#: 伴随文件里**装着内容**的那几个：它们的大小就是「还没并进主库的改动量」。
+#:
+#: `-wal` 是预写日志，自上次 checkpoint 以来的全部改动都在里面；
+#: `-journal` 是回滚日志，只在非 WAL 模式或个别 DDL 期间存在。
+#: 二者清零（或消失）就意味着「已经全部并进主库」。
+CONTENT_SUFFIXES: Tuple[str, ...] = ("-wal", "-journal")
+
+#: 伴随文件里**只有索引、没有内容**的那个。
+#:
+#: `-shm` 是 WAL 的共享内存索引：它记录「哪些页在 WAL 里、在什么位置」，
+#: 本身**一个字节的内容都不装**。把它算成「待合并的改动」是本模块此前的
+#: 一处误报 —— 见下面 `StorageFootprint.content_bytes` 的说明。
+#:
+#: 它还有一个容易骗人的性质：Linux 上它**恒为 32 KB**（一页 4 KB 的哈希
+#: 表 + 索引区，由 SQLite 的 `SQLITE_SHM_*` 常量定死），与库里有多少数据
+#: 无关。空库开着连接也是 32 KB。所以它一旦被当成「待合并」，
+#: 用户会**永远**看到一句「有 32.0 KB 尚未并入主库」，而实际上一步都不用做。
+INDEX_SUFFIXES: Tuple[str, ...] = ("-shm",)
+
 #: 新格式（3.7.0+）WAL 的头部大小。用不到、只是别处可能想判类型。
 WAL_HEADER_SIZE = 32
+
+
+def companion_kind(name: str) -> str:
+    """这个伴随文件名是「装内容的」还是「只有索引的」。
+
+    返回 ``"content"`` / ``"index"`` / ``"other"``。判定按**后缀精确匹配**：
+    ``history.db-wal-old`` 是用户自己的文件，不能算进任何一个。
+    """
+    for suffix in CONTENT_SUFFIXES:
+        if name.endswith(suffix):
+            return "content"
+    for suffix in INDEX_SUFFIXES:
+        if name.endswith(suffix):
+            return "index"
+    return "other"
 
 
 @dataclass
@@ -67,34 +126,66 @@ class FileEntry:
     def name(self) -> str:
         return self.path.name
 
+    @property
+    def kind(self) -> str:
+        """`main` / `content` / `index` / `other`。
+
+        主文件之外的判定交给 `companion_kind()`。别处要用它的地方
+        都不要自己 `endswith` —— 「哪些后缀装内容」只有一处定义。
+        """
+        if not self.companion:
+            return "main"
+        return companion_kind(self.name)
+
     def as_dict(self) -> dict:
-        return {"name": self.name, "size": self.size, "companion": self.companion}
+        return {
+            "name": self.name,
+            "size": self.size,
+            "companion": self.companion,
+            "kind": self.kind,
+        }
 
 
 @dataclass
 class StorageFootprint:
-    """一整份历史在磁盘上的占用，按文件归因。"""
+    """一整份历史在磁盘上的占用，按文件归因。
+
+    占用分三层，因为它们对应三种**不同的用户动作**（或无需动作）：
+
+    | 归因 | 是什么 | 用户该做什么 |
+    | --- | --- | --- |
+    | `main_bytes` | 主库 | 里面有空洞才需要 `VACUUM` |
+    | `content_bytes` | WAL / journal 里**没说进主库的内容** | 等它自动合并，或跑 `--compact` |
+    | `index_bytes` | `-shm`（WAL 的共享内存索引，不装内容） | **什么都不用做** |
+
+    此前只有「主库 + 伴随」两层，`-shm` 被并进「待合并」，于是
+    「有没有待合并的改动」这个判断从根上就错了 —— 详见
+    `StorageFootprint.content_bytes`。
+    """
 
     main_bytes: int = 0
-    #: 伴随文件（WAL / journal / shm）。它们的**存在**就说明「还有改动没进主库」。
-    companion_bytes: int = 0
+    #: 装内容的伴随文件（`-wal` / `-journal`）。**它非零才代表真有改动没进主库。**
+    content_bytes: int = 0
+    #: 只有索引的伴随文件（`-shm`）。恒有、且与数据量无关，**不代表任何待办**。
+    index_bytes: int = 0
     files: List[FileEntry] = field(default_factory=list)
     #: 库不存在时为空集 —— 调用方据此说「尚未创建」，而不是说「占用 0 字节」
     exists: bool = False
 
     @property
+    def companion_bytes(self) -> int:
+        """全部伴随文件的总大小（`-wal` + `-journal` + `-shm`）。
+
+        只用来算**总占用**（用户 `du` 会看到这些字节，少算就不对账）。
+        **不要**拿它回答「有多少改动没并进主库」—— 那个问题的答案是
+        `content_bytes`，因为它不含恒为 32 KB 的 `-shm`。
+        """
+        return self.content_bytes + self.index_bytes
+
+    @property
     def total_bytes(self) -> int:
         """真实占用。这才是用户 `du` 得到的数字。"""
         return self.main_bytes + self.companion_bytes
-
-    @property
-    def companion_only_bytes(self) -> int:
-        """只靠自动 checkpoint 就能收回的部分。
-
-        单独把它列出来，是因为它与「主库里有垃圾」是两件事：
-        前者跑一次 checkpoint 就没了，后者才需要 `VACUUM`。
-        """
-        return self.companion_bytes
 
     #: `as_dict()` 的字段集合。两个后端必须给出**同一组键** ——
     #: 形状分叉的症状正是这个项目一直在防的那类：换个存储方式，
@@ -104,6 +195,8 @@ class StorageFootprint:
         "bytes",
         "main_bytes",
         "companion_bytes",
+        "content_bytes",
+        "index_bytes",
         "reclaimable_bytes",
         "exists",
         "files",
@@ -121,6 +214,8 @@ class StorageFootprint:
             "bytes": self.total_bytes,
             "main_bytes": self.main_bytes,
             "companion_bytes": self.companion_bytes,
+            "content_bytes": self.content_bytes,
+            "index_bytes": self.index_bytes,
             "reclaimable_bytes": max(0, int(reclaimable)),
             "exists": self.exists,
             "files": [entry.as_dict() for entry in self.files],
@@ -160,18 +255,16 @@ def measure(main: Optional[Path]) -> StorageFootprint:
     footprint.files = entries
     footprint.exists = any(not entry.companion for entry in entries)
     for entry in entries:
-        if entry.companion:
-            footprint.companion_bytes += entry.size
-        else:
+        if not entry.companion:
             footprint.main_bytes += entry.size
+        elif entry.kind == "content":
+            footprint.content_bytes += entry.size
+        else:
+            # `-shm` 以及任何我们没归类的伴随文件都算索引。
+            # 宁可少报「待合并」也不能多报 —— 多报会让用户去做一件
+            # 根本不存在的事（「我的改动怎么还没合并」）。
+            footprint.index_bytes += entry.size
     return footprint
-
-
-def footprint_of(path: Optional[Path]) -> Dict[str, object]:
-    """``measure()`` 的字典形式，给 CLI / 设置页直接塞进 payload。"""
-    result = measure(path).as_dict()
-    result["footprint_text"] = format_bytes(int(result["bytes"]))
-    return result
 
 
 def format_bytes(value: int) -> str:

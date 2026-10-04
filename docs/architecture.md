@@ -358,6 +358,18 @@ items_fts(content, preview, source_app, tags)   -- external content 表
 现在统一走 `core/storage_files.measure()`，`stats()['db_size']` 是总占用，
 `storage_files` 给出按文件的归因。两个后端这组键必须完全一致。
 
+归因是**三层**，因为三层对应三种不同的用户动作：
+
+| 字段 | 是什么 | 用户该做什么 |
+| --- | --- | --- |
+| `main_bytes` | 主库 | 里面有空洞（`reclaimable_bytes`）才需要 `--compact` |
+| `content_bytes` | `-wal` / `-journal` 里没说进主库的内容 | 等自动合并，或 `--compact` |
+| `index_bytes` | `-shm`，纯索引 | **什么都不用做** |
+
+只有前两层之和（`total_bytes`，含索引）才是 `du` 看到的数。
+把 `-shm` 并进 `content_bytes` 是此前的误报：它恒为 32 KB，
+checkpoint 干净之后 `--stats` 仍会天天提示「有 32.0 KB 尚未并入主库」。
+
 `optimize()` 的顺序也有讲究：**先 `VACUUM` 再 `wal_checkpoint(TRUNCATE)`**。
 反过来会让 `VACUUM` 的改动立刻写出一份新 WAL，于是「数据库已压缩」
 打完收工、占用却几乎没变。也不在这里 `close()` ——

@@ -321,6 +321,8 @@ def _apply_storage_switch(args, config) -> int:
             "size": footprint.total_bytes,
             "main_size": footprint.main_bytes,
             "companion_size": footprint.companion_bytes,
+            "content_size": footprint.content_bytes,
+            "index_size": footprint.index_bytes,
             "files": [entry.as_dict() for entry in footprint.files],
             "sqlite_path": str(database_path()),
             "json_path": str(json_path()),
@@ -333,14 +335,23 @@ def _apply_storage_switch(args, config) -> int:
         print(f"历史文件：{target}{'' if target.exists() else '（尚未创建）'}")
         if footprint.exists:
             print(f"文件大小：{storage_files.format_bytes(footprint.total_bytes)}")
-            if footprint.companion_bytes:
+            if footprint.content_bytes:
                 # 逐个数出来，用户才能把「这个 -wal 是谁建的」对上号
                 names = "、".join(
-                    entry.name for entry in footprint.files if entry.companion
+                    entry.name
+                    for entry in footprint.files
+                    if entry.kind == "content"
                 )
                 print(
-                    f"          其中 {storage_files.format_bytes(footprint.companion_bytes)}"
+                    f"          其中 {storage_files.format_bytes(footprint.content_bytes)}"
                     f" 在 {names}（尚未并入主库的改动，启动时会自动合并）"
+                )
+            if footprint.index_bytes:
+                # 索引要报，但不能说成「待合并」：它不装内容、不会合并。
+                # `du` 会看到这些字节，不报就又是「数对不上」。
+                print(
+                    f"          另有 {storage_files.format_bytes(footprint.index_bytes)}"
+                    " 是 WAL 索引（history.db-shm，不装内容，随连接关闭消失）"
                 )
         other = database_path() if backend == "json" else json_path()
         if other.exists():
@@ -468,14 +479,27 @@ def _footprint_line(stats: dict) -> str:
 
     info = stats.get("storage_files") or {}
     total = int(info.get("bytes", stats.get("db_size") or 0))
-    companion = int(info.get("companion_bytes") or 0)
     if not info.get("exists"):
         return f"{storage_files.format_bytes(total)}（尚未创建）"
-    if companion:
+    main_bytes = int(info.get("main_bytes") or 0)
+    # 「待合并」只认装内容的伴随文件（WAL / journal）。
+    # 拿 `companion_bytes` 来答这个问题会把恒为 32 KB 的 `-shm` 也算进去，
+    # 于是 WAL 明明是 0 字节、屏幕上却写着「待合并 32.0 KB」。
+    content = int(info.get("content_bytes") or 0)
+    index = int(info.get("index_bytes") or 0)
+    if content:
         return (
             f"{storage_files.format_bytes(total)}"
-            f"（主库 {storage_files.format_bytes(int(info.get('main_bytes') or 0))}"
-            f" + 待合并 {storage_files.format_bytes(companion)}）"
+            f"（主库 {storage_files.format_bytes(main_bytes)}"
+            f" + 待合并 {storage_files.format_bytes(content)}）"
+        )
+    if index:
+        # 有索引但没内容：占用要如实报出来（`du` 会看到），
+        # 但不能说成「待合并」—— 它不会合并，也不该合并。
+        return (
+            f"{storage_files.format_bytes(total)}"
+            f"（主库 {storage_files.format_bytes(main_bytes)}"
+            f" + 索引 {storage_files.format_bytes(index)}）"
         )
     return storage_files.format_bytes(total)
 
@@ -494,12 +518,14 @@ def _footprint_details(stats: dict) -> list:
     if not info.get("exists"):
         return []
     lines = []
-    companion = int(info.get("companion_bytes") or 0)
+    # **只报装内容的伴随文件**。`-shm` 不参与这个判断 —— 它恒为 32 KB、
+    # 与数据量无关，此前被算进来，于是「大于主库 5%」这条阈值对一个
+    # 小小的空库永远成立，`--stats` 会长期提示一件不存在的事。
+    content = int(info.get("content_bytes") or 0)
     main_bytes = int(info.get("main_bytes") or 0)
-    # 几百字节的 shm 是恒有的，小到可以忽略时报出来只会让人疑神疑鬼
-    if companion > max(64 * 1024, main_bytes * 0.05):
+    if content > max(64 * 1024, main_bytes * 0.05):
         lines.append(
-            f"          其中 {storage_files.format_bytes(companion)} 是尚未并入主库的改动"
+            f"          其中 {storage_files.format_bytes(content)} 是尚未并入主库的改动"
             "（下次启动或 --compact 会自动合并）"
         )
     holes = int(info.get("reclaimable_bytes") or 0)

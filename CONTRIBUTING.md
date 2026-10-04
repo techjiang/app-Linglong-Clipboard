@@ -96,10 +96,21 @@ get_meta / set_meta / optimize / stats / close
   之间差一倍 —— 而用户正是拿它决定要不要清理历史。实测 300 条记录：
   报「2.6 MB」，磁盘上躺着 6.7 MB。
 - **`stats()` 的 `db_size` 是总占用**，另有 `storage_files` 给出按文件的
-  归因（`main_bytes` / `companion_bytes` / `files` / `reclaimable_bytes`）。
-  两个后端的这组键**必须完全一致**（见 `StorageFootprint.DICT_KEYS`）：
-  JSON 单文件没有「空洞」的概念，但那个键仍要在、值为 0 ——
-  「没有这个概念」与「有、现在是 0」对调用方不该是两件事，否则它就得写分支。
+  归因（`main_bytes` / `companion_bytes` / `content_bytes` / `index_bytes` /
+  `files` / `reclaimable_bytes`）。两个后端的这组键**必须完全一致**
+  （见 `StorageFootprint.DICT_KEYS`）：JSON 单文件没有「空洞」的概念，
+  但那个键仍要在、值为 0 ——「没有这个概念」与「有、现在是 0」对调用方
+  不该是两件事，否则它就得写分支。
+- **别把 `-shm` 当「待合并」**。伴随文件分两类：`-wal` / `-journal`
+  **装内容**（`content_bytes`，它非零才真有改动没进主库），`-shm` 只有
+  **索引**（`index_bytes`）。`-shm` 在 Linux 上**恒为 32 KB**、与数据量无关，
+  把它算进「待合并」的后果是：checkpoint 干净之后，`--stats` 与设置页
+  会**长期**写着「其中 32.0 KB 是尚未并入主库的改动（下次启动会自动合并）」
+  —— 没有东西会合并，也没有东西需要合并，用户只能以为自己没落盘。
+  回答「有没有待合并的改动」用 `content_bytes`，算总占用才用 `companion_bytes`
+  （`du` 会看到索引那几十 KB，少算就不对账）。
+  回归闸门：`tests/test_storage_files.py::test_shm_is_not_counted_as_pending_content`
+  与 `tests/test_cli.py::test_stats_never_calls_the_shm_pending`。
 - **伴随文件按后缀精确匹配**，不能用 `glob("history.db*")`：用户目录里
   出现 `history.db-wal-old`、`history.db-bak` 是很自然的，算进来会让占用虚高。
 - **`measure()` 不许抛异常**。取不到大小的文件按「不存在」处理而不是记
