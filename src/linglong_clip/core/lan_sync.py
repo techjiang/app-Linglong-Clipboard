@@ -799,7 +799,24 @@ class LanSyncClient:
             return None
         query = urllib.parse.urlencode(
             {
-                "since": f"{since:.6f}",
+                # 时间戳必须**原样**送出，不能格式化成固定小数位。
+                # `f"{since:.6f}"` 会四舍五入，而 `time.time()` 在本机有
+                # 约 7 位小数精度：`1791123794.7115078` 被写成
+                # `1791123794.711508`，比原值**大**了 2e-7。服务端的排他
+                # 游标于是变成 `created_at > since`，而同一时刻的那批记录
+                # 恰好等于原值 —— 一条都不满足，整批被静默跳过：
+                #
+                #     本页末尾 created_at = 1791123794.7115078, seq = 500
+                #     请求 since = 1791123794.711508（已进位）
+                #     条件 created_at > since            → 假
+                #          created_at = since AND id > 500 → 假（值不等）
+                #     → 对端返回 0 条，界面写「同步成功」，尾巴永久丢失
+                #
+                # `repr()` 给出的是能往返还原该浮点数的**最短**字符串
+                # （`float(repr(x)) == x` 恒成立），正好满足「不丢精度
+                # 又不拖一串无意义的零」。`urllib.parse.urlencode` 会做
+                # 百分号编码，逗号/加号都不出现在这里，无需额外处理。
+                "since": repr(float(since or 0.0)),
                 "since_id": max(0, int(since_id or 0)),
                 "limit": limit,
                 "protocol": PROTOCOL_VERSION,
@@ -1215,17 +1232,39 @@ class LanSyncClient:
             total.flags_updated += page_outcome.flags_updated
             total.flag_changes += page_outcome.flag_changes
 
-            # 本页的「最后一条」= 服务端全序里的最大 `(created_at, seq)`。
+            # 本页的「最后一条」= 服务端**内容流**里的最大 `(created_at, seq)`。
             # 服务端 `since` 是排他语义，直接把游标推到最后一条即可，
             # 不会重读这一条。取 max 而不是末元素，是不假设响应内的顺序。
+            #
+            # **墓碑与标记变更必须排除在外。** 它们不在 `since` 分页的内容流里
+            # （服务端每页都把它们整批带上，见 `collect_records_detailed`），
+            # 各自的时间戳（`deleted_at` / 变更时刻）与内容记录的时间**毫无关系**。
+            # 把它们算进来，游标就会被一个「比待拉内容更晚」的墓碑时间带走：
+            #
+            #     本页内容    created_at = T（还有 T 时刻的后续记录没拉）
+            #     同批墓碑    deleted_at  = T + 86400（昨天的一条删除）
+            #     page_last = (T + 86400, 0) → 下一页请求 since = T + 86400
+            #     T 时刻剩下的记录（created_at < T + 86400）→ 永久跳过
+            #
+            # 后果与「按时间戳过滤」那轮修过的完全同形：不报错、界面写
+            # 「同步成功」，而记录没了。区别只是污染游标的换成了墓碑。
+            page_records = [
+                record
+                for record in records
+                if not record.is_tombstone and not record.is_flag_change
+            ]
             page_last = max(
-                (self._page_position(record) for record in records),
-                default=(0.0, 0),
+                (self._page_position(record) for record in page_records),
+                default=(requested, requested_id),
             )
             if page_last <= (requested, requested_id):
-                # 位置没有前进：对端没带 `seq`（旧版本）且同刻记录塞满一页。
-                # 再问下去只会拿到同一批，只能结束本轮 —— 剩下的记录
-                # 要靠对端升级后补齐。这里保持原状而不是死循环。
+                # 位置没有前进。两种情形：
+                # - 本页只有墓碑/变更（没有内容推进位置），下一页仍是同一批
+                #   内容 —— 说明内容已经读完，正常结束。
+                # - 对端没带 `seq`（旧版本）且同刻记录塞满一页，再问只会拿到
+                #   同一批，只能结束，剩余记录靠对端升级后补齐。
+                if not page_records:
+                    break
                 _log.warning(
                     "对端 %s 的游标无法前进（同刻记录已满一页且响应无 seq）："
                     "本轮提前结束，剩余记录需对端升级后补齐",
@@ -1235,8 +1274,10 @@ class LanSyncClient:
             requested, requested_id = page_last
             advanced = page_last
 
-            # 不满一页说明对端已经给完了，不必再多发一次请求
-            if len(records) < DEFAULT_PAGE_SIZE:
+            # 不满一页说明对端已经给完了，不必再多发一次请求。
+            # 判据只看**内容记录**：墓碑/变更每页都会整批附带，把它们算进
+            # 「这一页满没满」，有墓碑时页面会永远看着像满的，白多拉一轮。
+            if len(page_records) < DEFAULT_PAGE_SIZE:
                 break
 
         if advanced is not None:

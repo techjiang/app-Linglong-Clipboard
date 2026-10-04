@@ -12,6 +12,7 @@ import socket
 import time
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import pytest
@@ -1314,6 +1315,205 @@ def test_lan_seq_is_not_written_into_shared_journal(storage, tmp_path):
     # 从日志形状的字典还原时，缺这个键要落回 0，而不是报错
     restored = SyncRecord.from_json(record.to_json())
     assert restored is not None and restored.seq == 0
+
+
+# ---------- 游标的时间戳不能被格式化，也不能被墓碑带走 ----------
+
+
+def test_lan_since_keeps_full_float_precision(nodes):
+    """请求 URL 里的 `since` 必须原样送出，不能截成固定小数位。
+
+    旧实现写的是 `f"{since:.6f}"`。`time.time()` 在本机约 7 位小数，
+    格式化会**四舍五入**：`1791123793.7115078` 被写成
+    `1791123793.711508` —— 比原值大 2e-7。服务端游标是排他语义
+    （`created_at > since`），页尾同刻的那批记录恰好等于原值，
+    一条都不满足，整批被静默跳过。
+
+    必须抓**真实的 HTTP 请求 URL**：客户端内部传给 `fetch` 的还是
+    完整的浮点数，舍入发生在 `fetch` 拼查询串那一步，在 `fetch` 的
+    调用处打桩是看不到的（第一版用例就是这么假绿的）。
+    """
+    make, local, remote = nodes
+    _add_same_instant(local, 2, at=1791123794.7115078)
+
+    a = make(local, "a", token="t")
+    port = a.status()["port"]
+    b = make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{port}"]
+
+    # 先同步一轮，把游标停在 `1791123794.7115078`
+    assert b.sync_all() == 2
+    peer = PeerInfo(host="127.0.0.1", port=port)
+    key = b._client.cursor_key(peer)
+    stored = b._client.cursors.get_pair(key)[0]
+    assert stored == 1791123794.7115078
+    expected_since = b._client.cursors.since_pair_for(key)[0]
+    assert expected_since == 1791123793.7115078
+    # 这个值用 6 位小数表达不了 —— 正是旧实现出错的地方
+    assert float(f"{expected_since:.6f}") != expected_since
+
+    urls: list = []
+
+    class _Recorder:
+        """把请求 URL 记下来后交给真的 opener，请求本身照常发生。"""
+
+        def __init__(self, real):
+            self._real = real
+
+        def __call__(self, request, *args, **kwargs):
+            urls.append(getattr(request, "full_url", str(request)))
+            return self._real(request, *args, **kwargs)
+
+    import urllib.request as url_mod
+
+    real_open = url_mod.urlopen
+    url_mod.urlopen = _Recorder(real_open)  # type: ignore[assignment]
+    try:
+        b.sync_all()
+    finally:
+        url_mod.urlopen = real_open  # type: ignore[assignment]
+
+    records_urls = [u for u in urls if "/records?" in u]
+    assert records_urls, "必须发出 /records 请求"
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(records_urls[0]).query)
+    sent = float(query["since"][0])
+    assert sent == expected_since, (
+        f"URL 里的 since 被格式化丢了精度：{sent!r}，应为 {expected_since!r}"
+    )
+
+
+def test_lan_same_instant_beyond_page_at_real_precision(nodes):
+    """真实精度（非整数时刻）下，同刻记录超过一页也不能丢。
+
+    旧实现把 `since` 四舍五入到 6 位小数，页尾时间戳被进位，下一页的
+    排他条件对同刻剩余记录全为假 —— 服务端返回 0 条，界面写「同步成功」。
+    此前的同刻用例全用 `3000.0` 这类整数时刻，在旧实现下也正常，
+    所以一条都没抓到它。
+    """
+    make, local, remote = nodes
+    _add_same_instant(local, 1005, at=1791123794.7115078)
+
+    a, b = make(local, "a", token="t"), make(remote, "b", token="t")
+    b.peers = [f"127.0.0.1:{a.status()['port']}"]
+
+    assert b.sync_all() == 1005
+    assert remote.count() == 1005
+    assert b.sync_all() == 0, "重复同步仍须为 0，不能退化成全量重扫"
+
+
+def test_lan_tombstone_timestamp_does_not_push_cursor_forward(nodes):
+    """墓碑的时间戳不能推进内容游标。
+
+    墓碑不在 `since` 分页的内容流里 —— 服务端每页整批附带，而它的时间
+    （`deleted_at`）与内容记录的时间毫无关系。旧实现把**全部**返回记录
+    拿来取 `max`，于是一个「比待拉内容更晚」的墓碑会把游标直接带走，
+    剩下的内容记录永久跳过：不报错、界面写「同步成功」。
+
+    用整数时刻写内容（避开四舍五入那条路径），单独验证墓碑这一条。
+    """
+    make, local, remote = nodes
+    # 时间戳要落在保留期内，否则墓碑会被当成过期、根本不发出去 ——
+    # 那样测的就不是游标，而是「什么都没发生」。
+    # 取 3 位小数：能被 6 位小数精确表达，从而把「四舍五入」那条
+    # 独立缺陷排除在外，单独验证墓碑这一条。
+    base = round(time.time(), 3)
+    _add_same_instant(local, 505, at=base)
+
+    from linglong_clip.core.tombstones import TombstoneStore
+
+    store = TombstoneStore(local.path.parent / "tombstones.json")
+    store.record("deadbeef" * 4, deleted_at=base + 0.25)  # 比内容晚 0.25 秒
+
+    a = LanSync(
+        storage=local, device_name="a", token="t", port=0,
+        guard=PrivacyGuard(), tombstones=store,
+    )
+    b = LanSync(
+        storage=remote, device_name="b", token="t", port=0, guard=PrivacyGuard()
+    )
+    assert a.start() and b.start()
+    try:
+        b.peers = [f"127.0.0.1:{a.status()['port']}"]
+        assert b.sync_all() == 505
+        assert remote.count() == 505, "墓碑的时间戳不该把内容游标带走"
+    finally:
+        a.stop()
+        b.stop()
+
+
+def test_lan_flag_change_timestamp_does_not_push_cursor_forward(nodes):
+    """标记变更的时间戳同样不能推进内容游标（与墓碑同一条约束）。"""
+    make, local, remote = nodes
+    base = round(time.time(), 3)
+    _add_same_instant(local, 505, at=base)
+
+    from linglong_clip.core.flag_changes import FLAG_PINNED, FlagChangeStore
+
+    store = FlagChangeStore(local.path.parent / "flag_changes.json")
+    store.record("cafebabe" * 4, FLAG_PINNED, True, at=base + 0.5, device="a")
+
+    a = LanSync(
+        storage=local, device_name="a", token="t", port=0,
+        guard=PrivacyGuard(), flag_changes=store,
+    )
+    b = LanSync(
+        storage=remote, device_name="b", token="t", port=0, guard=PrivacyGuard()
+    )
+    assert a.start() and b.start()
+    try:
+        b.peers = [f"127.0.0.1:{a.status()['port']}"]
+        assert b.sync_all() == 505
+        assert remote.count() == 505
+    finally:
+        a.stop()
+        b.stop()
+
+
+def test_lan_tombstone_only_page_does_not_loop(nodes):
+    """只剩墓碑可带时正常结束，且游标没被墓碑推走。
+
+    内容已经拉完、只有一条墓碑的场景：`page_records` 为空、位置没有前进。
+    必须正常结束（而不是被当成「游标推不动」的故障），且游标仍停在
+    内容的位置 —— 否则该时刻后补的记录会被漏掉。
+    """
+    make, local, remote = nodes
+    base = round(time.time(), 3)
+    _add_same_instant(local, 3, at=base)
+
+    from linglong_clip.core.tombstones import TombstoneStore
+
+    store = TombstoneStore(local.path.parent / "tombstones.json")
+    # 墓碑要明显晚于内容（>1 秒的安全窗口），否则游标回退的那一秒
+    # 会把「墓碑把游标带走」的后果盖住 —— 那时用例会假绿。
+    store.record("f00dface" * 4, deleted_at=base + 600.0)
+
+    a = LanSync(
+        storage=local, device_name="a", token="t", port=0,
+        guard=PrivacyGuard(), tombstones=store,
+    )
+    b = LanSync(
+        storage=remote, device_name="b", token="t", port=0, guard=PrivacyGuard()
+    )
+    assert a.start() and b.start()
+    try:
+        b.peers = [f"127.0.0.1:{a.status()['port']}"]
+        assert b.sync_all() == 3
+        # 第二轮：只有墓碑、没有内容，必须立刻返回 0，不能空转
+        assert b.sync_all() == 0
+
+        # 再写一条**同一时刻**的记录。游标若被墓碑的 `base + 600` 推走，
+        # 这条就永远拉不到。
+        local.add(
+            ClipboardItem(
+                kind="text", content="late", preview="late",
+                created_at=base, hash="late",
+            )
+        )
+        assert b.sync_all() == 1
+        assert remote.find_by_hash("late") is not None
+    finally:
+        a.stop()
+        b.stop()
 
 
 # ---------- 图片按需传输 ----------
