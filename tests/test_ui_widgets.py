@@ -1767,6 +1767,54 @@ def test_settings_shows_real_footprint(qt_app, home):
     store.close()
 
 
+def test_settings_never_calls_the_shm_pending(qt_app, home):
+    """设置页也不能把 `-shm` 说成「待合并」。
+
+    这和 `--stats` 是同一个缺陷的两个出口：`-shm` 在 Linux 上恒为 32 KB，
+    与数据量无关。把「改动全部并入主库、WAL 清零」之后的现场交给设置页，
+    它此前会写「+ 待合并 32.0 KB」—— 一件不存在、也不会发生的事。
+    """
+    from linglong_clip.core.storage import Storage
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+    from linglong_clip.utils.paths import database_path
+
+    store = Storage(home / "history.db")
+    store.count()
+    store._conn.commit()
+    store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    assert database_path() == home / "history.db"
+
+    dialog = SettingsDialog(Config(home / "config.json"))
+    text = dialog._storage_size.text()
+    assert "待合并" not in text, "WAL 已清空，不该说有待合并的改动"
+    assert "索引" in text or "主库" not in text
+    store.close()
+
+
+def test_settings_counts_wal_content_as_pending(qt_app, home):
+    """WAL 里真有内容时，设置页必须说「待合并」。
+
+    反向守一条：不能为了去掉误报就把真话也一起删了。
+    """
+    from linglong_clip.core.models import ClipboardItem
+    from linglong_clip.core.storage import Storage
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    store = Storage(home / "history.db")
+    for index in range(40):
+        store.add(
+            ClipboardItem(kind="text", content=f"内容 {index} " + "x" * 3000, preview=f"{index}")
+        )
+
+    dialog = SettingsDialog(Config(home / "config.json"))
+    text = dialog._storage_size.text()
+    assert "待合并" in text
+    assert "索引" not in text
+    store.close()
+
+
 def test_settings_footprint_without_history(qt_app, home):
     """没有历史文件时说「尚无历史文件」，不谎报 0。"""
     from linglong_clip.ui.settings_dialog import SettingsDialog

@@ -1363,10 +1363,20 @@ class SettingsDialog(QDialog):
             self._storage_size.setText("尚无历史文件")
             return
         text = storage_files.format_bytes(footprint.total_bytes)
-        if footprint.companion_bytes:
+        main_text = storage_files.format_bytes(footprint.main_bytes)
+        # 「待合并」只认 WAL / journal。把 `-shm` 也算进去的话，
+        # 空库开着连接就会写「+ 待合并 32.0 KB」，而那 32 KB 全是索引、
+        # 一个字节都不会被合并 —— 用户会一直以为历史没写完盘。
+        if footprint.content_bytes:
             text += (
-                f"（主库 {storage_files.format_bytes(footprint.main_bytes)}"
-                f" + 待合并 {storage_files.format_bytes(footprint.companion_bytes)}）"
+                f"（主库 {main_text}"
+                f" + 待合并 {storage_files.format_bytes(footprint.content_bytes)}）"
+            )
+        elif footprint.index_bytes:
+            # 索引也要报（`du` 会看到），但用词得说清它不用处理
+            text += (
+                f"（主库 {main_text}"
+                f" + 索引 {storage_files.format_bytes(footprint.index_bytes)}）"
             )
         self._storage_size.setText(text)
 

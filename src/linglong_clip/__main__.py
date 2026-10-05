@@ -321,6 +321,8 @@ def _apply_storage_switch(args, config) -> int:
             "size": footprint.total_bytes,
             "main_size": footprint.main_bytes,
             "companion_size": footprint.companion_bytes,
+            "content_size": footprint.content_bytes,
+            "index_size": footprint.index_bytes,
             "files": [entry.as_dict() for entry in footprint.files],
             "sqlite_path": str(database_path()),
             "json_path": str(json_path()),
@@ -333,14 +335,23 @@ def _apply_storage_switch(args, config) -> int:
         print(f"历史文件：{target}{'' if target.exists() else '（尚未创建）'}")
         if footprint.exists:
             print(f"文件大小：{storage_files.format_bytes(footprint.total_bytes)}")
-            if footprint.companion_bytes:
+            if footprint.content_bytes:
                 # 逐个数出来，用户才能把「这个 -wal 是谁建的」对上号
                 names = "、".join(
-                    entry.name for entry in footprint.files if entry.companion
+                    entry.name
+                    for entry in footprint.files
+                    if entry.kind == "content"
                 )
                 print(
-                    f"          其中 {storage_files.format_bytes(footprint.companion_bytes)}"
+                    f"          其中 {storage_files.format_bytes(footprint.content_bytes)}"
                     f" 在 {names}（尚未并入主库的改动，启动时会自动合并）"
+                )
+            if footprint.index_bytes:
+                # 索引要报，但不能说成「待合并」：它不装内容、不会合并。
+                # `du` 会看到这些字节，不报就又是「数对不上」。
+                print(
+                    f"          另有 {storage_files.format_bytes(footprint.index_bytes)}"
+                    " 是 WAL 索引（history.db-shm，不装内容，随连接关闭消失）"
                 )
         other = database_path() if backend == "json" else json_path()
         if other.exists():
@@ -468,14 +479,27 @@ def _footprint_line(stats: dict) -> str:
 
     info = stats.get("storage_files") or {}
     total = int(info.get("bytes", stats.get("db_size") or 0))
-    companion = int(info.get("companion_bytes") or 0)
     if not info.get("exists"):
         return f"{storage_files.format_bytes(total)}（尚未创建）"
-    if companion:
+    main_bytes = int(info.get("main_bytes") or 0)
+    # 「待合并」只认装内容的伴随文件（WAL / journal）。
+    # 拿 `companion_bytes` 来答这个问题会把恒为 32 KB 的 `-shm` 也算进去，
+    # 于是 WAL 明明是 0 字节、屏幕上却写着「待合并 32.0 KB」。
+    content = int(info.get("content_bytes") or 0)
+    index = int(info.get("index_bytes") or 0)
+    if content:
         return (
             f"{storage_files.format_bytes(total)}"
-            f"（主库 {storage_files.format_bytes(int(info.get('main_bytes') or 0))}"
-            f" + 待合并 {storage_files.format_bytes(companion)}）"
+            f"（主库 {storage_files.format_bytes(main_bytes)}"
+            f" + 待合并 {storage_files.format_bytes(content)}）"
+        )
+    if index:
+        # 有索引但没内容：占用要如实报出来（`du` 会看到），
+        # 但不能说成「待合并」—— 它不会合并，也不该合并。
+        return (
+            f"{storage_files.format_bytes(total)}"
+            f"（主库 {storage_files.format_bytes(main_bytes)}"
+            f" + 索引 {storage_files.format_bytes(index)}）"
         )
     return storage_files.format_bytes(total)
 
@@ -494,12 +518,14 @@ def _footprint_details(stats: dict) -> list:
     if not info.get("exists"):
         return []
     lines = []
-    companion = int(info.get("companion_bytes") or 0)
+    # **只报装内容的伴随文件**。`-shm` 不参与这个判断 —— 它恒为 32 KB、
+    # 与数据量无关，此前被算进来，于是「大于主库 5%」这条阈值对一个
+    # 小小的空库永远成立，`--stats` 会长期提示一件不存在的事。
+    content = int(info.get("content_bytes") or 0)
     main_bytes = int(info.get("main_bytes") or 0)
-    # 几百字节的 shm 是恒有的，小到可以忽略时报出来只会让人疑神疑鬼
-    if companion > max(64 * 1024, main_bytes * 0.05):
+    if content > max(64 * 1024, main_bytes * 0.05):
         lines.append(
-            f"          其中 {storage_files.format_bytes(companion)} 是尚未并入主库的改动"
+            f"          其中 {storage_files.format_bytes(content)} 是尚未并入主库的改动"
             "（下次启动或 --compact 会自动合并）"
         )
     holes = int(info.get("reclaimable_bytes") or 0)
@@ -1345,9 +1371,20 @@ def _run_cli(args: argparse.Namespace) -> int:
 
         cursors = build_cursor_store()
         if args.sync_cursor_reset:
-            count = len(cursors.snapshot())
-            cursors.reset()
-            print(f"已清空 {count} 条同步游标，下次同步将重新全量扫描")
+            # 「重新全量扫描」必须真的是全量。此前这里只清局域网的 `cursors`，
+            # 共享文件夹的条目进度（`entries` / `anchors`）原封不动 ——
+            # 于是命令报「已清空 1 条」而列表里还排着另外两条，
+            # 用户没有任何办法让它们归零：判失效要先读得到对端日志，
+            # 而对端日志已经不在本机时，那条路径永远走不到。
+            lan, entries = cursors.reset_all()
+            total = lan + entries
+            if total:
+                print(
+                    f"已清空 {total} 条同步游标"
+                    f"（局域网 {lan} 条、共享文件夹 {entries} 条），下次同步将重新全量扫描"
+                )
+            else:
+                print("本就没有同步游标，无需清空")
             if not args.sync_cursor:
                 storage.close()
                 return 0
@@ -1359,12 +1396,23 @@ def _run_cli(args: argparse.Namespace) -> int:
             if not status["count"]:
                 print("尚无同步记录（或从未同步过）")
             for row in status["cursors"]:
-                print(f"  {row['key']:<32} {row['since_text']}")
+                # 位置的含义按来源不同：共享文件夹按「读到第几条」，
+                # 局域网按时间戳。混着报会让人以为两者是同一个数。
+                print(f"  {row['key']:<32} {row['position_text']}")
+            if status["entry_count"] and not status["lan_count"]:
+                # 只有共享文件夹有位置时，说清「清空」走的不是同一条路。
+                # 否则用户在 `--sync-cursor-reset` 之后再跑一次这条命令，
+                # 会以为上一条命令没生效。
+                print(
+                    "（共享文件夹的条目进度按来源单独维护；"
+                    "对端日志已不在本机时它不会自动失效，需用 --sync-cursor-reset 清掉）"
+                )
         storage.close()
         return 0
 
     if args.sync_status:
         from .core.lan_sync import build_lan_sync
+        from .core.protocol import PROTOCOL_VERSION
         from .core.sync_cursor import build_cursor_store
 
         cursors = build_cursor_store()
@@ -1386,6 +1434,7 @@ def _run_cli(args: argparse.Namespace) -> int:
                     print(f"加密：{'已启用' if status['encrypted'] else '未启用'}")
                     peers = status.get("peers") or []
                     print(f"对端：{len(peers)} 个")
+                    incompatible = []
                     for peer in peers:
                         label = f"{peer['host']}:{peer['port']}"
                         if peer.get("device"):
@@ -1397,6 +1446,26 @@ def _run_cli(args: argparse.Namespace) -> int:
 
                             label += f" · 已同步至 {_time.strftime('%m-%d %H:%M', _time.localtime(since))}"
                         print(f"  {label}")
+                        # 协议版本要**逐对端**报出来。不报的话，一台版本对不上的
+                        # 对端在屏幕上和「在线但最近没复制东西」长得一模一样 ——
+                        # 而它其实永远不会同步成功。
+                        if peer.get("protocol"):
+                            print(f"     协议：{peer['protocol']}（本机 {PROTOCOL_VERSION}）")
+                        elif peer.get("compatibility") == "unreported":
+                            print("     协议：对端未报版本，按本机版本处理")
+                        if peer.get("compatible") is False:
+                            incompatible.append(peer)
+                            print(f"     ⚠ 不兼容：{peer.get('error') or '版本不一致'}")
+                        elif peer.get("error"):
+                            print(f"     ⚠ {peer['error']}")
+                    if incompatible:
+                        # 这是一条**不会自愈**的状态：不提示的话，用户会一直
+                        # 以为「同步是开着的，只是没什么可同步」。
+                        print(
+                            f"⚠ 有 {len(incompatible)} 个对端与本机协议版本不一致，"
+                            "本轮不会从它们那里同步任何记录。"
+                            "请把两台机器升到同一版本。"
+                        )
                     _print_pending_event_summary()
                 node.stop()
             else:

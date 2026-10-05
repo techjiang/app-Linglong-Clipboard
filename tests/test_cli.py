@@ -279,6 +279,25 @@ def test_sync_cursor_json(cli_env, capsys, home):
     assert payload["cursors"][0]["key"] == "lan:127.0.0.1:48620"
 
 
+def test_sync_cursor_json_includes_anchor(cli_env, capsys, home):
+    """共享文件夹的游标要连锚点一起报出来。
+
+    排查「同步成功但没东西过来」时，第一个要问的是「位置还成立吗」——
+    而位置是否成立看的是锚点与日志第 N 条是否一致，不是一个数字。
+    只报「第几条」的话，等长重写这种情况在 CLI 上完全看不出来。
+    """
+    from linglong_clip.core.sync_cursor import build_cursor_store
+
+    store = build_cursor_store()
+    store.advance_entry("folder:peer.llsync", 3, anchor="abc123")
+
+    assert main(["--sync-cursor", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    row = next(one for one in payload["cursors"] if one["key"] == "folder:peer.llsync")
+    assert row["entries"] == 3
+    assert row["anchor"] == "abc123"
+
+
 def test_sync_cursor_reset(cli_env, capsys):
     from linglong_clip.core.sync_cursor import build_cursor_store
 
@@ -290,7 +309,75 @@ def test_sync_cursor_reset(cli_env, capsys):
 
 def test_sync_cursor_reset_without_existing(cli_env, capsys):
     assert main(["--sync-cursor-reset"]) == 0
-    assert "已清空 0 条同步游标" in capsys.readouterr().out
+    assert "本就没有同步游标，无需清空" in capsys.readouterr().out
+
+
+def test_sync_cursor_reset_also_clears_folder_progress(cli_env, capsys):
+    """`--sync-cursor-reset` 清掉的条数必须与列表里排的条数一致。
+
+    回归闸门对应的症状：命令报「已清空 1 条，下次同步将重新全量扫描」，
+    紧接着跑 `--sync-cursor` 仍然列出共享文件夹那两条 —— 报的数来自
+    `len(snapshot())`（只有局域网那份），清的也只有那一份。
+    用户没有任何办法让它们归零：判失效要先读得到对端日志，
+    而对端日志已经不在本机时那条路径永远走不到。
+    """
+    from linglong_clip.core.sync_cursor import build_cursor_store
+
+    store = build_cursor_store()
+    store.set("lan:192.168.1.9:48620", 1790497962.2, since_id=12)
+    store.advance_entry("folder:peer-A.llsync", 40, anchor="hn2")
+    store.advance_entry("folder:peer-B.llsync", 7, anchor="ab")
+
+    # 先数一遍列表里有几行，再断言清掉的条数与它相等 —— 不写死数字，
+    # 免得以后再加一类位置时这条用例悄悄失去意义。
+    assert main(["--sync-cursor", "--json"]) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert listed["count"] == 3
+
+    assert main(["--sync-cursor-reset"]) == 0
+    out = capsys.readouterr().out
+    assert f"已清空 {listed['count']} 条同步游标" in out
+    assert "共享文件夹 2 条" in out
+
+    assert main(["--sync-cursor", "--json"]) == 0
+    after = json.loads(capsys.readouterr().out)
+    assert after["cursors"] == []
+    assert after["count"] == 0
+    assert after["entry_count"] == 0
+
+
+def test_sync_cursor_reset_clears_progress_whose_journal_is_gone(cli_env, capsys):
+    """对端日志已不在本机时，残留的条目进度也要能被清掉。
+
+    这是上一条的另一半：不能只把「清空」延后到下次同步 ——
+    下次同步读不到那份日志，`reset_entry()` 根本不会被调到。
+    """
+    from linglong_clip.core.sync_cursor import build_cursor_store
+
+    store = build_cursor_store()
+    # 来源名指向一个本机不存在的日志文件
+    store.advance_entry("folder:gone.llsync", 128, anchor="dead")
+
+    assert main(["--sync-cursor-reset"]) == 0
+    assert "已清空 1 条同步游标" in capsys.readouterr().out
+
+    assert main(["--sync-cursor", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["entry_count"] == 0
+
+
+def test_sync_cursor_mentions_how_to_clear_folder_progress(cli_env, capsys):
+    """只剩共享文件夹进度时，列表要说明它走的是哪条清空路径。
+
+    否则用户在 `--sync-cursor-reset` 之后再跑一次这条命令，
+    会以为上一条命令没生效（现象上确实一样：列表还是那两行）。
+    """
+    from linglong_clip.core.sync_cursor import build_cursor_store
+
+    build_cursor_store().advance_entry("folder:peer.llsync", 3, anchor="h3")
+    assert main(["--sync-cursor"]) == 0
+    out = capsys.readouterr().out
+    assert "第 3 条" in out
+    assert "--sync-cursor-reset" in out
 
 
 def test_sync_status_lan_mode(cli_env, capsys, config):
@@ -322,6 +409,55 @@ def test_sync_status_lan_json(cli_env, capsys, config):
     assert payload["mode"] == "lan"
     assert payload["running"] is True
     assert isinstance(payload["port"], int)
+
+
+def test_sync_status_flags_a_peer_that_speaks_another_protocol(cli_env, capsys, config, home):
+    """版本对不上的对端，必须在状态里**明说**，而不是显示成「在线、正常」。
+
+    这是缺陷的用户可见面：不兼容时同步永远是 0 条，而 0 条和
+    「对端最近没复制东西」长得一模一样。不提示的话，用户没有任何
+    线索，只能一直以为「同步开着，只是没东西」。
+
+    用一个只回固定 `/ping` 的假对端，不依赖第二台真机器。
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class FuturePeer(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # noqa: A003
+            pass
+
+        def do_GET(self):  # noqa: N802
+            body = json.dumps(
+                {"ok": True, "protocol": "2", "device": "future-desktop", "auth_required": False}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FuturePeer)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        config.update(
+            {
+                "sync.enabled": True,
+                "sync.mode": "lan",
+                "sync.lan_port": 0,
+                "sync.encrypt": False,
+                "sync.lan_peers": [f"127.0.0.1:{server.server_address[1]}"],
+            },
+            persist=True,
+        )
+        assert main(["--sync-status"]) == 0
+        out = capsys.readouterr().out
+        assert "协议：2" in out, "要报出对端说的是哪个版本"
+        assert "不兼容" in out
+        assert "升到同一版本" in out, "还要说清该干什么，否则用户只知道坏了"
+        assert "1 个对端与本机协议版本不一致" in out, "这是一条不会自愈的状态，要单独点出来"
+    finally:
+        server.shutdown()
 
 
 def test_sync_status_lan_disabled(cli_env, capsys, config):
@@ -1894,6 +2030,68 @@ def test_stats_reports_real_footprint(home, capsys):
     # 那次打开会往 WAL 里补一点东西 —— 差几十字节是正常的，
     # 而旧实现（只 stat 主文件）会差出几倍。
     assert abs(payload["db_size"] - disk) < 64 * 1024
+
+
+def test_stats_never_calls_the_shm_pending(home, capsys):
+    """`-shm` 是索引，不能说成「待合并/尚未并入主库的改动」。
+
+    缺陷的形状：`-shm` 在 Linux 上恒为 32 KB，与数据量无关。
+    它此前被并进「待合并」，于是建好库、checkpoint 干净之后，
+    `--stats` 会**长期**写着一句：
+
+        其中 32.0 KB 是尚未并入主库的改动（下次启动或 --compact 会自动合并）
+
+    一个字节的待合并内容都没有，却每天都提示用户有东西没落盘。
+    """
+    from linglong_clip.core.storage import Storage
+
+    store = Storage(home / "history.db")
+    store.count()  # 建库即可：schema 也是内容
+    # 把改动全部并进主库，WAL 清零 —— 此刻「待合并」必须为 0（或没有 WAL）
+    store._conn.commit()
+    store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    store.close()
+
+    assert main(["--stats", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    info = payload["storage_files"]
+    # 索引可能还在（另一个连接又打开了库），但它绝不能被算作内容
+    assert info["content_bytes"] == 0 or info["content_bytes"] < info["index_bytes"]
+    assert info["bytes"] == info["main_bytes"] + info["companion_bytes"]
+
+    assert main(["--stats"]) == 0
+    out = capsys.readouterr().out
+    # 「待合并」只能由装内容的伴随文件触发；这里没有内容，就不该出现
+    if "待合并" not in out:
+        assert "索引" in out or "主库" not in out
+    # 无论如何都不能出现「尚未并入主库」这句 —— 没有东西等着并
+    assert "尚未并入主库" not in out
+
+
+def test_storage_status_separates_index_from_content(home, capsys):
+    """`--storage-status` 的 JSON 要把索引与内容分开给出。"""
+    from linglong_clip.core.storage import Storage
+
+    store = Storage(home / "history.db")
+    store.count()
+    store._conn.commit()
+    store._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    assert main(["--storage-status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["content_size"] == 0
+    assert payload["index_size"] >= 0
+    assert payload["companion_size"] == payload["content_size"] + payload["index_size"]
+    assert payload["size"] == payload["main_size"] + payload["companion_size"]
+    # 每个文件条目自己说清是主 / 内容 / 索引
+    kinds = {entry["name"]: entry["kind"] for entry in payload["files"]}
+    assert kinds.get("history.db") == "main"
+    for name, kind in kinds.items():
+        if name.endswith("-shm"):
+            assert kind == "index"
+        if name.endswith("-wal"):
+            assert kind == "content"
+    store.close()
 
 
 def test_stats_text_says_where_the_bytes_are(home, capsys):

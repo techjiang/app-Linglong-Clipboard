@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
 import time
@@ -25,13 +26,23 @@ from .models import IMAGE_DIGEST_KEY, PINNED_BY_KEY, ClipboardItem
 from . import image_transfer
 from .privacy import PrivacyGuard
 from .storage import Storage
-from .sync_cursor import SyncCursorStore
-from .tombstones import Tombstone, TombstoneStore, contains_hash
+from ..utils import paths
+from . import flag_changes as flag_changes_module
+from . import sync_cursor
+from .sync_cursor import SyncCursorStore, build_cursor_store
+from .tombstones import (
+    TOMBSTONE_FILENAME,
+    Tombstone,
+    TombstoneStore,
+    build_tombstone_store,
+    contains_hash,
+)
 from .flag_changes import (
     FLAG_FAVORITE,
     FLAG_PINNED,
     FlagChange,
     FlagChangeStore,
+    build_flag_change_store,
     resolve_flag,
 )
 
@@ -62,15 +73,15 @@ class SyncRecord:
     created_at: float = field(default_factory=time.time)
     #: 发送方库内的自增 id，**仅用于局域网翻页**，不参与内容判重。
     #:
-    #: 游标是 `(created_at, seq)` 复合值：同一时刻的记录多到塞满一页时，
-    #: 只记时间戳的游标在首页之后就推不动了 —— 下一页请求
-    #: `created_at > T` 返回空，剩下的记录不是「更旧」而是**一样新**，
-    #: 于是被永久跳过且没有任何提示。`seq` 就是那个能让游标继续前进的次级键。
+    #: 局域网用 `(created_at, seq)` 做翻页游标：同一时刻的记录多到塞满一页时，
+    #: 只记时间戳的游标在首页之后就推不动了 —— 下一页请求 `created_at > T`
+    #: 返回空，剩下的记录不是「更旧」而是**一样新**，于是被永久跳过。
+    #: `seq` 就是那个能让翻页前进的次级键。
     #:
-    #: 它不进 JSON：那是发送方的内部编号，对接收方没有意义
-    #: （接收方靠 `hash` 判重，靠 `created_at` 排序），
-    #: 而且 `to_json` 输出的就是写进共享日志的格式，多一个字段就多一次解析风险。
-    #: 局域网响应单独携带它，见 `lan_sync.collect_records_detailed`。
+    #: 共享文件夹模式的游标**不用它** —— 那边用「读到日志第几条」。
+    #: 日志是追加式的，条目序号天然单调，且与记录里的任何字段无关；
+    #: 而 `seq` 是发送方的库内编号，同一个 id 会被「内容记录」和它的
+    #: 「标记补发」复用，拿它当位置判据会把后续补发全过滤掉。
     seq: int = 0
     #: 图片等二进制内容不进同步（体积大且隐私风险高）
     payload_b64: str = ""
@@ -302,6 +313,37 @@ class SyncCipher:
             return None
 
 
+def _sidecar_dir(storage: Storage) -> Path:
+    """这台设备的辅助文件（游标 / 墓碑 / 标记变更）该放哪。
+
+    放在**数据库所在目录**，与 `images/` 同级 —— 它们是「这台设备的历史」
+    的一部分，不是全局共享的配置。
+
+    此前它们默认落在 `paths.data_dir()`：单机看起来没问题，但**同一个进程里
+    两台设备**（测试、以及任何在一台机器上模拟两台的场景）会共用同一份文件，
+    于是 A 的动作被当成 B 的、标记互相抵消。判据也很直白 ——
+    辅助文件的归属应当与它描述的数据一致，而那份数据就在 `storage.path` 旁边。
+    """
+    try:
+        return Path(storage.path).parent  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        return paths.data_dir()
+
+
+def _default_cursors(storage: Storage) -> SyncCursorStore:
+    return build_cursor_store(_sidecar_dir(storage) / sync_cursor.CURSOR_FILENAME)
+
+
+def _default_tombstones(storage: Storage) -> TombstoneStore:
+    return build_tombstone_store(_sidecar_dir(storage) / TOMBSTONE_FILENAME)
+
+
+def _default_flag_changes(storage: Storage) -> FlagChangeStore:
+    return build_flag_change_store(
+        _sidecar_dir(storage) / flag_changes_module.FLAG_CHANGE_FILENAME
+    )
+
+
 class FolderSync:
     """基于共享文件夹的同步（OneDrive / iCloud / Syncthing / NFS 均可）。"""
 
@@ -322,12 +364,16 @@ class FolderSync:
         self.device_name = device_name or socket.gethostname()
         self._cipher = cipher or SyncCipher(False)
         self._guard = guard
-        self.cursors = cursors if cursors is not None else SyncCursorStore()
-        self.tombstones = tombstones if tombstones is not None else TombstoneStore()
+        self.cursors = cursors if cursors is not None else _default_cursors(storage)
+        self.tombstones = (
+            tombstones if tombstones is not None else _default_tombstones(storage)
+        )
         #: 标记变更（取消固定/取消收藏）的传播通道。与墓碑并列，
         #: 见 `core/flag_changes.py` 的说明。
         self.flag_changes = (
-            flag_changes if flag_changes is not None else FlagChangeStore()
+            flag_changes
+            if flag_changes is not None
+            else _default_flag_changes(storage)
         )
         self._lock = threading.RLock()
 
@@ -508,6 +554,18 @@ class FolderSync:
                 handle.write(blob)
         # 写入成功后才确认送达：写失败时异常向上抛，墓碑与变更保持待发状态，
         # 下轮重试。确认之后不再复述，否则每轮同步都要重传一遍历史事件。
+        #
+        # 「已发过」同时落一份到旁路文件：`compact()` 裁掉旧日志之后，
+        # 只看日志会把裁掉的当成「没发过」而重发 —— 而位置改成
+        # 「读到第几条」之后，重发的旧记录追加在末尾，对端位置已推过去，
+        # 于是永远读不到（见 `_local_hashes` 的说明）。
+        content_hashes = [
+            record.hash
+            for record in records
+            if not record.is_tombstone and not record.is_flag_change
+        ]
+        if content_hashes:
+            self._remember_sent(content_hashes)
         if pending:
             self._ack_sent_tombstones()
         if pending_changes:
@@ -516,11 +574,72 @@ class FolderSync:
         return len(records)
 
     def _local_hashes(self) -> set:
-        """已在本地日志里出现过的 hash，避免重复导出。"""
+        """**已经发出去过**的 hash，避免重复导出。
+
+        判据是「历史上发过」，不是「日志现在还留着」—— `compact()` 会把
+        旧条目裁掉，裁掉的记录如果在这里判成「没发过」，就会被重新导出一次。
+
+        这在按时间过滤的年代只是浪费一点带宽（对端靠 hash 去重）；
+        而位置改成「读到第几条」之后它会**丢数据**：重发的旧记录追加在日志
+        末尾，对端的位置却已经推过去了，于是这条永远读不到。
+        而 `compact()` 是每轮同步都会调的，所以这不是边角情形。
+        """
         hashes: set = set()
         for record in self._read_journal(self.journal_path):
             hashes.add(record.hash)
+        # 裁掉的那些也算「发过」：落盘记录与日志取并集。
+        hashes |= self._sent_hashes()
         return hashes
+
+    # ---- 「发过哪些」的落盘记录 ----
+
+    @property
+    def _sent_ledger_path(self) -> Path:
+        """本机「已发过哪些」的账本。
+
+        放在**数据目录**（与游标、墓碑同级），不放共享目录：它是本机的私有
+        记账，跟着同步盘跑到别的机器上毫无意义，还会给对方留下一个
+        看不懂的文件。共享目录里只该有 `*.llsync` 这些对端要读的东西。
+        """
+        return _sidecar_dir(self._storage) / "exported_hashes.json"
+
+    def _sent_hashes(self) -> set:
+        """读「已发过的指纹」。文件不存在或损坏都按空集处理。
+
+        它只是**防止重发**的辅助信息：丢了最坏是多发一轮，对端靠 hash 去重。
+        所以不做迁移、不抛异常 —— 损坏就当没有。
+        """
+        path = self._sent_ledger_path
+        if not path.exists():
+            return set()
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            _log.warning("已发送指纹文件无法解析，忽略：%s", exc)
+            return set()
+        if not isinstance(raw, dict):
+            return set()
+        hashes = raw.get("hashes")
+        return {str(one) for one in hashes} if isinstance(hashes, list) else set()
+
+    def _remember_sent(self, hashes: Iterable[str]) -> None:
+        """把这些指纹追加进「已发过」的记录（原子写）。"""
+        merged = self._sent_hashes() | {str(one) for one in hashes if one}
+        path = self._sent_ledger_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps(
+                    {"version": 1, "hashes": sorted(merged)},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+        except OSError as exc:
+            # 写不进去只是下次可能重发一轮，不该让导出失败
+            _log.warning("已发送指纹写入失败：%s", exc)
 
     def _local_flag_state(self) -> Dict[str, FlagSnapshot]:
         """日志里每个指纹**已经发出去过**的标记。
@@ -614,35 +733,53 @@ class FolderSync:
         return self.flag_changes.ack([self.flag_changes._key(change) for change in sent])
 
     def _import_journal(self, path: Path, seen_local: set) -> "ImportOutcome":
-        """导入单份对端日志，并推进其游标。返回本轮统计。"""
+        """导入单份对端日志，并推进其游标。返回本轮统计。
+
+        **位置用「读到第几条」，不用时间戳。** 日志是追加式的，条目序号
+        天然单调；而 `created_at` 由写入方给、不保证单调 —— 历史导入、
+        存储迁移都会写下过去的时间戳。按时间过滤时，这些新追加的记录
+        恰好落在游标之前，于是被永久跳过，而导出侧只看 `hash` 去重、
+        照发不误。两台机器都觉得自己是对的。
+        """
         key = self.cursor_key(path)
-        since = self.cursors.since_for(key)
+        position = max(0, int(self.cursors.entry_for(key) or 0))
         outcome = ImportOutcome()
-        newest = since
-        all_records = list(self._read_journal(path))
-        # 标记变更**不受游标过滤**：它的时间戳是「用户做那个动作的时刻」，
-        # 与同批内容记录的 `created_at` 无关。若按游标裁掉，一条晚到的取消
-        # （比如对端离线了一阵才上线）会永远传不过来 —— 而取消恰恰是
-        # 「对端曾经收过这个标记」的后续事件，漏一次就再也不会有第二次机会。
-        # 与局域网模式的处理一致（那边墓碑与变更都单独成批）。
-        records = [
-            record
-            for record in all_records
-            if record.is_flag_change
-            or float(getattr(record, "created_at", 0.0) or 0.0) > since
-        ]
+        numbered = self._read_journal_numbered(path)
+
+        # 对端把日志裁剪/重写过之后，条目序号会整体前移 —— 此时本地游标
+        # 指向的是**别人的**位置，必须退回全量重扫（hash 会去重，代价只是
+        # 一轮多读）。
+        #
+        # 判据**不能只看长度**。「日志比游标短」只是重写的一种结果，而
+        # 裁剪到上限附近的日志会长期保持在上限上下，长度**恰好等于**游标是
+        # 最常见的那种重写：序号 2 在裁剪前指 c1、裁剪后指 n0，长度一样。
+        # 这时只看长度会判成「位置仍然有效」，于是从第 2 条之后开始读，
+        # 而每条新记录都落在那之前 —— 一轮一轮跳过，界面上写着「同步成功」。
+        # 所以位置旁边存了锚点（读到第几条时那条的指纹），读之前先核对。
+        if not self.cursors.entry_is_valid(
+            key, len(numbered), lambda index: _anchor_of(numbered, index)
+        ):
+            _log.info(
+                "对端日志 %s 已被重写（长度 %d，游标 %d，锚点对不上），"
+                "游标已失效，退回全量重扫",
+                path.name, len(numbered), position,
+            )
+            # 这里必须**显式清零**，不能只把 `position` 局部改成 0：
+            # `advance_entry()` 是只增不减的（多来源互相覆盖时要防倒退），
+            # 局部改 0 之后推上去的仍是旧的大值，游标就永远卡在失效位置上。
+            self.cursors.reset_entry(key)
+            position = 0
+
+        records = [record for _index, record in numbered[position:]]
+        newest = position + len(records)
 
         # 同一份日志里被判过删除的指纹：后面的内容记录一律不再写入。
         # 顺序至关重要 —— 日志是追加式的，「先有内容、后有删除」；
         # 若反过来让内容记录覆盖删除，用户删掉的东西会被同一条日志复活。
-        # 游标的安全窗口（回退 1 秒）会让这两条落在同一批里，
-        # 所以这个「批内去重」不是可选项。
+        # 位置按条目序号推进后，这两条仍可能落在同一批里（同一次
+        # 追加写入的多条记录共享一个块），所以这个「批内去重」不是可选项。
         deleted_in_batch: set = set()
         for record in records:
-            if not record.is_flag_change:
-                # 标记变更不参与游标推进：它的时间戳与内容记录不同源，
-                # 混进来会让游标跳到一个与内容无关的时刻。
-                newest = max(newest, float(getattr(record, "created_at", 0.0) or 0.0))
             if record.is_tombstone:
                 # 删除标记只认别的设备发出的：自己写进日志的那条不算
                 if record.device == self.device_name:
@@ -710,9 +847,9 @@ class FolderSync:
             seen_local.add(record.hash)
             apply_flags(self._storage, record, seen_local, self.flag_changes)
             outcome.imported += 1
-        # 只有在完整读完后才推进游标：解析中途出错不该跳过剩余记录
-        if newest > since:
-            self.cursors.advance(key, newest)
+        # 只有在完整读完后才推进游标：解析中途出错不该跳过剩余记录。
+        # 锚点跟着一起写：下一轮靠它核对「这个序号还指同一条记录吗」。
+        self.cursors.advance_entry(key, newest, anchor=_anchor_of(numbered, newest))
         return outcome
 
     def _apply_flag_change(
@@ -810,9 +947,23 @@ class FolderSync:
 
     def _read_journal(self, path: Path) -> Iterable[SyncRecord]:
         """按「4 字节长度 + 载荷」的分块格式读取，单块损坏不影响其余。"""
+        return [record for _index, record in self._read_journal_numbered(path)]
+
+    def _read_journal_numbered(self, path: Path) -> List[tuple]:
+        """同 `_read_journal`，但每条带**在日志里的条目序号**（从 1 起）。
+
+        为什么需要序号：游标要回答「这份日志我读到第几条了」。
+        `created_at` 回答不了这个问题 —— 它由写入方给，**不保证单调**
+        （系统剪贴板历史导入、存储迁移都会写下过去的时间戳），
+        于是新追加的记录会「落在游标之前」而被永久跳过。
+
+        日志是追加式的，所以**条目序号**天然单调：新记录一定排在后面。
+        它不依赖记录里的任何字段，也不需要改变文件格式。
+        """
         if not path.exists():
             return []
-        records: List[SyncRecord] = []
+        records: List[tuple] = []
+        index = 0
         try:
             raw = path.read_bytes()
         except OSError as exc:
@@ -840,7 +991,8 @@ class FolderSync:
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
                 if record is not None:
-                    records.append(record)
+                    index += 1
+                    records.append((index, record))
         return records
 
     # ---- 维护 ----
@@ -866,7 +1018,7 @@ class FolderSync:
 
     def status(self) -> Dict[str, object]:
         files = sorted(self.folder.glob("*.llsync")) if self.folder.exists() else []
-        cursors = self.cursors.snapshot()
+        entries = self.cursors.entry_snapshot()
         devices = []
         for path in files:
             key = self.cursor_key(path)
@@ -874,8 +1026,12 @@ class FolderSync:
                 {
                     "device": path.stem,
                     "journal": path.name,
-                    "since": cursors.get(key, 0.0),
-                    "synced": cursors.get(key, 0.0) > 0,
+                    # 「同步到哪」的权威答案是**条目游标**：文件夹模式按
+                    # 「读到第几条」推进。这里**不报时间戳** —— 它不是这个
+                    # 模式的判据，报出来只会是一个恒为 0 的数，
+                    # 让人误以为「一直没同步过」。
+                    "entries": entries.get(key, 0),
+                    "synced": entries.get(key, 0) > 0,
                 }
             )
         return {
@@ -994,6 +1150,19 @@ def apply_flags(
     if seen_local is not None:
         seen_local.add(record.hash)
     return True
+
+
+def _anchor_of(numbered: List[tuple], index: int) -> str:
+    """日志里第 `index` 条（从 1 起）的指纹；越界或没有指纹时返回空串。
+
+    唯一用途是给游标当锚点：回答「这个序号现在还指同一条记录吗」。
+    返回空串表示**无从核对**，调用方会退回只比长度 —— 这与没有锚点时
+    的行为一致，所以这里不必造一个假的指纹出来。
+    """
+    if index <= 0 or index > len(numbered):
+        return ""
+    record = numbered[index - 1][1]
+    return str(getattr(record, "hash", "") or "")
 
 
 def _pinned_by_patch(merged: FlagSnapshot) -> dict:

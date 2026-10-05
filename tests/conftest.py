@@ -16,6 +16,24 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 
+@pytest.fixture(autouse=True)
+def isolate_data_dir(tmp_path_factory, monkeypatch):
+    """**每一个**用例都跑在隔离的数据目录里。
+
+    为什么是 autouse：游标、墓碑、标记变更这三个存储都默认落在
+    `paths.data_dir()`，而它们各自的构造函数**没有**默认取 `tmp_path`。
+    忘了显式传 `home` 的用例会静默读写真实用户目录 —— 于是出现
+    「单跑绿、一起跑红」「换台机器就红」这类最难查的失败：
+    上一个用例写下的游标把下一个用例的记录判成「已同步」。
+
+    这个 fixture 不替代 `home`；`home` 仍然给需要路径的用例用，
+    两者的数据目录是同一个（`tmp_path`），只是这里不做显式返回。
+    """
+    base = tmp_path_factory.mktemp("data-home")
+    monkeypatch.setenv("LINGLONG_CLIPBOARD_HOME", str(base))
+    return base
+
+
 @pytest.fixture()
 def home(tmp_path, monkeypatch):
     """隔离的数据目录，避免测试写到真实用户目录。"""

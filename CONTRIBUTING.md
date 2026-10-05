@@ -96,10 +96,21 @@ get_meta / set_meta / optimize / stats / close
   之间差一倍 —— 而用户正是拿它决定要不要清理历史。实测 300 条记录：
   报「2.6 MB」，磁盘上躺着 6.7 MB。
 - **`stats()` 的 `db_size` 是总占用**，另有 `storage_files` 给出按文件的
-  归因（`main_bytes` / `companion_bytes` / `files` / `reclaimable_bytes`）。
-  两个后端的这组键**必须完全一致**（见 `StorageFootprint.DICT_KEYS`）：
-  JSON 单文件没有「空洞」的概念，但那个键仍要在、值为 0 ——
-  「没有这个概念」与「有、现在是 0」对调用方不该是两件事，否则它就得写分支。
+  归因（`main_bytes` / `companion_bytes` / `content_bytes` / `index_bytes` /
+  `files` / `reclaimable_bytes`）。两个后端的这组键**必须完全一致**
+  （见 `StorageFootprint.DICT_KEYS`）：JSON 单文件没有「空洞」的概念，
+  但那个键仍要在、值为 0 ——「没有这个概念」与「有、现在是 0」对调用方
+  不该是两件事，否则它就得写分支。
+- **别把 `-shm` 当「待合并」**。伴随文件分两类：`-wal` / `-journal`
+  **装内容**（`content_bytes`，它非零才真有改动没进主库），`-shm` 只有
+  **索引**（`index_bytes`）。`-shm` 在 Linux 上**恒为 32 KB**、与数据量无关，
+  把它算进「待合并」的后果是：checkpoint 干净之后，`--stats` 与设置页
+  会**长期**写着「其中 32.0 KB 是尚未并入主库的改动（下次启动会自动合并）」
+  —— 没有东西会合并，也没有东西需要合并，用户只能以为自己没落盘。
+  回答「有没有待合并的改动」用 `content_bytes`，算总占用才用 `companion_bytes`
+  （`du` 会看到索引那几十 KB，少算就不对账）。
+  回归闸门：`tests/test_storage_files.py::test_shm_is_not_counted_as_pending_content`
+  与 `tests/test_cli.py::test_stats_never_calls_the_shm_pending`。
 - **伴随文件按后缀精确匹配**，不能用 `glob("history.db*")`：用户目录里
   出现 `history.db-wal-old`、`history.db-bak` 是很自然的，算进来会让占用虚高。
 - **`measure()` 不许抛异常**。取不到大小的文件按「不存在」处理而不是记
@@ -371,33 +382,132 @@ _MIGRATIONS = {
 「主流程过滤了、同步漏了」这类不一致最难发现。改一处就要改另一处，
 并同步更新 `tests/test_tombstones.py` 里两组同名用例。
 
+### 改动局域网协议
+
+`core/protocol.py` 是协议版本与兼容性判定的**唯一**出处，服务端、客户端、
+发现广播、CLI 四处都读它。约束：
+
+1. **改动字段语义（删字段、换字段名、改编码）必须升主版本号**。次版本号
+   只用来表示「加了东西」—— 主版本相同即判定为兼容。
+2. **`PROTOCOL_VERSION` 不许在别处再定义一份**。它在 `lan_sync.py` 里
+   只有一次转发（`PROTOCOL_VERSION = protocol.PROTOCOL_VERSION`），
+   目的是不破坏既有 import。四处各持一份的后果是：报出去的版本与
+   实际拿来判的版本可以毫不相干，而且看不出来。
+3. **握手要排在读数据之前，拒绝时一条数据都不给**。这是这一层存在的
+   全部理由：一份读不懂的载荷会被解析成 0 条，而 0 条与「对端没有东西
+   可同步」长得一模一样。给出数据再拒绝等于没拒绝。
+4. **拒绝用 426，响应里带 `detail`**。客户端把这个字符串原样印给用户，
+   所以它必须是人话（说清哪台、什么版本、该干什么），不是错误码。
+5. **判定必须四档，不许合并**。`unreported`（没报版本）是**确定**的
+   —— 协议 1 是历史上唯一存在过的版本；`malformed`（认不出）是不确定的。
+   把后者当「说得来」，就是按自己的心意去读一份不知道是什么的东西。
+6. **握手成功与否不能与口令混淆**。`/ping` 不校验口令，所以口令配错时
+   握手照样成功 —— 那是有意的：两件事不该互相掩盖。
+7. **对端版本要登记，不只写在 `PeerInfo` 上**。`discover()` 每次新建
+   对象，只写对象等于写在便签上。连 `error` 一起登记：只登记版本的话，
+   状态页会出现一台「不兼容但错误栏是空的」机器。
+8. **`/ping` 与 UDP 广播的版本字段来自同一份 `protocol.advertised_payload()`**。
+   广播说协议 2、握手说协议 1 这种自相矛盾无从排查。
+
+回归闸门：`tests/test_protocol.py`。其中
+`test_future_peer_with_renamed_fields_is_not_reported_as_success`
+直接对应缺陷的形状（未来字段名 → 导入 0 条且报「在线」），
+`test_records_refuses_what_it_cannot_read` 守住「拒绝时不给数据」，
+`test_records_accepts_our_version_and_silent_old_clients` 是反向那条
+（不许为了拦不兼容，把唯一存在过的老版本也拦掉）。
+
 ### 改动增量游标 / 遍历顺序
 
 游标决定「哪些记录会被同步到」，写错的表现是**静默丢数据**：没有报错，
 `--sync-status` 也照常显示进度，只是那一段历史在别的设备上从不存在。
 约束清单：
 
-1. **游标是 `(created_at, id)` 复合值，不能退回单纯时间戳**。同一时刻的记录
+1. **判「这条是不是新记录」不能用时间戳**。它是写入方给的，不保证单调 ——
+   系统剪贴板历史导入、存储迁移、任何显式构造 `created_at=过去` 的写入方
+   都会写下比游标更早的时间。按时间过滤时这些记录落在游标之前，被永久跳过，
+   而导出侧只看 `hash` 去重、照发不误：**两边都觉得自己是对的**
+   （B 说「发了」，C 说「没收到」，界面上写着「同步成功、0 条」）。
+   共享文件夹模式的判据是**日志条目序号**（日志是追加式的，天然单调，
+   且不需要改文件格式）；`created_at` 只用来排序展示。
+   回归闸门：`test_record_with_past_timestamp_is_still_imported`、
+   `test_past_timestamp_record_arrives_in_later_round`。
+2. **事件类记录不带序号，且无条件处理**。墓碑、标记变更、以及
+   「内容已发过、只补发标记」的记录都不是「新内容」。按新内容过滤它们，
+   会让一条晚到的取消永远传不过来 —— 而取消是「对端曾经收过这个标记」的
+   后续事件，漏一次就没有第二次机会。判据收在 `_is_deferred_event()`。
+3. **对端日志被裁剪后，条目序号会整体前移**。判据是「日志比游标短」，
+   此时必须走 `reset_entry()` **显式清零** —— `advance_entry()` 取 `max`
+   （多来源互相防倒退），只把局部变量改 0，推上去的仍是旧的大值。
+4. **`compact()` 不能只清日志**。「发过哪些」要另存 `*.llsync.sent`，
+   与日志取并集（`_local_hashes`）：裁掉的记录若被当成「没发过」重新导出，
+   会追加在日志末尾，而接收方的位置已经推过去了 —— 永远读不到。
+   `compact()` 是每轮同步都会调的，这不是边角情形。
+   回归闸门：`test_compacted_journal_does_not_resend_old_records`。
+5. **辅助文件（游标 / 墓碑 / 标记变更）跟着数据库走**，不跟全局数据目录走。
+   否则同一进程里的两台设备共用一份，A 的动作被当成 B 的，
+   标记永远同步不过去。见 `_sidecar_dir()`。
+   回归闸门：`test_two_devices_do_not_share_sidecar_files`。
+6. **`lan:` 的游标是 `(created_at, id)` 复合值，不能退回单纯时间戳**。同一时刻的记录
    多到塞满一页时（紧密循环写库、批量导入系统历史都会这样），只记时间戳的
    游标在首页之后就推不动：下一页请求 `created_at > T` 返回空，而剩下的记录
    不是「更旧」而是「一样新」。实测 1005 条同刻记录会永久丢 505 条。
    安全窗口解决不了这个 —— 回退一秒只会反复重读同一页。
-2. **两个后端的 `iter_since` 必须逐条同语义**。`Storage`（SQLite）与
+7. **两个后端的 `iter_since` 必须逐条同语义**。`Storage`（SQLite）与
    `JsonRepository`（JSON）都实现它，同步模块不区分后端。分叉的后果是
    「换个存储后端就少一段历史」，同样没有报错。
    `tests/test_repository.py::test_iter_since_matches_storage_backend`
    就是守住这条的。
-3. **`since_id == 0` 要退化为「只比时间」**。这是旧行为，也是
+8. **`since_id == 0` 要退化为「只比时间」**。这是旧行为，也是
    `Storage.iter_since` 第一页 `WHERE created_at > ?` 的语义。
    改成「`(ts, 0)` 字典序比较」会让恰好等于 `since` 的记录被取出来。
-4. **回退安全窗口时 `id` 部分必须归零**。回退意味着该时刻的记录要整批重读；
+9. **回退安全窗口时 `id` 部分必须归零**。回退意味着该时刻的记录要整批重读；
    只回退时间却仍按 `id > 游标` 过滤，会漏掉回退区间里 id 较小的记录。
-5. **`seq` 只走局域网响应，不写进共享日志**。它是发送方的库内编号，
+10. **`seq` 只走局域网响应，不写进共享日志**。它是发送方的库内编号，
    接收方用不上；写进 `to_json()` 会改变共享格式，还要处理老版本读到
    未知字段。`from_json()` 读它只是为了兼容局域网载荷，缺失时落回 0。
-6. **游标推进前必须确认「位置真的前进了」**。对端是旧版本（不带 `seq`）
+11. **游标推进前必须确认「位置真的前进了」**。对端是旧版本（不带 `seq`）
    又恰好同刻记录满页时，位置推不动 —— 这时要明确告警并结束本轮，
-   不能死循环，也不能假装成功。
+   不能死循环，也不能假装成功。注意「只剩墓碑可带」不是这种情形：
+   那属于正常结束（`page_records` 为空），不该报疑似故障。
+12. **游标时间戳进出网络时不许格式化**。`f"{since:.6f}"` 会四舍五入，
+   而 `time.time()` 约 7 位小数 —— 送出的值比原值大 2e-7，服务端的排他
+   条件（`created_at > since`）于是对同一时刻的记录整批为假，
+   同刻记录的尾巴被静默丢掉，而 `seq` 明明已经带上了。
+   用 `repr(float(...))`（可精确往返的最短字符串）。
+   回归闸门必须抓**真实的请求 URL**：在 `fetch()` 调用处打桩只看得到
+   完整浮点数，舍入发生在函数内部 —— 用例会假绿。
+   见 `test_lan_since_keeps_full_float_precision`。
+13. **推进内容游标、判断「这一页满没满」，都只能数内容记录**。
+   墓碑与标记变更每页整批附带（它们不受 `since` 过滤），时间戳与内容
+   毫无关系。把它们算进 `page_last`，游标会被一个「比待拉内容更晚」的
+   墓碑带走，剩下的记录永久跳过 —— 与前一条「按时间戳过滤」同形。
+   回归闸门：`test_lan_tombstone_timestamp_does_not_push_cursor_forward`、
+   `test_lan_flag_change_timestamp_does_not_push_cursor_forward`。
+   注意测试数据两个坑：内容时间戳要用**真实精度**（`3000.0` 这类整数
+   时刻在旧实现下也正常），墓碑时间戳要**超过 1 秒安全窗口**
+   （否则回退的一秒会把后果盖住，用例假绿）。
+14. **一个来源的位置是三份东西，动它要一起动。** `cursors`（协议位置，
+   局域网）、`entries`（本地位置，共享文件夹）、`anchors`（本地位置
+   旁边的锚点）是同一件事的三个部分：
+
+   - `forget(key)` 必须三张表一起 pop。只清 `cursors` 会留下后两份，
+     同一个来源下次出现时 `entry_for()` 仍返回旧值，而
+     `entry_is_valid()` 会拿一个**属于上次那个对端**的锚点去核对新日志 ——
+     核对结果只取决于「新日志第 N 条的指纹恰好等于旧值吗」。恰好相等
+     就判成「位置仍有效」，前面那几条记录被静默跳过。
+     回归闸门：`test_forget_clears_entry_and_anchor_too`、
+     `test_forget_then_rename_does_not_inherit_stale_anchor`。
+   - `reset()` **只**清 `cursors`（历史行为，别往它加参数）；
+     `reset_entry_cursors()` 是对称的另一半；`reset_all()` 两样都清。
+     清空命令用 `reset_all()`：用户说「重新全量扫描」，那两半都该回到起点。
+   - `status()['count']` 是**两种位置并集的行数**，另有 `lan_count` /
+     `entry_count` 分开计数。报数时不要用 `len(snapshot())` ——
+     那只是局域网那半，于是会出现「已清空 1 条」而列表里还排着两条，
+     且那些残留**永远清不掉**（判失效要先读得到对端日志，而对端日志
+     已不在本机时那条路径走不到）。
+     回归闸门：`test_sync_cursor_reset_also_clears_folder_progress`、
+     `test_sync_cursor_reset_clears_progress_whose_journal_is_gone`、
+     `test_status_count_is_the_number_of_rows`。
 
 ### 修改同步的用户标记语义
 
