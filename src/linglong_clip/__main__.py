@@ -1371,9 +1371,20 @@ def _run_cli(args: argparse.Namespace) -> int:
 
         cursors = build_cursor_store()
         if args.sync_cursor_reset:
-            count = len(cursors.snapshot())
-            cursors.reset()
-            print(f"已清空 {count} 条同步游标，下次同步将重新全量扫描")
+            # 「重新全量扫描」必须真的是全量。此前这里只清局域网的 `cursors`，
+            # 共享文件夹的条目进度（`entries` / `anchors`）原封不动 ——
+            # 于是命令报「已清空 1 条」而列表里还排着另外两条，
+            # 用户没有任何办法让它们归零：判失效要先读得到对端日志，
+            # 而对端日志已经不在本机时，那条路径永远走不到。
+            lan, entries = cursors.reset_all()
+            total = lan + entries
+            if total:
+                print(
+                    f"已清空 {total} 条同步游标"
+                    f"（局域网 {lan} 条、共享文件夹 {entries} 条），下次同步将重新全量扫描"
+                )
+            else:
+                print("本就没有同步游标，无需清空")
             if not args.sync_cursor:
                 storage.close()
                 return 0
@@ -1388,6 +1399,14 @@ def _run_cli(args: argparse.Namespace) -> int:
                 # 位置的含义按来源不同：共享文件夹按「读到第几条」，
                 # 局域网按时间戳。混着报会让人以为两者是同一个数。
                 print(f"  {row['key']:<32} {row['position_text']}")
+            if status["entry_count"] and not status["lan_count"]:
+                # 只有共享文件夹有位置时，说清「清空」走的不是同一条路。
+                # 否则用户在 `--sync-cursor-reset` 之后再跑一次这条命令，
+                # 会以为上一条命令没生效。
+                print(
+                    "（共享文件夹的条目进度按来源单独维护；"
+                    "对端日志已不在本机时它不会自动失效，需用 --sync-cursor-reset 清掉）"
+                )
         storage.close()
         return 0
 

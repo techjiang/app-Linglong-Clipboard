@@ -309,7 +309,75 @@ def test_sync_cursor_reset(cli_env, capsys):
 
 def test_sync_cursor_reset_without_existing(cli_env, capsys):
     assert main(["--sync-cursor-reset"]) == 0
-    assert "已清空 0 条同步游标" in capsys.readouterr().out
+    assert "本就没有同步游标，无需清空" in capsys.readouterr().out
+
+
+def test_sync_cursor_reset_also_clears_folder_progress(cli_env, capsys):
+    """`--sync-cursor-reset` 清掉的条数必须与列表里排的条数一致。
+
+    回归闸门对应的症状：命令报「已清空 1 条，下次同步将重新全量扫描」，
+    紧接着跑 `--sync-cursor` 仍然列出共享文件夹那两条 —— 报的数来自
+    `len(snapshot())`（只有局域网那份），清的也只有那一份。
+    用户没有任何办法让它们归零：判失效要先读得到对端日志，
+    而对端日志已经不在本机时那条路径永远走不到。
+    """
+    from linglong_clip.core.sync_cursor import build_cursor_store
+
+    store = build_cursor_store()
+    store.set("lan:192.168.1.9:48620", 1790497962.2, since_id=12)
+    store.advance_entry("folder:peer-A.llsync", 40, anchor="hn2")
+    store.advance_entry("folder:peer-B.llsync", 7, anchor="ab")
+
+    # 先数一遍列表里有几行，再断言清掉的条数与它相等 —— 不写死数字，
+    # 免得以后再加一类位置时这条用例悄悄失去意义。
+    assert main(["--sync-cursor", "--json"]) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert listed["count"] == 3
+
+    assert main(["--sync-cursor-reset"]) == 0
+    out = capsys.readouterr().out
+    assert f"已清空 {listed['count']} 条同步游标" in out
+    assert "共享文件夹 2 条" in out
+
+    assert main(["--sync-cursor", "--json"]) == 0
+    after = json.loads(capsys.readouterr().out)
+    assert after["cursors"] == []
+    assert after["count"] == 0
+    assert after["entry_count"] == 0
+
+
+def test_sync_cursor_reset_clears_progress_whose_journal_is_gone(cli_env, capsys):
+    """对端日志已不在本机时，残留的条目进度也要能被清掉。
+
+    这是上一条的另一半：不能只把「清空」延后到下次同步 ——
+    下次同步读不到那份日志，`reset_entry()` 根本不会被调到。
+    """
+    from linglong_clip.core.sync_cursor import build_cursor_store
+
+    store = build_cursor_store()
+    # 来源名指向一个本机不存在的日志文件
+    store.advance_entry("folder:gone.llsync", 128, anchor="dead")
+
+    assert main(["--sync-cursor-reset"]) == 0
+    assert "已清空 1 条同步游标" in capsys.readouterr().out
+
+    assert main(["--sync-cursor", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["entry_count"] == 0
+
+
+def test_sync_cursor_mentions_how_to_clear_folder_progress(cli_env, capsys):
+    """只剩共享文件夹进度时，列表要说明它走的是哪条清空路径。
+
+    否则用户在 `--sync-cursor-reset` 之后再跑一次这条命令，
+    会以为上一条命令没生效（现象上确实一样：列表还是那两行）。
+    """
+    from linglong_clip.core.sync_cursor import build_cursor_store
+
+    build_cursor_store().advance_entry("folder:peer.llsync", 3, anchor="h3")
+    assert main(["--sync-cursor"]) == 0
+    out = capsys.readouterr().out
+    assert "第 3 条" in out
+    assert "--sync-cursor-reset" in out
 
 
 def test_sync_status_lan_mode(cli_env, capsys, config):

@@ -295,7 +295,10 @@ def test_reset_only_clears_lan_cursors(tmp_path):
     """`reset()` 只管局域网的 `cursors`，不该动共享文件夹的条目进度。
 
     两种位置回答的是两个不同的问题（向对端请求到哪 / 本地处理到哪），
-    一次全清会让两种同步模式互相牵连。条目进度由 `reset_entry` 单独回退。
+    一次全清会让两种同步模式互相牵连。这也是为什么清空命令走的是
+    `reset_all()` 而不是给 `reset()` 加个参数 —— 语义不同，就不该合并。
+    条目进度另由 `reset_entry()`（按来源回退）与 `reset_entry_cursors()`
+    （全部清零）负责。
     """
     path = tmp_path / "c.json"
     store = SyncCursorStore(path)
@@ -309,6 +312,134 @@ def test_reset_only_clears_lan_cursors(tmp_path):
     assert reloaded.snapshot() == {}
     assert reloaded.entry_for("folder:a.llsync") == 2
     assert reloaded.anchor_for("folder:a.llsync") == "h2"
+
+
+def test_reset_entry_cursors_clears_progress_and_anchors(tmp_path):
+    """`reset()` 的另一半：条目进度也要能单独清零。
+
+    为什么需要它 —— 条目游标的失效判据要求在**读得到对端日志**时才能
+    走到 `reset_entry()`（先 `entry_is_valid()` 判失效，再清零）。对端
+    日志已经不在本机时（换了同步目录、对端换了机器名），那条路径永远
+    走不到，于是文件里长期留着一批指向不存在日志的位置，而且没有任何
+    命令能让它们归零 —— 用户只能手动删文件。
+    """
+    path = tmp_path / "c.json"
+    store = SyncCursorStore(path)
+    store.load()
+    store.advance_entry("folder:a.llsync", 4, anchor="h4")
+    store.advance_entry("folder:b.llsync", 9, anchor="h9")
+
+    assert store.reset_entry_cursors() == 2
+
+    reloaded = SyncCursorStore(path)
+    reloaded.load()
+    assert reloaded.entry_for("folder:a.llsync") == 0
+    assert reloaded.anchor_for("folder:a.llsync") == ""
+    assert reloaded.entry_snapshot() == {}
+
+
+def test_reset_all_clears_both_kinds_and_writes_nothing_left(tmp_path):
+    """「重新全量扫描」必须真的是全量：两种位置都清掉，文件里不留痕。
+
+    回归闸门对应的是一个真实症状：`--sync-cursor-reset` 报「已清空 1 条」，
+    而后紧跟着跑 `--sync-cursor` 仍然列出另外两条 —— 因为它数的是
+    `len(snapshot())`（只有局域网那份），清的也只有那一份。
+    """
+    path = tmp_path / "c.json"
+    store = SyncCursorStore(path)
+    store.load()
+    store.set("lan:1.2.3.4:5000", 100.0, since_id=3)
+    for index in range(3):
+        store.advance_entry(f"folder:peer-{index}.llsync", 5 + index, anchor=f"h{index}")
+
+    lan, entries = store.reset_all()
+    assert (lan, entries) == (1, 3)
+
+    reloaded = SyncCursorStore(path)
+    reloaded.load()
+    assert reloaded.snapshot() == {}
+    assert reloaded.entry_snapshot() == {}
+    # 落盘的内容也要干净：留一个空 `anchors` 没关系，但不能留条目
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["cursors"] == {}
+    assert payload["entries"] == {}
+    assert payload["anchors"] == {}
+    assert reloaded.status()["count"] == 0
+    assert reloaded.status()["lan_count"] == 0
+    assert reloaded.status()["entry_count"] == 0
+
+
+def test_reset_all_on_empty_store_reports_zero(tmp_path):
+    """空存储上重复清空不该报数，也不该写文件。"""
+    path = tmp_path / "c.json"
+    store = SyncCursorStore(path)
+    store.load()
+    assert store.reset_all() == (0, 0)
+    assert not path.exists()
+
+
+def test_status_count_is_the_number_of_rows(tmp_path):
+    """`count` 要与 `cursors` 列表的行数一致，另给两类各自的个数。
+
+    `status['count']` 此前是行数，而 `--sync-cursor-reset` 却拿
+    `len(snapshot())` 当总数 —— 两个数在只有共享文件夹游标时是
+    「1 与 0」的关系，于是「清了 1 条、还剩 2 条」。
+    """
+    store = SyncCursorStore(tmp_path / "c.json")
+    store.load()
+    store.set("lan:a:1", 1700000000.0)
+    store.advance_entry("folder:a.llsync", 2, anchor="h2")
+    store.advance_entry("folder:b.llsync", 2, anchor="h2")
+
+    status = store.status()
+    assert status["count"] == len(status["cursors"]) == 3
+    assert status["lan_count"] == 1
+    assert status["entry_count"] == 2
+
+
+def test_forget_clears_entry_and_anchor_too(tmp_path):
+    """`forget(key)` 要清掉这个来源的**全部**位置。
+
+    只 pop `cursors` 会留下 `entries` / `anchors`：同一个来源下次出现时
+    `entry_for()` 仍返回旧值，`entry_is_valid()` 拿一个**属于上次那个对端**
+    的锚点去核对新日志 —— 核对结果只取决于「新日志第 N 条的指纹恰好等于
+    旧值吗」。恰好相等时判成「位置仍有效」，于是从第 N 条之后开始读，
+    前面的记录全部跳过，而界面写着「同步成功、0 条」。
+    """
+    path = tmp_path / "c.json"
+    store = SyncCursorStore(path)
+    store.load()
+    store.set("lan:1.2.3.4:5000", 111.0, since_id=7)
+    store.advance_entry("folder:peer.llsync", 2, anchor="OLD")
+
+    assert store.forget("folder:peer.llsync") is True
+    assert store.entry_for("folder:peer.llsync") == 0
+    assert store.anchor_for("folder:peer.llsync") == ""
+
+    reloaded = SyncCursorStore(path)
+    reloaded.load()
+    assert reloaded.entry_for("folder:peer.llsync") == 0
+    assert reloaded.anchor_for("folder:peer.llsync") == ""
+
+
+def test_forget_then_rename_does_not_inherit_stale_anchor(tmp_path):
+    """换名后的对端不该继承旧来源的锚点 —— 这是上一条的后果面。
+
+    旧行为下：`forget` 留下锚点 `h1`；新日志第 2 条恰好也是 `h1` 时
+    `entry_is_valid()` 判「位置仍有效」，第 1 条新记录被静默跳过。
+    清干净之后判据退化为「位置 0 → 有效，从头读」，两条都在。
+    """
+    path = tmp_path / "c.json"
+    store = SyncCursorStore(path)
+    store.load()
+    store.advance_entry("folder:old-name.llsync", 2, anchor="same")
+    store.forget("folder:old-name.llsync")
+
+    journal = ["same", "extra"]
+    assert store.entry_is_valid(
+        "folder:old-name.llsync", len(journal), lambda index: journal[index - 1]
+    ) is True
+    assert store.entry_for("folder:old-name.llsync") == 0
 
 
 def test_entry_is_valid_treats_position_zero_as_valid(tmp_path):

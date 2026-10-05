@@ -314,25 +314,73 @@ class SyncCursorStore:
         return (shifted, 0) if shifted != ts else (ts, sid)
 
     def forget(self, key: str, *, persist: bool = True) -> bool:
+        """忘掉某个来源的全部位置。
+
+        **三张表要一起清。** 一个来源的位置是三份东西：协议位置
+        （`cursors`）、本地位置（`entries`）、以及本地位置的锚点
+        （`anchors`）。只 pop `cursors` 会留下后两份 —— 而下次这个来源
+        再出现时，`entry_for()` 仍返回旧值，`entry_is_valid()` 会拿一个
+        **属于上次那个对端**的锚点去核对，核对结果只取决于巧合。
+        """
         self._ensure_loaded()
         with self._lock:
             existed = self._cursors.pop(key, None) is not None
+            existed = self._entries.pop(key, None) is not None or existed
+            existed = self._anchors.pop(key, None) is not None or existed
             if existed and persist:
                 self._save_locked()
             return existed
 
     def reset(self, *, persist: bool = True) -> None:
-        """清空全部游标（下一轮回到全量重扫）。
+        """清空局域网游标（`cursors`），下一轮回到全量重扫。
 
-        只清 `cursors`（局域网那套）。条目游标是共享文件夹的本地进度，
-        它由 `reset_entry` 按来源单独回退 —— 这两种位置回答的是两个不同
-        的问题，一次全清会让两种模式互相牵连。
+        **只清 `cursors`，不碰 `entries` / `anchors`。** 这两种位置回答的是
+        两个不同的问题：「向对端请求到哪」（局域网，协议的一部分）与
+        「本地处理到哪」（共享文件夹，本地进度）。一次全清会让两种同步模式
+        互相牵连 —— 清了共享文件夹的进度，下一轮就要把对端日志重读一遍。
+
+        名字保留成 `reset` 是历史原因（它一直只做这件事）；需要「全都清掉」
+        的调用方请用 `reset_all()`，不要往这里加参数。
         """
         with self._lock:
             self._loaded = True
             self._cursors = {}
             if persist:
                 self._save_locked()
+
+    def reset_entry_cursors(self, *, persist: bool = True) -> int:
+        """清空共享文件夹的条目进度（含锚点），返回清掉的来源数。
+
+        与 `reset()` 对称的另一半。日志被对端清空、或用户换了同步目录时，
+        残留下来的条目进度会**永远清不掉**：判失效要先有日志文件才走得到
+        `reset_entry()`，而日志已经不存在了。结果文件里长期留着一批
+        指向不存在日志的位置，`--sync-cursor` 每次都把它们列出来。
+        """
+        self._ensure_loaded()
+        with self._lock:
+            count = len(self._entries)
+            self._entries = {}
+            self._anchors = {}
+            if count and persist:
+                self._save_locked()
+            return count
+
+    def reset_all(self, *, persist: bool = True) -> Tuple[int, int]:
+        """清空全部位置，返回 `(局域网来源数, 共享文件夹来源数)`。
+
+        给 `--sync-cursor-reset` 用：「重新全量扫描」就该是全量，
+        包括那些日志已经不在本机的来源。
+        """
+        with self._lock:
+            self._loaded = True
+            lan = len(self._cursors)
+            entries = len(self._entries)
+            self._cursors = {}
+            self._entries = {}
+            self._anchors = {}
+            if (lan or entries) and persist:
+                self._save_locked()
+            return lan, entries
 
     def snapshot(self) -> Dict[str, float]:
         """`key -> 时间戳`，保持既有形状（CLI / 用例按它取用）。"""
@@ -375,10 +423,18 @@ class SyncCursorStore:
                         ),
                     }
                 )
+            lan_count = len(self._cursors)
+            # `entry_count` 是**位置**个数而不是「有几条游标」：它按 key 数，
+            # 与 `lan_count` 相加才是行数（同一来源两种位置只出一行）。
+            # 报「清了 1 条、还剩 2 条」的根因就是拿 `len(snapshot())`
+            # （只有局域网那份）当总数，而列表里排的是两份的并集。
+            entry_count = len(self._entries)
             return {
                 "path": str(self.path),
                 "exists": self.path.exists(),
                 "count": len(rows),
+                "lan_count": lan_count,
+                "entry_count": entry_count,
                 "cursors": rows,
             }
 

@@ -486,6 +486,28 @@ _MIGRATIONS = {
    注意测试数据两个坑：内容时间戳要用**真实精度**（`3000.0` 这类整数
    时刻在旧实现下也正常），墓碑时间戳要**超过 1 秒安全窗口**
    （否则回退的一秒会把后果盖住，用例假绿）。
+14. **一个来源的位置是三份东西，动它要一起动。** `cursors`（协议位置，
+   局域网）、`entries`（本地位置，共享文件夹）、`anchors`（本地位置
+   旁边的锚点）是同一件事的三个部分：
+
+   - `forget(key)` 必须三张表一起 pop。只清 `cursors` 会留下后两份，
+     同一个来源下次出现时 `entry_for()` 仍返回旧值，而
+     `entry_is_valid()` 会拿一个**属于上次那个对端**的锚点去核对新日志 ——
+     核对结果只取决于「新日志第 N 条的指纹恰好等于旧值吗」。恰好相等
+     就判成「位置仍有效」，前面那几条记录被静默跳过。
+     回归闸门：`test_forget_clears_entry_and_anchor_too`、
+     `test_forget_then_rename_does_not_inherit_stale_anchor`。
+   - `reset()` **只**清 `cursors`（历史行为，别往它加参数）；
+     `reset_entry_cursors()` 是对称的另一半；`reset_all()` 两样都清。
+     清空命令用 `reset_all()`：用户说「重新全量扫描」，那两半都该回到起点。
+   - `status()['count']` 是**两种位置并集的行数**，另有 `lan_count` /
+     `entry_count` 分开计数。报数时不要用 `len(snapshot())` ——
+     那只是局域网那半，于是会出现「已清空 1 条」而列表里还排着两条，
+     且那些残留**永远清不掉**（判失效要先读得到对端日志，而对端日志
+     已不在本机时那条路径走不到）。
+     回归闸门：`test_sync_cursor_reset_also_clears_folder_progress`、
+     `test_sync_cursor_reset_clears_progress_whose_journal_is_gone`、
+     `test_status_count_is_the_number_of_rows`。
 
 ### 修改同步的用户标记语义
 
