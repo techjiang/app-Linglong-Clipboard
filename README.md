@@ -2,7 +2,7 @@
 
 > 跨平台智能剪切板 —— 本地优先、语义检索、可编程转换
 
-[![构建与测试](https://github.com/linglong/clipboard/actions/workflows/build.yml/badge.svg)](.github/workflows/build.yml)
+[![构建与测试](https://github.com/techjiang/Linglong-Clipboard/actions/workflows/build.yml/badge.svg)](https://github.com/techjiang/Linglong-Clipboard/actions/workflows/build.yml)
 [![许可](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](pyproject.toml)
 
@@ -1287,8 +1287,9 @@ linglong-clipboard --config-audit --json   # 机器可读，退出码 0/1
 ### 从源码运行（开发）
 
 ```bash
-git clone https://github.com/linglong/clipboard.git
-cd clipboard
+# 主仓库在 CNB，GitHub 是同步镜像，两者代码一致
+git clone https://cnb.cool/asoe/TechSauce/app-Linglong-Clipboard.git
+cd app-Linglong-Clipboard
 pip install -r requirements.txt
 
 # 直接运行
@@ -1304,11 +1305,17 @@ linglong-clipboard          # 或简写 llclip
 
 ### 下载预编译版本
 
-到 Releases 页面下载对应平台的文件：
+到 Releases 页面下载对应平台的文件。三平台都是压缩包，解压即用，无需安装 Python：
 
-- **Windows**：`玲珑剪切板.exe`，双击即用，无需安装 Python
-- **macOS**：`玲珑剪切板.app`
-- **Linux**：`linglong-clipboard`，`chmod +x` 后运行
+| 平台 | 文件 | 用法 |
+| --- | --- | --- |
+| Windows | `linglong-clipboard-windows.zip` | 解压得到 `玲珑剪切板.exe`，双击运行 |
+| macOS | `linglong-clipboard-macos.zip` | 解压得到 `玲珑剪切板.app` |
+| Linux | `linglong-clipboard-linux.tar.gz` | `tar xzf` 后得到 `linglong-clipboard`，`chmod +x` 再运行 |
+
+> 主站：[cnb.cool/asoe/TechSauce/app-Linglong-Clipboard](https://cnb.cool/asoe/TechSauce/app-Linglong-Clipboard)
+> 镜像：[github.com/techjiang/Linglong-Clipboard](https://github.com/techjiang/Linglong-Clipboard)
+> 两个仓库的 Releases 内容一致。
 
 ### Linux 桌面集成
 
@@ -1969,6 +1976,24 @@ tools/
 - `core/` 下不要导入 Qt
 - 平台相关代码放 `platform/`，并更新 README 的能力矩阵
 - 原生能力都要有降级路径，不能让应用启动失败
+
+---
+
+## 关于
+
+由 **科技酱** 维护。
+
+| 渠道 | 地址 |
+| --- | --- |
+| 主站 | https://www.asoe.cn |
+| 技术文档 | https://docs.asoe.cn |
+| 论坛 | https://forums.asoe.cn |
+| 代码仓库 | https://cnb.cool/asoe/TechSauce/app-Linglong-Clipboard |
+| GitHub 镜像 | https://github.com/techjiang/Linglong-Clipboard |
+| 哔哩哔哩 | https://space.bilibili.com/1768832152 |
+| 邮箱 | official@tech.asoe.cn |
+
+QQ 群：291974598 · 474819022 · 631167288
 
 ---
 

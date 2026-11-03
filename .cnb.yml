@@ -1,8 +1,9 @@
-# CNB 流水线：推送时跑测试，打标签时产出可执行文件
+# CNB 流水线：推送时跑测试，打标签时产出可执行文件并发布到 CNB Release
 #
 # 注意：PyInstaller 不支持交叉编译，这里只能产出当前镜像（Linux）的二进制。
-# Windows / macOS 的产物由 .github/workflows/build.yml 的三平台矩阵负责。
-
+# Windows / macOS 的产物由 .github/workflows/build.yml 的三平台矩阵负责，
+# 三平台产物汇总到 GitHub Release（CNB Release 只挂 Linux 包）。
+#
 main:
   push:
     - stages:
@@ -32,4 +33,43 @@ main:
             ./dist/linglong-clipboard --version
             ./dist/linglong-clipboard --stats
           artifacts:
-            - dist/**
+            - dist/*.tar.gz
+            - dist/*.zip
+
+        # artifacts 只是「这次构建的产物」，不挂到版本页就没人能从 Releases 下载。
+        # tag 名就是版本号，附件与 GitHub Release 用同一套 ASCII 命名。
+        - name: 发布到 CNB Release
+          image: cnbcool/default-npc:latest
+          script: |
+            set -e
+            TAG="$CNB_BRANCH"
+            REPO="$CNB_REPO_SLUG"
+            ASSET="linglong-clipboard-linux.tar.gz"
+            PKG=$(ls dist/*.tar.gz 2>/dev/null | head -1 || find . -name '*.tar.gz' | head -1)
+            if [ -z "$PKG" ]; then
+              echo "找不到 Linux 发行包，终止发布" >&2
+              exit 1
+            fi
+            echo "发行包：$PKG"
+
+            # Release 由 tag 触发时可能还没建好，重试几次
+            for i in 1 2 3 4 5 6; do
+              RID=$(cnb releases get-release-by-tag --repo "$REPO" --tag "$TAG" --json 2>/dev/null \
+                | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"]["id"])' 2>/dev/null) && [ -n "$RID" ] && break
+              echo "等待 $TAG 对应的 Release…（第 $i 次）"
+              sleep 10
+            done
+            [ -n "$RID" ] || { echo "Release $TAG 不存在，终止发布" >&2; exit 1; }
+
+            SIZE=$(stat -c%s "$PKG")
+            # 三步上传：要地址 -> 传到返回的 URL -> 确认。confirm 之前附件不算数。
+            cnb releases post-release-asset-upload-url --repo "$REPO" --release-id "$RID" \
+              --asset-name "$ASSET" --size "$SIZE" --overwrite --json > upload.json
+            UPLOAD=$(python3 -c 'import json;print(json.load(open("upload.json"))["data"]["upload_url"])')
+            VERIFY=$(python3 -c 'import json;print(json.load(open("upload.json"))["data"]["verify_url"])')
+            curl -fsS -X PUT -H 'Content-Type: application/octet-stream' --data-binary @"$PKG" "$UPLOAD" > /dev/null
+            TOKEN=$(python3 -c 'import sys,urllib.parse as u;q=u.parse_qs(u.urlparse(sys.argv[1]).query);print(q["upload_token"][0])' "$VERIFY")
+            PATH_=$(python3 -c 'import sys,urllib.parse as u;q=u.parse_qs(u.urlparse(sys.argv[1]).query);print(q["asset_path"][0])' "$VERIFY")
+            cnb releases post-release-asset-upload-confirmation --repo "$REPO" --release-id "$RID" \
+              --upload-token "$TOKEN" --asset-path "$PATH_" --ttl 0
+            echo "已发布：Release $TAG / $ASSET"

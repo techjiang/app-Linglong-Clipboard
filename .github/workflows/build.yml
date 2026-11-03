@@ -63,10 +63,13 @@ jobs:
         include:
           - os: windows-latest
             artifact: 玲珑剪切板-windows
+            release: linglong-clipboard-windows.zip
           - os: ubuntu-latest
             artifact: 玲珑剪切板-linux
+            release: linglong-clipboard-linux.tar.gz
           - os: macos-latest
             artifact: 玲珑剪切板-macos
+            release: linglong-clipboard-macos.zip
 
     steps:
       - uses: actions/checkout@v4
@@ -111,3 +114,19 @@ jobs:
           name: ${{ matrix.artifact }}
           path: dist/
           if-no-files-found: error
+
+      # 打标签时把三平台产物汇总到同一个 GitHub Release。
+      # action 默认给附件加 `..` 前缀（如 `玲珑剪切板-windows..linger`），
+      # 下载后文件名不可预测；用 files 显式改写成 ASCII 名称，
+      # 与 CNB Release 的附件命名保持一致。
+      - name: 上传到 GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip=>${{ matrix.release }}
+            dist/*.tar.gz=>${{ matrix.release }}
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
