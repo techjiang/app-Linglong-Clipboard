@@ -80,6 +80,7 @@ def humanize_size(size: int) -> str:
 class ItemCard(QFrame):
     """一条记录的卡片视图。"""
 
+    clicked = Signal(int)
     double_clicked = Signal(int)
     context_requested = Signal(int, object)
 
@@ -99,10 +100,9 @@ class ItemCard(QFrame):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        accent = KIND_COLORS.get(item.kind, palette.accent)
-        self.setStyleSheet(
-            f"QFrame#Card {{ border-left: 3px solid {accent}; }}"
-        )
+        # 类型色条走动态属性 + 全局 QSS：逐卡片 setStyleSheet 会覆盖
+        # 主题里 `#Card[selected="true"]` 的选中态，点了卡片看不出变化。
+        self.setProperty("kind", item.kind)
         self._build_ui()
         self.setToolTip(self._tooltip_text())
 
@@ -247,6 +247,11 @@ class ItemCard(QFrame):
         self.setProperty("selected", "true" if selected else "false")
         self.style().unpolish(self)
         self.style().polish(self)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        if event.button() == Qt.MouseButton.LeftButton and self._item.id is not None:
+            self.clicked.emit(self._item.id)
+        super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         if self._item.id is not None:

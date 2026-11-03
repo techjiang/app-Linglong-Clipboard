@@ -18,12 +18,17 @@ import platform
 import shutil
 import subprocess
 import sys
+import tarfile
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SPEC = ROOT / "packaging" / "linglong-clipboard.spec"
 DIST = ROOT / "dist"
 BUILD = ROOT / "build"
+
+#: 产物基名，与 spec 里的 name 保持一致
+APP_NAME = "玲珑剪切板" if sys.platform.startswith("win") else "linglong-clipboard"
 
 
 def platform_label() -> str:
@@ -94,13 +99,51 @@ def build(onedir: bool = False) -> int:
         print("打包失败", file=sys.stderr)
         return result.returncode
 
+    archive = package_archive(onedir)
     print(f"\n完成，产物位于 {DIST.relative_to(ROOT)}/")
     for entry in sorted(DIST.iterdir()):
         if entry.is_file():
             print(f"  {entry.name}  {entry.stat().st_size / 1024 / 1024:.1f} MB")
         else:
             print(f"  {entry.name}/")
+    if archive is not None:
+        print(f"\n发行包：{archive.relative_to(ROOT)}")
     return 0
+
+
+def package_archive(onedir: bool):
+    """把产物打成可直接分发的归档，没有产物时返回 None。
+
+    裸可执行文件有两个麻烦：浏览器/网盘会拦，Linux 下经邮件或 HTTP
+    传输后容易丢可执行位。放进归档一并解决。
+    """
+    if sys.platform.startswith("win"):
+        source = DIST / f"{APP_NAME}.exe"
+        if not source.is_file():
+            return None
+        target = DIST / f"{APP_NAME}-windows.zip"
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as bundle:
+            bundle.write(source, source.name)
+        return target
+
+    if sys.platform == "darwin":
+        app = next(DIST.glob("*.app"), None)
+        if app is None:
+            return None
+        target = DIST / f"{APP_NAME}-macos.zip"
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as bundle:
+            for path in app.rglob("*"):
+                bundle.write(path, path.relative_to(DIST))
+        return target
+
+    target = DIST / f"{APP_NAME}-linux.tar.gz"
+    folder = DIST / APP_NAME
+    source = folder if (onedir and folder.is_dir()) else DIST / APP_NAME
+    if not source.exists():
+        return None
+    with tarfile.open(target, "w:gz") as bundle:
+        bundle.add(source, arcname=APP_NAME)
+    return target
 
 
 def main() -> int:

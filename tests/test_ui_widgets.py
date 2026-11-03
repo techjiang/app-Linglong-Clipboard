@@ -1845,3 +1845,24 @@ def test_settings_footprint_follows_configured_backend(qt_app, home):
     assert dialog._storage_size.text() != "尚无历史文件"
     # JSON 单文件没有伴随文件，不该出现「待合并」
     assert "待合并" not in dialog._storage_size.text()
+
+
+# ---- 主题一致性（回归：对话框/浮层没套主题时深色下灰底灰字）----
+
+def test_transform_window_uses_full_theme(config, qt_app):
+    from linglong_clip.ui.theme import build_stylesheet, palette_for
+
+    from linglong_clip.ui.transform_window import TransformWindow
+
+    window = TransformWindow(config, AutomationEngine())
+    assert window.styleSheet() == build_stylesheet(palette_for(config.get("ui.theme", "system")))
+    assert window._body.objectName() == "TransformBody"
+
+
+def test_quick_overlay_stylesheet_on_itself(storage, config, qt_app):
+    from linglong_clip.core.semantic import SemanticEngine
+    from linglong_clip.ui.quick_paste import QuickPasteOverlay
+    from linglong_clip.ui.theme import toast_style
+
+    overlay = QuickPasteOverlay(storage, SemanticEngine(storage), config)
+    assert overlay.styleSheet() == toast_style(overlay._palette_theme)

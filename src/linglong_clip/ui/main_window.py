@@ -7,12 +7,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
-    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -515,6 +514,9 @@ class MainWindow(QWidget):
         self._status = bar
         self._status_label = QLabel("就绪")
         bar.addWidget(self._status_label)
+        self._notice_label = QLabel("")
+        self._notice_label.setObjectName("CardMeta")
+        bar.addPermanentWidget(self._notice_label)
         root.addWidget(bar)
 
     def _install_shortcuts(self) -> None:
@@ -525,6 +527,8 @@ class MainWindow(QWidget):
             self.addAction(action)
 
         bind("Ctrl+F", lambda: self._search.setFocus())
+        bind("Down", lambda: self._move_selection(1))
+        bind("Up", lambda: self._move_selection(-1))
         bind("Escape", self._on_escape)
         bind("Return", self._copy_selected_plain)
         bind("Ctrl+C", self._copy_selected_plain)
@@ -581,13 +585,18 @@ class MainWindow(QWidget):
         )
 
     def _render_list(self) -> None:
-        # 清空旧卡片
-        while self._list_layout.count() > 1:
+        # 清空旧卡片：连末尾的 stretch 一起取空再重铺。
+        # 只清到剩一项会让「卡片数」与「占位项数」越跑越错位，
+        # 切换搜索时因此残留上一轮渲染的卡片（看着像重影）。
+        while self._list_layout.count():
             entry = self._list_layout.takeAt(0)
             widget = entry.widget()
             if widget is not None:
+                widget.setParent(None)
                 widget.deleteLater()
         self._cards.clear()
+        # 先垫一个 stretch，卡片依次插在它前面，内容保持顶对齐
+        self._list_layout.addStretch(1)
 
         if not self._items:
             self._empty_label.show()
@@ -600,6 +609,9 @@ class MainWindow(QWidget):
 
         for item in self._items:
             card = ItemCard(item, self._palette_theme, density=self._density)
+            # 单击只换选中项（右侧预览跟着变）；复制仍要双击，
+            # 免得「点一下看看」就把剪贴板覆盖了。
+            card.clicked.connect(self._select)
             card.double_clicked.connect(
                 lambda item_id: self._emit_copy(item_id, plain_text_only=False)
             )
@@ -723,6 +735,22 @@ class MainWindow(QWidget):
         """「直接粘贴到上次的窗口」：同样是出站，同样要过一遍规则。"""
         self.paste_requested.emit(item_id)
         self.outbound_requested.emit(item_id, False)
+
+    def _move_selection(self, delta: int) -> None:
+        """上下键在列表里移动选中项，并把卡片滚进可视区域。"""
+        if not self._items:
+            return
+        ids = [item.id for item in self._items if item.id is not None]
+        if not ids:
+            return
+        if self._selected_id in ids:
+            position = (ids.index(self._selected_id) + delta) % len(ids)
+        else:
+            position = 0
+        self._select(ids[position])
+        card = self._cards.get(ids[position])
+        if card is not None:
+            self._scroll.ensureWidgetVisible(card, 0, 40)
 
     def _paste_nth(self, index: int) -> None:
         if 1 <= index <= len(self._items):
@@ -874,19 +902,21 @@ class MainWindow(QWidget):
 
     def notify_cleared(self, removed: int) -> None:
         """由 Application 在清理完成后回调，用于更新状态栏与列表。"""
-        self._status_label.setText(f"已清理 {removed} 条记录")
+        self.notify(f"已清理 {removed} 条记录")
         self.reload()
 
     def _compact_db(self) -> None:
         self.compact_requested.emit()
 
     def notify_compacted(self) -> None:
-        self._status_label.setText("数据库已压缩")
+        self.notify("数据库已压缩")
 
     def focus_search(self) -> None:
         self._search.setFocus()
         self._search.selectAll()
 
     def notify(self, message: str, timeout_ms: int = 2500) -> None:
-        self._status_label.setText(message)
-        QTimer.singleShot(timeout_ms, lambda: self._status_label.setText("就绪"))
+        # 状态栏左侧固定显示记录数，右侧才是会过期的提示。
+        # 共用一格的话，一条「已复制」会把「N 条记录」永久顶掉。
+        self._notice_label.setText(message)
+        QTimer.singleShot(timeout_ms, lambda: self._notice_label.clear())

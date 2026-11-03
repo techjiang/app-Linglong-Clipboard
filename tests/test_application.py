@@ -1007,3 +1007,21 @@ def test_stale_search_index_would_hide_new_item(app_instance):
 
     app_instance._invalidate_search_index()
     assert [item.hash for item in app_instance.search_index.snapshot()] == ["hl"]
+
+
+# ---- 拦截敏感内容要有回执（回归）----
+
+def test_sensitive_capture_tells_user_it_was_blocked(app_instance):
+    app_instance._on_captured_ui(
+        ClipboardItem(kind="sensitive", content="", sensitive=True), "skipped_privacy"
+    )
+    assert "拦截" in app_instance.window._notice_label.text()
+
+
+def test_blocked_capture_does_not_reload_list(app_instance, monkeypatch):
+    calls = []
+    monkeypatch.setattr(app_instance.window, "reload", lambda: calls.append(1))
+    app_instance._on_captured_ui(
+        ClipboardItem(kind="sensitive", content="", sensitive=True), "skipped_privacy"
+    )
+    assert calls == []

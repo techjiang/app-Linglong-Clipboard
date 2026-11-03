@@ -1701,7 +1701,7 @@ pytest tests/ --cov=linglong_clip --cov-report=html # 带覆盖率
 QT_QPA_PLATFORM=offscreen pytest tests/test_ui.py   # 无头环境跑界面测试
 ```
 
-2029 个用例，覆盖核心逻辑、平台适配、界面组件与端到端流程。
+2041 个用例，覆盖核心逻辑、平台适配、界面组件与端到端流程。
 界面测试统一走 Qt 的 `offscreen` 平台，无需真实显示器，CI 里也能跑。
 
 **平台相关的测试用「仿真原生层」而不是打桩断言。** Windows 分支喂一个

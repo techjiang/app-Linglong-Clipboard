@@ -694,3 +694,90 @@ def test_preview_lists_other_forms(qt_app, home):
     assert "text/html" in window._preview._meta.text()
     window.shutdown()
     storage.close()
+
+
+# ---- 选中态与列表重渲染（回归）----
+
+def test_card_does_not_override_own_stylesheet(qt_app):
+    from linglong_clip.ui.item_card import ItemCard
+    from linglong_clip.ui.theme import DARK
+
+    card = ItemCard(ClipboardItem(id=1, kind="code", content="x = 1"), DARK)
+    # 卡片级 setStyleSheet 会压掉 #Card[selected="true"]，点了看不出选中
+    assert card.styleSheet() == ""
+    assert card.property("kind") == "code"
+
+
+def test_stylesheet_has_per_kind_border_and_selected_state():
+    from linglong_clip.ui.theme import DARK, KIND_COLORS, build_stylesheet
+
+    sheet = build_stylesheet(DARK)
+    for kind, color in KIND_COLORS.items():
+        assert f'QFrame#Card[kind="{kind}"] {{ border-left: 3px solid {color}; }}' in sheet
+    assert 'QFrame#Card[selected="true"]' in sheet
+
+
+def test_reload_does_not_leave_stale_cards(window, seeded):
+    """换搜索结果后不能残留上一轮的卡片（会出现重影）。"""
+    from linglong_clip.ui.item_card import ItemCard
+
+    window.reload()
+    assert window._scroll.widget().layout().count() >= 5
+    window._search.setText("会议纪要")
+    window.reload()
+    layout = window._scroll.widget().layout()
+    cards = [
+        layout.itemAt(index).widget()
+        for index in range(layout.count())
+        if isinstance(layout.itemAt(index).widget(), ItemCard)
+    ]
+    # 1 张卡 + 1 个 stretch，而不是在旧卡片上继续叠加
+    assert len(cards) == 1
+    assert layout.count() == 2
+
+
+def test_card_click_emits_selection(qt_app):
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtGui import QMouseEvent
+    from PySide6.QtWidgets import QApplication
+
+    from linglong_clip.ui.item_card import ItemCard
+    from linglong_clip.ui.theme import DARK
+
+    card = ItemCard(ClipboardItem(id=9, kind="text", content="x"), DARK)
+    seen = []
+    card.clicked.connect(seen.append)
+    QApplication.sendEvent(
+        card,
+        QMouseEvent(
+            QMouseEvent.Type.MouseButtonPress,
+            QPoint(5, 5),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        ),
+    )
+    assert seen == [9]
+
+
+def test_window_arrow_keys_move_selection(window, seeded):
+    window.reload()
+    window._select(window._items[0].id)
+    window._move_selection(1)
+    assert window._selected_id == window._items[1].id
+    window._move_selection(-1)
+    assert window._selected_id == window._items[0].id
+
+
+def test_window_arrow_keys_wrap(window, seeded):
+    window.reload()
+    window._select(window._items[-1].id)
+    window._move_selection(1)
+    assert window._selected_id == window._items[0].id
+
+
+def test_window_notice_does_not_clobber_record_count(window, seeded):
+    window.reload()
+    window.notify("已复制：文本")
+    assert "条记录" in window._status_label.text()
+    assert window._notice_label.text() == "已复制：文本"

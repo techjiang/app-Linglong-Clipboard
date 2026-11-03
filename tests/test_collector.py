@@ -439,3 +439,15 @@ def test_pin_immune_false_evicts_pinned_when_over_limit(storage, config):
     remaining = {item.content for item in storage.list(limit=100)}
     # 排序把固定项排前，所以仍留着它，淘汰的是最旧的普通记录
     assert remaining == {"PINNED", "plain3"}
+
+
+# ---- 敏感内容：拦了也要让用户知道 ----
+
+def test_sensitive_content_is_not_persisted_but_signalled(collector, storage):
+    outcome, saved = collector.process(_item("sk-abcdefghijklmnopqrstuvwxyz123456"))
+    assert outcome == SKIPPED_PRIVACY
+    assert saved is None
+    assert storage.count() == 0
+    # 不落库，但要发一条提示；否则用户以为采集坏了
+    assert collector.events[-1][0] == SKIPPED_PRIVACY
+    assert "未记录" in collector.events[-1][1]

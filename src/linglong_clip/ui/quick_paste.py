@@ -131,6 +131,9 @@ class QuickPasteOverlay(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFixedWidth(560)
+        # 样式挂在浮层本身：panel 是子控件，单独设样式时
+        # 高亮行的 unpolish/polish 只在 panel 生效，切换选中容易不刷新
+        self.setStyleSheet(toast_style(self._palette_theme))
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
@@ -147,7 +150,6 @@ class QuickPasteOverlay(QWidget):
 
         panel = QFrame()
         panel.setObjectName("QuickPanel")
-        panel.setStyleSheet(toast_style(self._palette_theme))
         outer.addWidget(panel)
 
         layout = QVBoxLayout(panel)

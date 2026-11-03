@@ -95,9 +95,12 @@ class Collector:
         if verdict.sensitive:
             item.sensitive = True
             if not self._guard.should_keep_sensitive():
-                # 敏感内容不落盘：既不进历史，也不参与同步
+                # 敏感内容不落盘：既不进历史，也不参与同步。
+                # 但要把「拦了什么」通知出去 —— 静默丢弃会让用户以为
+                # 采集坏了，甚至反复复制同一段密码来「重试」。
                 _log.info("敏感内容不入库：%s", verdict.summary)
                 self._discard_image(item)
+                self._emit(self._privacy_notice(item, verdict.reasons), SKIPPED_PRIVACY)
                 return SKIPPED_PRIVACY, None
 
         # 超长文本的截断放在隐私判定之后：判定读的是完整内容，
@@ -392,6 +395,21 @@ class Collector:
         if removed:
             _log.info("清除 %d 条超期敏感记录", removed)
         return removed
+
+    def _privacy_notice(self, item: ClipboardItem, reasons) -> ClipboardItem:
+        """生成只含「拦了什么」的占位记录，用于驱动界面提示。
+
+        不落库、不含原文 —— 它的唯一用途是让用户知道这次没记下来。
+        """
+        summary = "、".join(dict.fromkeys(reasons or [])) or "敏感信息"
+        return ClipboardItem(
+            kind="sensitive",
+            content="",
+            preview=f"{summary} · 未记录",
+            source_app=item.source_app,
+            source_title=item.source_title,
+            sensitive=True,
+        )
 
     def _emit(self, item: Optional[ClipboardItem], outcome: str) -> None:
         if item is None or self._on_captured is None:

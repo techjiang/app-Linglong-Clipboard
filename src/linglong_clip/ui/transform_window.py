@@ -10,7 +10,6 @@ from typing import List, Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -21,7 +20,7 @@ from PySide6.QtWidgets import (
 
 from ..core.automation import REGISTRY, AutomationEngine
 from ..core.models import ClipboardItem
-from .theme import palette_for
+from .theme import build_stylesheet, palette_for
 
 
 class TransformWindow(QWidget):
@@ -41,9 +40,9 @@ class TransformWindow(QWidget):
         self.setWindowFlag(Qt.WindowType.Window)
 
         palette = palette_for(config.get("ui.theme", "system"))
-        self.setStyleSheet(
-            f"QWidget {{ background-color: {palette.bg}; color: {palette.text}; }}"
-        )
+        # 套完整主题：只覆盖 QWidget 的 background/color 会把按钮、滚动条
+        # 的原生绘制抹掉，深色下按钮变成灰底灰字，看着像禁用。
+        self.setStyleSheet(build_stylesheet(palette))
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -51,6 +50,7 @@ class TransformWindow(QWidget):
 
         self._title = QLabel("转换结果")
         self._title.setObjectName("StatValue")
+        self._title.setWordWrap(True)
         layout.addWidget(self._title)
 
         self._chain_label = QLabel("")
@@ -59,12 +59,9 @@ class TransformWindow(QWidget):
         layout.addWidget(self._chain_label)
 
         self._body = QTextEdit()
+        self._body.setObjectName("TransformBody")
         self._body.setReadOnly(True)
         self._body.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
-        self._body.setStyleSheet(
-            f"QTextEdit {{ background-color: {palette.surface}; color: {palette.text};"
-            f" border: 1px solid {palette.border}; border-radius: 8px; padding: 10px; }}"
-        )
         layout.addWidget(self._body, 1)
 
         self._actions_row = QHBoxLayout()

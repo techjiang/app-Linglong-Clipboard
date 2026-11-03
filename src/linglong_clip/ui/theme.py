@@ -96,6 +96,18 @@ def palette_for(theme: str) -> Palette:
     return LIGHT if theme == "light" else DARK
 
 
+def _kind_border_rules(palette: Palette) -> str:
+    """按 `kind` 动态属性给卡片左侧色条上色。
+
+    用 QSS 而不是逐卡片 `setStyleSheet`：卡片级样式表会盖掉
+    `#Card[selected="true"]`，选中与未选中看起来一模一样 —— 用户点了没反应。
+    """
+    return "".join(
+        f'QFrame#Card[kind="{kind}"] {{ border-left: 3px solid {color}; }}\n'
+        for kind, color in KIND_COLORS.items()
+    )
+
+
 def build_stylesheet(palette: Palette) -> str:
     """生成全局 QSS。
 
@@ -215,6 +227,9 @@ QFrame#Card {{
     border: 1px solid {p.border};
     border-left: 3px solid {p.accent};
     border-radius: 10px;
+}}
+{_kind_border_rules(p)}QFrame#Card:hover {{
+    background-color: {p.surface_hover};
 }}
 QFrame#Card[selected="true"] {{
     background-color: {p.surface_active};
@@ -488,5 +503,34 @@ QLineEdit#QuickSearch:focus {{
 QLineEdit {{
     placeholder-text-color: {p.text_faint};
     min-height: 20px;
+}}
+/* 转换结果窗口独立成窗、不继承主窗口样式表，这几个控件名由它使用 */
+QTextEdit#TransformBody {{
+    background-color: {p.surface};
+    color: {p.text};
+    border: 1px solid {p.border};
+    border-radius: 8px;
+    padding: 10px;
+}}
+QPushButton#Primary {{
+    background-color: {p.accent};
+    border: 1px solid {p.accent};
+    color: {p.accent_text};
+    font-weight: 600;
+}}
+QPushButton#Primary:hover {{
+    background-color: {p.accent_dim};
+}}
+QPushButton#Ghost {{
+    background-color: transparent;
+    border: 1px solid {p.border};
+    border-radius: 6px;
+    padding: 3px 9px;
+    color: {p.text_dim};
+    font-size: 12px;
+}}
+QPushButton#Ghost:hover {{
+    border-color: {p.accent_dim};
+    color: {p.text};
 }}
 """

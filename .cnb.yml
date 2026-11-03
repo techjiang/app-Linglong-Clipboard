@@ -33,6 +33,7 @@ main:
             ./dist/linglong-clipboard --version
             ./dist/linglong-clipboard --stats
           artifacts:
+            # 只传发行归档：dist 里还有 PyInstaller 的中间文件
             - dist/*.tar.gz
             - dist/*.zip
 

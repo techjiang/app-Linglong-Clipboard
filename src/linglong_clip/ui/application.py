@@ -19,7 +19,7 @@ from PySide6.QtCore import QAbstractNativeEventFilter, QObject, QTimer, Qt, Sign
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from ..core.automation import AutomationEngine
-from ..core.collector import CAPTURED, MERGED, Collector
+from ..core.collector import CAPTURED, MERGED, SKIPPED_PRIVACY, Collector
 from ..core.copy_guard import ClipboardReleaser, plan_outbound
 from ..core.models import PINNED_BY_KEY, ClipboardItem
 from ..core.monitor import ClipboardMonitor, FocusTracker
@@ -686,14 +686,19 @@ class Application(QObject):
         """GUI 线程：刷新列表与提示。"""
         if self._shutting_down:
             return
-        self._invalidate_search_index()
-        self.window.reload()
-        if outcome == CAPTURED:
-            self.window.notify(f"已记录：{item.kind_label} · {item.display_source}")
-        elif outcome == MERGED:
-            self.window.notify("内容已存在，已更新使用记录")
+        if outcome in (CAPTURED, MERGED):
+            self._invalidate_search_index()
+            self.window.reload()
+            if outcome == CAPTURED:
+                self.window.notify(f"已记录：{item.kind_label} · {item.display_source}")
+            else:
+                self.window.notify("内容已存在，已更新使用记录")
+            return
 
-        if item.sensitive:
+        # 被拦截的内容没有落库，列表不用刷新；但必须给回执，
+        # 否则「我复制了却没记录」会被当成 Bug 反复重试。
+        if item.sensitive or outcome == SKIPPED_PRIVACY:
+            self.window.notify("已拦截敏感内容，未写入历史", timeout_ms=4000)
             self.tray.notify("已拦截敏感内容", "包含密码或密钥，未写入历史")
 
     # ---- 剪贴板操作 ----
