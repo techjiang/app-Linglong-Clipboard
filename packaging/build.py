@@ -13,6 +13,7 @@ macOS 的 .app 只能在 macOS 上打。CI 里用矩阵构建（见 .github/work
 from __future__ import annotations
 
 import argparse
+import os
 import platform
 import shutil
 import subprocess
@@ -54,7 +55,27 @@ def clean() -> None:
             print(f"已清理 {path.relative_to(ROOT)}")
 
 
+def _prepare_dist() -> None:
+    """清掉 dist 里同名的旧产物。
+
+    `--clean` 只清 PyInstaller 的构建缓存，不动 dist/。
+    于是「先打单文件、再打目录模式」时，dist 里已有一个同名**文件**，
+    COLLECT 要建同名**目录**，直接报
+    `ValueError: Resource '...' is not a valid file!`。
+    """
+    if not DIST.exists():
+        return
+    for entry in DIST.iterdir():
+        if entry.is_dir():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink(missing_ok=True)
+
+
 def build(onedir: bool = False) -> int:
+    # 不能把 `--onefile/--onedir` 和 .spec 一起传：PyInstaller 会拒绝
+    # （「makespec options not valid when a .spec file is given」），
+    # 发版第一步就会卡在这里。模式改由环境变量传给 spec。
     command = [
         sys.executable,
         "-m",
@@ -62,10 +83,13 @@ def build(onedir: bool = False) -> int:
         str(SPEC),
         "--noconfirm",
         "--clean",
-        "--onedir" if onedir else "--onefile",
     ]
-    print(f"在 {platform_label()} 上打包：{' '.join(command[2:])}")
-    result = subprocess.run(command, cwd=str(ROOT), check=False)
+    env = dict(os.environ)
+    env["LINGLONG_ONEDIR"] = "1" if onedir else "0"
+    _prepare_dist()
+    print(f"在 {platform_label()} 上打包：{' '.join(command[2:])}"
+          f"（{'目录' if onedir else '单文件'}模式）")
+    result = subprocess.run(command, cwd=str(ROOT), check=False, env=env)
     if result.returncode != 0:
         print("打包失败", file=sys.stderr)
         return result.returncode

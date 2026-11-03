@@ -64,7 +64,11 @@ def _normalize_values(raw: Dict[str, Any]) -> tuple:
 DEFAULTS: Dict[str, Any] = {
     "capture": {
         "enabled": True,
-        "types": ["text", "rich", "image", "file", "link", "color"],
+        # 必须包含 code：代码片段是最常被复制的内容之一，
+        # 漏掉它会让「复制一段函数」直接不入库，用户完全不知道为什么。
+        # sensitive 不放进来：敏感内容是否入库由 privacy 策略决定，
+        # 放进采集开关会出现「勾了却还是不记」的困惑。
+        "types": ["text", "rich", "image", "file", "link", "color", "code"],
         "max_text_length": 200_000,
         "poll_interval_ms": 300,
         # 主选择区（X11/Wayland PRIMARY，选中即生效）是否也采集。

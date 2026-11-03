@@ -82,15 +82,28 @@ jobs:
           pip install -r requirements-dev.txt
           pip install cryptography pyyaml
 
-      - name: 安装 Linux 图形库
+      - name: 安装 Linux 图形库与打包依赖
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libegl1 libglib2.0-0 libxkbcommon-x11-0 libdbus-1-3
+          # binutils 提供 objdump（PyInstaller 在 Linux 上打包必需）；
+          # libpython 让 PyInstaller 找得到 libpython3.x.so，否则直接报错退出。
+          sudo apt-get install -y \
+            libegl1 libglib2.0-0 libxkbcommon-x11-0 libdbus-1-3 \
+            libfontconfig1 libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 \
+            libxcb-shape0 binutils libpython3.12
           echo "QT_QPA_PLATFORM=offscreen" >> "$GITHUB_ENV"
 
       - name: 打包
         run: python packaging/build.py
+
+      - name: 冒烟测试（产物必须能启动）
+        if: runner.os == 'Linux'
+        run: |
+          ./dist/linglong-clipboard --version
+          ./dist/linglong-clipboard --list
+          ./dist/linglong-clipboard --stats
+        shell: bash
 
       - name: 上传产物
         uses: actions/upload-artifact@v4

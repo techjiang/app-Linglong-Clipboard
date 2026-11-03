@@ -10,6 +10,7 @@
 否则下次改动时会因为「不知道为什么有这行」而误删。
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -62,10 +63,63 @@ excludes = [
     "PySide6.QtPdf",
     "PySide6.QtPdfWidgets",
     "PySide6.QtSvgWidgets",
+    "PySide6.QtNetwork",
+    "PySide6.QtPrintSupport",
+    "PySide6.QtDBus",
+    "PySide6.QtXml",
+    "PySide6.QtConcurrent",
+    "PySide6.QtUiTools",
+    "PySide6.QtSerialBus",
+    "PySide6.QtStateMachine",
+    "PySide6.QtWebSockets",
+    "PySide6.QtSpatialAudio",
+    "PySide6.QtTextToSpeech",
+    "PySide6.QtHttpServer",
+    # 开发/测试期才用的包，最终用户用不到
+    "pytest",
+    "setuptools",
+    "pip",
+    "wheel",
+    "PyInstaller",
 ]
 
+# `excludes` 只作用于 Python 层：PySide6 的 hook 会把整套 Qt 库直接塞进
+# binaries，管不到。这里按文件名做最后一道过滤 —— 剪贴板只用
+# Core / Gui / Widgets，其余 Qt 库对最终用户毫无意义，留着体积翻倍还拖慢启动。
+_DROP_QT_LIBS = (
+    "libQt6Qml", "libQt6Quick", "libQt6VirtualKeyboard", "libQt6Pdf",
+    "libQt6Sql", "libQt6Test", "libQt6Designer", "libQt6Help",
+    "libQt6Multimedia", "libQt6Charts", "libQt6DataVisualization",
+    "libQt6Bluetooth", "libQt6Nfc", "libQt6Positioning", "libQt6SerialPort",
+    "libQt6SerialBus", "libQt6SpatialAudio", "libQt6Graphs", "libQt6TextToSpeech",
+    "libQt6HttpServer", "libQt6WebEngine", "libQt6WebSockets", "libQt6StateMachine",
+    "libQt6Concurrent", "libQt6PrintSupport", "libQt6SvgWidgets", "libQt6Svg",
+)
+
+#: Qt 插件同理：只留当前平台真正会用到的
+_DROP_QT_PLUGINS = (
+    "qmltooling", "qml", "virtualkeyboard", "designer", "sqldrivers",
+    "multimedia", "printsupport", "webview", "scenegraph", "assetimporters",
+    "position", "sensors", "canbus", "nfc", "bluetooth",
+)
+
+
+def _keep(entry) -> bool:
+    name = str(entry[0]).replace("\\", "/")
+    lowered = name.lower()
+    if any(token.lower() in lowered for token in _DROP_QT_LIBS):
+        return False
+    if "/plugins/" in lowered:
+        return not any(token in lowered for token in _DROP_QT_PLUGINS)
+    return True
+
+# 入口必须是「绝对导入」的启动脚本：直接把 `linglong_clip/__main__.py`
+# 交给 PyInstaller 会变成顶层脚本，里面的相对导入失去包上下文，
+# 产物一运行就 ImportError（开发时都是 `-m` 跑，察觉不到）。
+_ENTRY = project_root / "packaging" / "_entry.py"
+
 a = Analysis(
-    [str(src_dir / "linglong_clip" / "__main__.py")],
+    [str(_ENTRY)],
     pathex=[str(src_dir)],
     binaries=[],
     datas=[],
@@ -77,15 +131,25 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+a.binaries = TOC([entry for entry in a.binaries if _keep(entry)])
+a.datas = TOC([entry for entry in a.datas if _keep(entry)])
+
 pyz = PYZ(a.pure)
+
+# 单文件还是目录模式由 build.py 通过环境变量传递。
+# 不能给 PyInstaller 同时传 .spec 和 --onefile/--onedir（它会直接报错拒绝），
+# 所以这个选择只能写在 spec 的结构里：onefile = 内联 binaries 且没有 COLLECT。
+ONEDIR = os.environ.get("LINGLONG_ONEDIR", "0") == "1"
 
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
+    [] if ONEDIR else a.binaries,
+    [] if ONEDIR else a.datas,
     [],
     name="linglong-clipboard" if sys.platform != "win32" else "玲珑剪切板",
+    # 目录模式：EXE 只是 COLLECT 的输入，不该落到 dist/ 里和目录同名
+    exclude_binaries=ONEDIR,
     debug=False,
     bootloader_ignore_signals=False,
     strip=not sys.platform.startswith("win"),
@@ -102,3 +166,16 @@ exe = EXE(
     icon=None,
     bundle_identifier="cool.cnb.linglong.clipboard" if sys.platform == "darwin" else None,
 )
+
+if ONEDIR:
+    # EXE 的产物目录要挪进 build/：目录模式下 COLLECT 会建一个与 EXE 同名的
+    # 目录，EXE 也留在 dist/ 的话两者同名，PyInstaller 会报
+    # `Resource '...' is not a valid file!`（它在 dist 里看到的是同名文件）。
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=not sys.platform.startswith("win"),
+        upx=False,
+        name="linglong-clipboard" if sys.platform != "win32" else "玲珑剪切板",
+    )

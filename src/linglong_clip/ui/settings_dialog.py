@@ -30,7 +30,6 @@ from PySide6.QtWidgets import (
 
 from ..core.automation import Rule
 from ..core.models import KIND_LABELS
-from ..utils.logger import get_logger
 from ..core.theme_spec import (
     DEFAULT_DENSITY,
     DENSITY_OPTIONS,
@@ -38,6 +37,8 @@ from ..core.theme_spec import (
     density_issue,
     normalize_density,
 )
+from ..utils.logger import get_logger
+from .theme import build_stylesheet, palette_for
 
 _log = get_logger("settings")
 
@@ -88,7 +89,12 @@ class SettingsDialog(QDialog):
         self.changes: Dict[str, object] = {}
 
         self.setWindowTitle("设置 — 玲珑剪切板")
-        self.resize(640, 560)
+        self.resize(760, 640)
+        # 独立窗口必须自己套一层全局样式表：QSS 不会从父窗口继承，
+        # 不设的话设置页是系统默认灰白外观，和主界面完全脱节。
+        self.setStyleSheet(
+            build_stylesheet(palette_for(self._config.get("ui.theme", "system")))
+        )
 
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
@@ -103,6 +109,10 @@ class SettingsDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        # 中文界面里按钮文案也要跟着走：Qt 自带翻译不一定加载，
+        # 直接把默认的 OK / Cancel 改掉更可靠。
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("保存")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)

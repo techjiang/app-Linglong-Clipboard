@@ -61,19 +61,30 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
-#: `pinned` / `favorite` 排前，随后按最近使用与创建时间
-_ORDER_COLUMNS = "pinned DESC, favorite DESC, COALESCE(NULLIF(used_at,0), created_at) DESC"
+#: 置顶（固定 → 收藏）优先，组内按「最近动过」排序。
+#:
+#: 用 `MAX(used_at, created_at)` 而不是 `COALESCE(NULLIF(used_at,0), created_at)`：
+#: 后者在没有使用记录时退回创建时间，但一旦被用过就**永远**按 used_at 排 ——
+#: 一条三天前的记录点一下复制，就会长期压在刚才复制的新记录前面。
+_ORDER_COLUMNS = (
+    "pinned DESC, favorite DESC, "
+    "MAX(COALESCE(used_at, 0), COALESCE(created_at, 0)) DESC, id DESC"
+)
 
 
 def _order_sql(alias: str = "") -> str:
-    """生成排序子句；带别名时自动加上前缀，避免手写字符串替换出错。"""
+    """生成排序子句；带别名时逐列加前缀。
+
+    不用 `str.replace` 拼前缀：`pinned` 是 `pinned_xxx` 之类列名的子串，
+    哪天加一个 `favorite_count` 列，替换就会把 SQL 改坏。
+    """
     if not alias:
         return f"ORDER BY {_ORDER_COLUMNS}"
     prefix = f"{alias}."
-    columns = _ORDER_COLUMNS.replace("pinned", f"{prefix}pinned")
-    columns = columns.replace("favorite", f"{prefix}favorite")
-    columns = columns.replace("used_at", f"{prefix}used_at")
-    columns = columns.replace("created_at", f"{prefix}created_at")
+    columns = ", ".join(
+        part if not part.strip()[:1].isalpha() else f"{prefix}{part.strip()}"
+        for part in _ORDER_COLUMNS.split(",")
+    )
     return f"ORDER BY {columns}"
 
 

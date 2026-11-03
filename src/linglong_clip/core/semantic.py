@@ -186,6 +186,9 @@ def _iter_kind_word_matches(text: str) -> List[Tuple[str, int, int]]:
     return found
 
 
+#: 「不要这一类」的前缀词
+_EXCLUDE_PREFIXES = ("不要", "不看", "排除", "除了", "非")
+
 #: 时间范围关键词 -> (起始时间偏移秒数, 结束时间偏移秒数)；None 表示不限
 _TIME_RANGES: Dict[str, tuple] = {
     "今天": ("today", None),
@@ -266,6 +269,8 @@ class QueryIntent:
     raw: str = ""
     keywords: str = ""
     kinds: List[str] = field(default_factory=list)
+    #: 「不要图片」「除了链接」这类排除条件
+    exclude_kinds: List[str] = field(default_factory=list)
     source: str = ""
     since: float = 0.0
     until: float = 0.0
@@ -276,7 +281,15 @@ class QueryIntent:
 
     @property
     def has_filters(self) -> bool:
-        return bool(self.kinds or self.source or self.since or self.until or self.pinned_only)
+        return bool(
+            self.kinds
+            or self.exclude_kinds
+            or self.source
+            or self.since
+            or self.until
+            or self.pinned_only
+            or self.favorite_only
+        )
 
 
 @dataclass
@@ -398,7 +411,20 @@ def parse_intent(query: str) -> QueryIntent:
             time_words_seen = True
             break
 
-    # 2. 类型。歧义词要「被结构组织过」才算类型，见 `_is_type_query()`
+    # 2. 排除类型：「不要图片」「除了链接」。
+    #    必须先摘掉，否则排除词里的类型词会被 `_KIND_BY_WORD` 当成「只看这一类」——
+    #    「不要图片」于是被解析成「只要图片」，结果正好相反。
+    for prefix in _EXCLUDE_PREFIXES:
+        for kind, words in KIND_KEYWORDS.items():
+            for word in sorted(words, key=len, reverse=True):
+                phrase = f"{prefix}{word}"
+                if phrase in remaining:
+                    if kind not in intent.exclude_kinds:
+                        intent.exclude_kinds.append(kind)
+                        intent.explain.append(f"排除：{word}")
+                    remaining = remaining.replace(phrase, " " * len(phrase))
+
+    # 3. 类型。歧义词要「被结构组织过」才算类型，见 `_is_type_query()`
     #
     #    这里对所有类型词（含非歧义的）统一处理：`_is_type_query` 只对
     #    歧义词生效，其余一律照旧解析，所以「链接」这类同义词的行为不变。
@@ -418,7 +444,7 @@ def parse_intent(query: str) -> QueryIntent:
         # 才不会把「所有链接 所有代码」里的第二个词当成第一个的后续内容跳过
         remaining = remaining[:start] + " " * (end - start) + remaining[end:]
 
-    # 3. 固定 / 收藏
+    # 4. 固定 / 收藏
     pinned_pattern = re.compile(r"固定|置顶|pinned?", re.IGNORECASE)
     if pinned_pattern.search(remaining):
         intent.pinned_only = True
@@ -430,7 +456,7 @@ def parse_intent(query: str) -> QueryIntent:
         intent.explain.append("仅收藏项")
         remaining = favorite_pattern.sub(" ", remaining)
 
-    # 4. 来源应用
+    # 5. 来源应用
     match = _SOURCE_RE.search(remaining)
     if match:
         candidate = match.group(1).strip()
@@ -621,6 +647,9 @@ class SemanticEngine:
         intent = parse_intent(query) if query and use_intent else QueryIntent(keywords=query)
         effective_kind = kind or (intent.kinds[0] if len(intent.kinds) == 1 else None)
         effective_since = since or intent.since
+        # 意图里解析出的上界必须并进来：早先只把 `intent.until` 算出来却没用，
+        # 结果搜「昨天」会把今天的记录一起带出来。
+        effective_until = until or intent.until or None
         effective_source = source or intent.source
         # 关键点：`intent.keywords` 为空表示整句都被解析成了过滤条件
         # （如「上周的截图」），此时不能退回原串去全文检索 ——
@@ -649,7 +678,7 @@ class SemanticEngine:
                 effective_kind=effective_kind,
                 intent=intent,
                 effective_since=effective_since,
-                until=until,
+                until=effective_until,
                 effective_source=effective_source,
                 pinned_only=pinned_only,
                 favorite_only=favorite_only,
@@ -669,7 +698,7 @@ class SemanticEngine:
             effective_kind=effective_kind,
             intent=intent,
             effective_since=effective_since,
-            until=until,
+            until=effective_until,
             effective_source=effective_source,
             pinned_only=pinned_only,
             favorite_only=favorite_only,
@@ -800,6 +829,8 @@ class SemanticEngine:
             if effective_kind and item.kind != effective_kind:
                 continue
             if intent.kinds and len(intent.kinds) > 1 and item.kind not in intent.kinds:
+                continue
+            if intent.exclude_kinds and item.kind in intent.exclude_kinds:
                 continue
             if effective_since and max(item.created_at, item.used_at) < effective_since:
                 continue

@@ -13,7 +13,12 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Pattern
 
 from ..utils.logger import get_logger
-from .classify import SENSITIVE_PATTERNS, is_password_manager
+from .classify import (
+    WEAK_SENSITIVE_RULES,
+    detect_sensitive,
+    is_blocking_sensitivity,
+    is_password_manager,
+)
 from .models import ClipboardItem
 
 _log = get_logger("privacy")
@@ -128,16 +133,15 @@ class PrivacyGuard:
                 reasons=[f"来源在黑名单：{item.source_app}"],
             )
 
-        for name, pattern in SENSITIVE_PATTERNS:
-            try:
-                if pattern.search(text):
-                    reasons.append(name)
-            except re.error:
-                continue
+        # 复用 classify 的判定，避免「采集层过滤了、同步漏了」这类两套规则不一致
+        reasons = detect_sensitive(text)
 
-        sensitive = bool(reasons)
+        # 强信号（私钥/密钥/密码/证件号…）才走「敏感」通道；只命中邮箱、
+        # 手机号这类弱规则时仅记录原因，内容照常入库 —— 否则用户复制一份
+        # 带邮箱的会议纪要，记录会直接从历史里消失。
+        sensitive = is_blocking_sensitivity(reasons)
         verdict = PrivacyVerdict(allowed=True, sensitive=sensitive, reasons=reasons)
-        if sensitive and self._cfg("privacy.redact_on_copy_out", False):
+        if reasons and self._cfg("privacy.redact_on_copy_out", False):
             verdict.redacted_content = self.redact(text)
         return verdict
 

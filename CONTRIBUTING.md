@@ -124,6 +124,29 @@ get_meta / set_meta / optimize / stats / close
   与 `tests/test_cli.py::test_compact_actually_shrinks` —— 断言的是
   **测出来的占用变小**，不是「调用过 VACUUM」（后者两种写法都能过）。
 
+### 改完界面请重出截图
+
+文档里的图由脚本生成，不是手动截的：
+
+```bash
+QT_QPA_PLATFORM=offscreen python packaging/screenshots.py
+```
+
+它灌一组样例数据再渲染，结果稳定可复现，CI 里也能跑。
+改了布局、配色、文案却忘了重出，README 就会和实际界面对不上。
+
+### 打包产物必须能跑
+
+```bash
+python packaging/build.py            # 单文件
+python packaging/build.py --onedir   # 目录模式
+./dist/linglong-clipboard --version  # 一定要手动跑一次
+```
+
+有两类问题只在打包后才暴露，开发期用 `python -m` 跑永远碰不到：
+入口的相对导入失去包上下文、spec 里的路径算错。所以打包后
+**必须**执行一次 `--version`，CI 里也加了这个冒烟步骤。
+
 ### 新增转换器
 
 在 `core/automation.py` 里写一个纯函数，然后注册进 `_build_registry()`：
@@ -639,6 +662,8 @@ pytest tests/test_storage.py -k fts -v               # 单个模块
 要求：
 
 - **核心模块（`core/`）覆盖率维持在 85% 以上**，新增逻辑同步补用例
+- 修好的 Bug 到 `tests/test_release_regressions.py` 补一条，
+  注释里写清「当时是什么表现」—— 那个文件就是防止同一个坑踩第二次的
 - 界面测试走 Qt `offscreen` 平台，不要引入对真实显示器的依赖
 - 数据目录用 `tmp_path` / `LINGLONG_CLIPBOARD_HOME` 隔离，不要写到真实用户目录
 - 涉及平台的用例用 `pytest.importorskip`

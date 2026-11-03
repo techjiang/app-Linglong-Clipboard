@@ -265,7 +265,12 @@ class ItemCard(QFrame):
         因为卡片高度会因此浮动，列表滚动时行高不一会显得凌乱。
         """
         metrics = QFontMetrics(self._body.font())
-        available = max(120, self.width() - 30)
+        # 宽度为 0 说明还没布局，用父级（列表容器）的宽度估算：
+        # 否则按 120px 截断成「def hand…」，看起来像内容丢了。
+        width = self.width()
+        if width <= 1 and self.parentWidget() is not None:
+            width = self.parentWidget().width()
+        available = max(120, width - 30)
         self._body.setText(
             metrics.elidedText(self._preview_text(), Qt.TextElideMode.ElideRight, available)
         )

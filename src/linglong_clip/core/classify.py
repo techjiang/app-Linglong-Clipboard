@@ -56,6 +56,11 @@ _CODE_SIGNALS: List[Tuple[re.Pattern[str], int]] = [
     (re.compile(r"(?:^|\s)[A-Za-z_]\w*\s*=\s*[^=]"), 1),
 ]
 _CODE_THRESHOLD = 3
+
+#: JSON 兜底判定用：`{"a":1}` 这类短片段没有任何「行首关键字」特征，
+#: 靠语法特征打分永远判不出来，但它其实是最常被复制的「代码」之一
+#: （接口响应、配置、日志）。不做这层兜底，右键菜单里连「格式化 JSON」都不出现。
+_JSON_HINT_RE = re.compile(r"^\s*[\{\[]")
 #: 明显是编程语言源代码扩展名
 _CODE_EXT_RE = re.compile(
     r"\.(?:py|js|ts|tsx|jsx|java|kt|kts|go|rs|c|cc|cpp|cxx|h|hpp|cs|rb|php|swift|m|mm|sh|bash|zsh|fish|ps1|lua|pl|r|sql|vue|svelte|dart|scala|clj|ex|exs|erl|hs|ml|jl|nim|zig|v|groovy|gradle|tf|proto|graphql|gql)$",
@@ -69,7 +74,8 @@ SENSITIVE_PATTERNS: List[Tuple[str, re.Pattern[str]]] = [
     ("API Key", re.compile(r"\b(?:sk|pk|ghp|gho|ghs|glpat|xox[baprs])[-_][A-Za-z0-9_-]{16,}\b")),
     ("AWS 凭证", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
     ("JWT", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),
-    ("银行卡", re.compile(r"\b(?:\d[ -]?){15,19}\b")),
+    # 银行卡 16-19 位，允许 4 位一组的分隔。用 [0-9] 而非 \d：后者会吃掉全角数字。
+    ("银行卡", re.compile(r"\b[0-9](?:[0-9][ -]?){14,18}[0-9]\b")),
     ("身份证", re.compile(r"\b[1-9]\d{5}(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d{3}[\dXx]\b")),
     (
         "密码字段",
@@ -82,6 +88,21 @@ SENSITIVE_PATTERNS: List[Tuple[str, re.Pattern[str]]] = [
     ("邮箱", re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
     ("手机号", re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")),
 ]
+
+#: 这些规则命中只说明「内容里有个人敏感字段」，不足以把整条记录判死。
+#: 邮箱、手机号在正文里太常见，按敏感处理（默认不落盘）会让用户复制的
+#: 会议纪要、名片、报错日志凭空消失 —— 那比漏记更严重。
+WEAK_SENSITIVE_RULES = frozenset({"邮箱", "手机号"})
+
+#: 强规则需要上下文佐证：单独出现 16 位数字更可能是订单号、时间戳、
+#: 哈希前缀或 CSS 尺寸，因此银行卡号要同时出现金融关键词才认定。
+_CONTEXTUAL_RULES: Dict[str, re.Pattern[str]] = {
+    "银行卡": re.compile(
+        r"卡号|银行卡|信用卡|储蓄卡|借记卡|账户|账号|开户|银行|"
+        r"card\s*no|card\s*number|credit\s*card|debit\s*card|cvv|iban|account\s*no",
+        re.IGNORECASE,
+    ),
+}
 
 #: 这些应用被视作密码管理器，默认不记录其内容
 PASSWORD_MANAGER_HINTS = (
@@ -147,7 +168,7 @@ def detect_kind(
         if is_file_path(stripped):
             return FILE
 
-    if looks_like_code(stripped):
+    if looks_like_json(stripped) or looks_like_code(stripped):
         return CODE
 
     if has_html and _has_rich_markup(text):
@@ -202,6 +223,26 @@ def is_file_path(text: str) -> bool:
     return len(text.strip()) > 2
 
 
+def looks_like_json(text: str) -> bool:
+    """是否是一段结构化 JSON（对象或数组）。
+
+    只认对象/数组：`"abc"`、`42`、`true` 在 Python 里也是合法 JSON，
+    但它们只是普通值，当成代码会把大量正常文本误判。
+    """
+    import json
+
+    stripped = (text or "").strip()
+    if len(stripped) < 2 or len(stripped) > 200_000:
+        return False
+    if not _JSON_HINT_RE.match(stripped):
+        return False
+    try:
+        parsed = json.loads(stripped)
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(parsed, (dict, list))
+
+
 def looks_like_code(text: str) -> bool:
     if len(text) < 12:
         return False
@@ -231,18 +272,34 @@ def _has_rich_markup(html: str) -> bool:
 
 
 def detect_sensitive(text: str) -> List[str]:
-    """返回命中的敏感规则名，空列表表示未命中。"""
-    if not text or len(text) > 100_000:
-        # 超长内容不做全量扫描，避免卡顿；只扫前 100KB
-        text = text[:100_000]
+    """返回命中的敏感规则名，空列表表示未命中。
+
+    只扫前 100KB：剪贴板里的超大内容扫全文会拖慢采集线程，
+    而敏感字段几乎都出现在开头。
+    """
+    if not text:
+        return []
+    text = text[:100_000]
     hits: List[str] = []
     for name, pattern in SENSITIVE_PATTERNS:
         try:
-            if pattern.search(text):
-                hits.append(name)
+            if not pattern.search(text):
+                continue
         except re.error:
             continue
+        context = _CONTEXTUAL_RULES.get(name)
+        if context is not None and not context.search(text):
+            continue
+        hits.append(name)
     return hits
+
+
+def is_blocking_sensitivity(hits: List[str]) -> bool:
+    """命中的规则里是否包含「必须拦下」的强信号。
+
+    只有弱规则（邮箱、手机号）命中时，调用方应当标记而非拦截。
+    """
+    return any(hit not in WEAK_SENSITIVE_RULES for hit in hits)
 
 
 def is_password_manager(app_id: str) -> bool:
@@ -299,14 +356,17 @@ def analyze(
 ) -> Dict[str, object]:
     """一次性得出分类结论，供采集管线调用。
 
-    敏感内容强制归类为 `sensitive`，优先于其它类型 —— 这类内容默认不落盘。
+    强敏感内容（私钥、密钥、证件号…）归类为 `sensitive`，优先于其它类型；
+    弱信号（邮箱、手机号）只记录 `sensitive_reasons`，类型保持原样。
     """
     kind = detect_kind(
         text, has_html=has_html, has_image=has_image, has_files=has_files
     )
     sensitive_hits = detect_sensitive(text) if kind != IMAGE else []
     tags = extract_tags(text, kind=kind)
-    if sensitive_hits:
+    # 只有强信号才改写成「敏感」：否则一条「邮箱 + 正常正文」
+    # 会被显示成敏感项，分类与直觉不符。
+    if is_blocking_sensitivity(sensitive_hits):
         kind = SENSITIVE
     return {
         "kind": kind,

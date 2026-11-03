@@ -221,26 +221,33 @@ QFrame#Card[selected="true"] {{
     border: 1px solid {p.accent};
     border-left: 3px solid {p.accent};
 }}
+/* 卡片内标签必须透明：QLabel 默认会画一层 window 背景，
+   在带圆角与色条的卡片上就变成一条突兀的实心长条。 */
 QLabel#CardTitle {{
     color: {p.text};
     font-size: 13px;
+    background: transparent;
 }}
 QLabel#CardMeta {{
     color: {p.text_faint};
     font-size: 11px;
+    background: transparent;
 }}
 QLabel#CardKind {{
     color: {p.accent};
     font-size: 11px;
     font-weight: 600;
+    background: transparent;
 }}
 QLabel#CardPin {{
     color: {p.warning};
     font-size: 12px;
+    background: transparent;
 }}
 QLabel#EmptyHint {{
     color: {p.text_faint};
     font-size: 14px;
+    background: transparent;
 }}
 
 /* ---- 侧栏与分组 ---- */
@@ -252,15 +259,18 @@ QLabel#SectionTitle {{
     color: {p.text_faint};
     font-size: 11px;
     font-weight: 600;
+    background: transparent;
 }}
 QLabel#StatValue {{
     color: {p.text};
     font-size: 18px;
     font-weight: 600;
+    background: transparent;
 }}
 QLabel#StatLabel {{
     color: {p.text_faint};
     font-size: 11px;
+    background: transparent;
 }}
 QListWidget#SideList {{
     background-color: transparent;
@@ -363,6 +373,18 @@ QStatusBar {{
     border-top: 1px solid {p.border};
     color: {p.text_dim};
     font-size: 11px;
+    /* 状态栏高度由内容撑开，11px 字号若不给内边距，
+       文字的下半截会被状态栏边界切掉（截图里看得最清楚）。 */
+    min-height: 22px;
+}}
+QStatusBar::item {{
+    border: none;
+}}
+QStatusBar QLabel {{
+    background: transparent;
+    color: {p.text_dim};
+    font-size: 11px;
+    padding: 3px 6px;
 }}
 QCheckBox {{
     spacing: 7px;
@@ -459,5 +481,12 @@ QLineEdit#QuickSearch {{
 }}
 QLineEdit#QuickSearch:focus {{
     border: 1px solid {p.accent};
+}}
+/* 占位提示必须显式给色：浮层用的是独立局部样式表（toast_style），
+   不指定时占位文字会沿用主窗口的暗色，在深色面板上几乎看不见 ——
+   表现为「输入框里好像什么都没有」。 */
+QLineEdit {{
+    placeholder-text-color: {p.text_faint};
+    min-height: 20px;
 }}
 """
