@@ -294,6 +294,17 @@ class NativeSelfCheck:
             return CheckResult("主选择区读取", FAIL, f"能力探测失败：{exc!r}")
 
         if not caps.get("primary_selection", False):
+            # 主选择区是 X11 / Wayland 的概念。Windows 与 macOS 上它根本不存在，
+            # 报「降级」并附上「装 python-xlib」的提示会让人以为自己的系统少了功能，
+            # 然后去找一个在那两个平台上压根不存在的东西。跳过，并说明原因。
+            backend_name = getattr(backend, "name", "")
+            if backend_name in ("windows", "macos"):
+                return CheckResult(
+                    "主选择区读取",
+                    SKIP,
+                    f"{backend_name} 没有主选择区这个概念",
+                    "X11 / Wayland 的「选中即记录」专属功能，本平台不需要处理",
+                )
             return CheckResult(
                 "主选择区读取",
                 DEGRADED,

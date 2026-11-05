@@ -618,6 +618,29 @@ def test_primary_check_degraded_when_unsupported():
     result = _primary_result(_PrimaryBackend(caps=False))
     assert result.status == DEGRADED
     assert "wl-clipboard" in result.detail
+
+
+@pytest.mark.parametrize("backend_name", ["windows", "macos"])
+def test_primary_check_skipped_on_platforms_without_primary(backend_name):
+    """现象：Windows / macOS 上把「主选择区」报成**降级**，还提示装 python-xlib。
+
+    主选择区是 X11 / Wayland 的概念，这两个平台根本没有它。报降级会让用户
+    以为系统少了功能，然后去找一个在自己平台上压根不存在的东西
+    （这条是从真实 `.exe` 的 --selfcheck 输出里看到的）。
+    """
+    backend = _PrimaryBackend(caps=False)
+    backend.name = backend_name
+    result = _primary_result(backend)
+    assert result.status == SKIP
+    assert "python-xlib" not in result.detail
+    assert backend_name in result.detail
+
+
+def test_primary_check_still_guides_linux_users():
+    """Linux 上没有通道时，该给的装法还是要给 —— 别把上面那刀切过头。"""
+    result = _primary_result(_PrimaryBackend(caps=False))
+    assert result.status == DEGRADED
+    assert "python-xlib" in result.detail
     # 必须说清「这只是一个可选功能」，否则用户会以为采集坏了
     assert "不受影响" in result.hint
 

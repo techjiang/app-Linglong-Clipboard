@@ -746,6 +746,10 @@ def _primary_status(config) -> dict:
 
     if supported:
         detail = f"可用 · 后端 {backend_name}"
+    elif backend_name in ("windows", "macos"):
+        # 这两个平台没有主选择区这个概念。原来这里也报「X11 需 python-xlib」，
+        # 在 Windows 上看到那句只会让人去找一个不存在的依赖。
+        detail = f"本平台无此概念（{backend_name}）"
     else:
         detail = "本机无可用通道（X11 需 python-xlib 或 xclip/xsel；Wayland 需 wl-clipboard）"
 

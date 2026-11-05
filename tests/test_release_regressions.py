@@ -117,13 +117,35 @@ def test_exclude_kind_filters_results(storage):
     assert results
 
 
+def _last_week_midday() -> float:
+    """上周三中午 —— 无论今天星期几，这个时刻都落在「上周」区间内。
+
+    注意 `_day_start(n)` 的参数是「往前推 n 天」，不是星期序号。
+    """
+    return parse_intent("上周").since + 2 * 86400
+
+
+def _midday_days_ago(days: int) -> float:
+    """`days` 天前的**正午**。
+
+    不用 `now - 86400 * days`：那个偏移量对应的日期取决于现在几点。
+    `now - 86400 * 1.2` 在下午算「昨天」，在凌晨 00:05 就是「前天」——
+    这条用例因此在每天 0:00~4:48 之间必红。
+    取正午则无论何时跑都稳稳落在目标那一整天里。
+    """
+    import datetime as _dt
+
+    target = _dt.datetime.fromtimestamp(time.time()) - _dt.timedelta(days=days)
+    return target.replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
+
+
 def test_until_bound_excludes_later_items(storage):
     """现象：搜「昨天」把今天的记录也一起带出来了。
 
     `intent.until` 被解析出来却没用上，上界形同虚设。
     """
     now = time.time()
-    old = storage.add(_item("昨天的记录", created_at=now - 86400 * 1.2))
+    old = storage.add(_item("昨天的记录", created_at=_midday_days_ago(1)))
     fresh = storage.add(_item("今天的记录", created_at=now))
 
     ids = [item.id for item in SemanticEngine(storage).search("昨天", limit=20)]
@@ -163,11 +185,12 @@ def test_explicit_kind_and_query_kind_must_both_hold(storage):
     用户明确筛了类型，结果里却全是另一个类型。
     两个条件互相矛盾时无交集，正确答案是空，不是「随便挑一个」。
     """
-    now = time.time()
-    storage.add(
-        _item("https://cnb.cool/x", kind="link", created_at=now - 8 * 86400)
-    )
-    storage.add(_item("shot.png", kind="image", created_at=now - 8 * 86400))
+    # 钉进确定的上周时刻，别用「8 天前」：那个偏移对应哪一天取决于今天星期几，
+    # 周一时 8 天前是上周日（能过），周四时是上周三（也能过），
+    # 但这条用例要验的是「类型冲突」，不该顺带验日期。
+    stamp = _last_week_midday()
+    storage.add(_item("https://cnb.cool/x", kind="link", created_at=stamp))
+    storage.add(_item("shot.png", kind="image", created_at=stamp))
 
     engine = SemanticEngine(storage)
     assert engine.search("上周的截图") != []
