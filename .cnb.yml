@@ -71,7 +71,18 @@ $:
           image: cnbcool/default-npc:latest
           script: |
             set -e
-            TAG="${CNB_BRANCH}"
+            # 版本号 = 这次发布对应的 tag。
+            # tag_push 下 CNB_BRANCH 就是 tag 名；api_trigger 下它是分支名（main），
+            # 只能从事件 URL 尾部（.../releases/tag/v1.0.1）或手动指定的变量里取。
+            TAG="${RELEASE_TAG:-}"
+            if [ -z "$TAG" ]; then
+              case "$CNB_BRANCH" in
+                v[0-9]*) TAG="$CNB_BRANCH" ;;
+                *) TAG="${CNB_EVENT_URL##*/}" ;;
+              esac
+            fi
+            [ -n "$TAG" ] || { echo "推不出要发布的版本号" >&2; exit 1; }
+            echo "版本号：$TAG"
             REPO="${CNB_REPO_SLUG}"
 
             # 两个平台的包缺一不可：只发一半等于把另一半用户挡在门外。
