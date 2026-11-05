@@ -39,7 +39,7 @@ $:
             pip install --quiet pytest
             export QT_QPA_PLATFORM=offscreen
             # --require-native：原生依赖缺失时直接失败，不产出功能残缺的包
-            python packaging/build.py --require-native
+            python3 packaging/build.py --require-native
             # 产物必须能启动，否则打出来的只是一个几十 MB 的砖
             ./dist/linglong-clipboard --version
             ./dist/linglong-clipboard --stats
