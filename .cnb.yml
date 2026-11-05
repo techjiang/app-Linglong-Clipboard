@@ -23,8 +23,12 @@ main:
 
 # tag_push 是仓库级事件，与分支无关，必须写在 `$` 兜底分支下。
 # 之前挂在 `main:` 下面，打标签时流水线根本不触发，v1.0.0 只能手工补附件。
+#
+# api_trigger 让发布可以重跑：Release 建晚了、或者某一步偶发失败，
+# 不必删了标签重打（已挂 Release 的标签远端根本不让删）。
+# 用锚点复用同一份 stages，两个事件不会各写一遍然后悄悄走偏。
 $:
-  tag_push:
+  tag_push: &release-pipeline
     - stages:
         - name: 打包 Linux 可执行文件
           image: cnbcool/default-npc:latest
@@ -99,3 +103,6 @@ $:
               python3 tools/release_asset.py upload upload.out "$pkg" "$REPO" "$RID"
             done
             echo "已发布：Release $TAG（Linux + Windows）"
+
+  # 手动重跑发布：cnb build start-build --tag <tag> --event api_trigger
+  api_trigger: *release-pipeline
