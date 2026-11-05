@@ -717,7 +717,7 @@ def test_language_choice_describe_ok_case():
     assert choice.describe() == "按 eng 识别"
 
 
-def test_engine_handles_backend_languages_probe_exception():
+def test_engine_handles_backend_languages_probe_exception(tmp_path):
     """后端查已装语言时抛异常，不该把识别整个带崩，按「没有语言」处理。"""
 
     class Fragile(RecordingBackend):
@@ -725,7 +725,10 @@ def test_engine_handles_backend_languages_probe_exception():
             raise RuntimeError("--list-langs 炸了")
 
     engine = OcrEngine(backend=Fragile(langs=("eng",)), locale_hint="en_US")
-    result = engine.recognize_full(_image(Path("/tmp")))
+    # 用 tmp_path 而不是写死 `/tmp`：Windows 上没有这个目录，
+    # `recognize_full` 会在「文件不存在」那一步就返回，走不到语言探测，
+    # 于是这条用例在 Windows 上永远验不到它声称要验的东西。
+    result = engine.recognize_full(_image(tmp_path))
     assert result.error == "no_language_data"
     assert result.failed is True
 

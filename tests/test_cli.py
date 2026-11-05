@@ -1,6 +1,7 @@
 """命令行入口：查询、维护、JSON 输出。"""
 
 import json
+import os
 
 import pytest
 
@@ -510,7 +511,9 @@ def test_storage_status_json_backend(home, capsys):
     assert main(["--storage-status", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["backend"] == "json"
-    assert payload["path"].endswith(".clipboard/clipboard.json")
+    # 用 os.path.join 拼，别写死 "/"：Windows 上路径是 `.clipboard\\clipboard.json`，
+    # 写死斜杠的断言只在类 Unix 上成立。
+    assert payload["path"].endswith(os.path.join(".clipboard", "clipboard.json"))
 
 
 def test_storage_switch_is_idempotent(home, capsys):

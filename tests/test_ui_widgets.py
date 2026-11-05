@@ -503,7 +503,8 @@ def test_settings_about_shows_history_location(qt_app, home):
     config = Config(home / "config.json")
     config.set("storage.backend", "json")
     dialog = SettingsDialog(config)
-    assert dialog._storage_location.endswith(".clipboard/clipboard.json")
+    # Windows 上分隔符是 `\\`，断言要用 os.path.join 拼
+    assert dialog._storage_location.endswith(os.path.join(".clipboard", "clipboard.json"))
 
 
 def test_settings_saves_json_inline_options(qt_app, home):

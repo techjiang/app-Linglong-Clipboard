@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -454,7 +455,11 @@ def test_adapter_file_urls(adapter, qt_app, home):
 
     item = adapter.read_clipboard()
     assert item.kind == "file"
-    assert item.files == [str(target)]
+    # 比的是「同一个文件」，不是「同一个字符串」：
+    # `QUrl.toLocalFile()` 在 Windows 上返回正斜杠（`C:/Users/.../a.txt`），
+    # 而 `str(Path)` 是反斜杠。直接比字符串只在类 Unix 上成立，
+    # 换成路径比较才验的是真正关心的那件事。
+    assert [Path(f).resolve() for f in item.files] == [target.resolve()]
 
 
 def test_adapter_overlong_text_is_skipped(adapter, qt_app):
