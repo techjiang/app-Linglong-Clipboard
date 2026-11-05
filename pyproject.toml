@@ -33,12 +33,22 @@ dependencies = ["PySide6>=6.5"]
 encrypt = ["cryptography>=41"]
 # 把 JSON 转成 YAML 时用更可靠的实现，缺失时走内置的极简序列化
 yaml = ["pyyaml>=6"]
+# Linux/X11 全局快捷键与来源应用识别
+x11 = ["python-xlib>=0.33"]
 # macOS 全局快捷键需要 pyobjc
 macos-hotkeys = ["pyobjc-framework-Quartz>=9"]
 dev = [
     "pytest>=7",
     "pytest-cov>=4",
     "pyinstaller>=6",
+]
+# 打发行包时用：把各平台的原生依赖一并装上，产物才不缺功能
+packaging = [
+    "pyinstaller>=6",
+    "python-xlib>=0.33; sys_platform == 'linux'",
+    "pyobjc-framework-Quartz>=9; sys_platform == 'darwin'",
+    "cryptography>=41",
+    "pyyaml>=6",
 ]
 
 [project.scripts]

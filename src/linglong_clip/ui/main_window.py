@@ -662,9 +662,23 @@ class MainWindow(QWidget):
         self.reload()
 
     def _on_chip(self, kind: Optional[str]) -> None:
+        # 顶部类型按钮只管类型；「固定 / 收藏」是另一个维度，两者应当叠加。
+        # 此前这里写死 `_filter = "all"`，于是「收藏」里点一下「链接」，
+        # 收藏这个条件被悄悄清掉，列表变回全部记录。
         self._kind_filter = kind
-        self._filter = "all"
-        self._side_list.setCurrentRow(0 if kind is None else self._row_for_kind(kind))
+        row = 0 if kind is None else self._row_for_kind(kind)
+        if self._filter in ("pinned", "favorite"):
+            # 侧栏没有「固定 + 链接」这种行；高亮到对应类型行上，
+            # 让高亮不撒谎，同时保留 pinned/favorite 条件（下面的 reload 走它）。
+            item = self._side_list.item(row)
+            self._side_list.blockSignals(True)
+            self._side_list.setCurrentRow(row)
+            self._side_list.blockSignals(False)
+            if item is not None:
+                item.setSelected(True)
+        else:
+            self._filter = "all"
+            self._side_list.setCurrentRow(row)
         self._sync_chips()
         self.reload()
 
@@ -678,7 +692,11 @@ class MainWindow(QWidget):
         mapping = {"全部": None, "文本": "text", "链接": "link", "图片": "image"}
         for label, chip in self._chips.items():
             expected = mapping[label]
-            chip.setChecked(expected == self._kind_filter)
+            # 「全部」在侧栏被选中时看着也是「无色筛选」，两者等价，一起点亮
+            chip.setChecked(
+                expected == self._kind_filter
+                or (expected is None and self._filter != "all" and self._kind_filter is None)
+            )
 
     def _on_escape(self) -> None:
         if self._search.text():

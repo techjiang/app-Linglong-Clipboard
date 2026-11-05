@@ -2,7 +2,7 @@
 
 > 跨平台智能剪切板 —— 本地优先、语义检索、可编程转换
 
-[![构建与测试](https://github.com/techjiang/Linglong-Clipboard/actions/workflows/build.yml/badge.svg)](https://github.com/techjiang/Linglong-Clipboard/actions/workflows/build.yml)
+[![构建与测试](https://github.com/techjiang/app-Linglong-Clipboard/actions/workflows/build.yml/badge.svg)](https://github.com/techjiang/app-Linglong-Clipboard/actions/workflows/build.yml)
 [![许可](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](pyproject.toml)
 
@@ -1296,6 +1296,14 @@ pip install -r requirements.txt
 python linglong_clipboard.py
 ```
 
+Linux 上要全局快捷键与来源识别，需要 `python-xlib`（不装则退回命令行工具兜底）；
+macOS 上要全局快捷键，需要 `pyobjc-framework-Quartz`：
+
+```bash
+pip install -e ".[x11]"           # Linux
+pip install -e ".[macos-hotkeys]" # macOS
+```
+
 ### 安装为命令
 
 ```bash
@@ -1313,8 +1321,18 @@ linglong-clipboard          # 或简写 llclip
 | macOS | `linglong-clipboard-macos.zip` | 解压得到 `玲珑剪切板.app` |
 | Linux | `linglong-clipboard-linux.tar.gz` | `tar xzf` 后得到 `linglong-clipboard`，`chmod +x` 再运行 |
 
+发行包已内置各平台的原生依赖（Linux 的 `python-xlib`、macOS 的 `pyobjc`），
+所以「全局快捷键」和「来源应用识别」在包里是可用的，不需要用户另外装东西。
+
+两个**不进包**的外部依赖，需要的话自行安装：
+
+| 依赖 | 影响 | 装法 |
+| --- | --- | --- |
+| `tesseract` | 截图 OCR（不装则搜不到图里的文字，其余功能不受影响） | `apt install tesseract-ocr tesseract-ocr-chi-sim` / `brew install tesseract` |
+| `xdotool` | Linux 上「双击记录直接粘贴到上个窗口」 | `apt install xdotool` |
+
 > 主站：[cnb.cool/asoe/TechSauce/app-Linglong-Clipboard](https://cnb.cool/asoe/TechSauce/app-Linglong-Clipboard)
-> 镜像：[github.com/techjiang/Linglong-Clipboard](https://github.com/techjiang/Linglong-Clipboard)
+> 镜像：[github.com/techjiang/app-Linglong-Clipboard](https://github.com/techjiang/app-Linglong-Clipboard)
 > 两个仓库的 Releases 内容一致。
 
 ### Linux 桌面集成
@@ -1989,7 +2007,7 @@ tools/
 | 技术文档 | https://docs.asoe.cn |
 | 论坛 | https://forums.asoe.cn |
 | 代码仓库 | https://cnb.cool/asoe/TechSauce/app-Linglong-Clipboard |
-| GitHub 镜像 | https://github.com/techjiang/Linglong-Clipboard |
+| GitHub 镜像 | https://github.com/techjiang/app-Linglong-Clipboard |
 | 哔哩哔哩 | https://space.bilibili.com/1768832152 |
 | 邮箱 | official@tech.asoe.cn |
 

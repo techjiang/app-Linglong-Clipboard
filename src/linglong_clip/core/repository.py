@@ -515,7 +515,9 @@ class JsonRepository:
                     continue
                 if source_app and item.source_app != source_app:
                     continue
-                if since and item.created_at < since:
+                # 与 `Storage.list` 同语义：按 max(created_at, used_at) 判，
+                # 「三周前创建、刚刚复制回来」也算最近碰过。
+                if since and max(item.created_at, item.used_at) < since:
                     continue
                 selected.append(copy.deepcopy(item))
         selected.sort(key=_sort_key, reverse=True)

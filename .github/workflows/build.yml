@@ -42,6 +42,15 @@ jobs:
           # 无头环境跑 Qt 需要 offscreen 平台插件
           echo "QT_QPA_PLATFORM=offscreen" >> "$GITHUB_ENV"
 
+      # 测试本身不依赖 OCR：涉及 tesseract 的用例一律走桩后端，
+      # 只有少数几条探测「本机装没装」的路径需要真实存在。
+      # 装上它是为了让那几条走真分支，而不是被跳过 —— Windows / macOS
+      # 上没有这么省事的包管理器，那两条用例在那里会走「未安装」分支，
+      # 这本身也是必须被覆盖的真实场景，所以不必强求三平台都装。
+      - name: 安装 tesseract（可选，覆盖真机分支）
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y tesseract-ocr tesseract-ocr-chi-sim || true
+
       - name: 运行测试
         run: pytest tests/ --cov=linglong_clip --cov-report=xml --cov-report=term
 
@@ -80,10 +89,13 @@ jobs:
           cache: pip
 
       - name: 安装依赖
+        # `packaging` extra 里带了各平台的原生依赖（Linux 的 python-xlib、
+        # macOS 的 pyobjc），缺了它们打出来的包会少一整块功能，
+        # 而使用者只会看到「全局快捷键不可用」，不知道是包的问题。
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-dev.txt
-          pip install cryptography pyyaml
+          pip install -e ".[packaging]"
+          pip install pytest
 
       - name: 安装 Linux 图形库与打包依赖
         if: runner.os == 'Linux'
@@ -98,15 +110,26 @@ jobs:
           echo "QT_QPA_PLATFORM=offscreen" >> "$GITHUB_ENV"
 
       - name: 打包
-        run: python packaging/build.py
+        # --require-native：原生依赖缺失时直接失败。
+        # 否则 PyInstaller 照样退出 0，产出一个「能启动但少功能」的包。
+        run: python packaging/build.py --require-native
 
       - name: 冒烟测试（产物必须能启动）
-        if: runner.os == 'Linux'
-        run: |
-          ./dist/linglong-clipboard --version
-          ./dist/linglong-clipboard --list
-          ./dist/linglong-clipboard --stats
+        # 三平台都跑：打包成功不等于能运行。入口写错、Qt 插件缺失这类问题
+        # 只在真正执行时才暴露，而 CI 绿着，直到用户双击才发现。
         shell: bash
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          case "${{ runner.os }}" in
+            Windows) BIN="dist/玲珑剪切板.exe" ;;
+            macOS)   BIN="dist/玲珑剪切板.app/Contents/MacOS/玲珑剪切板" ;;
+            *)       BIN="dist/linglong-clipboard" ;;
+          esac
+          echo "产物：$BIN"
+          ls -la "$BIN" || dir dist
+          "$BIN" --version
+          "$BIN" --stats
 
       - name: 上传产物
         uses: actions/upload-artifact@v4

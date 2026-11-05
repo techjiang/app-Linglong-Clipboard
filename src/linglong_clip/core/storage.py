@@ -476,7 +476,11 @@ class Storage:
             clauses.append("source_app = ?")
             params.append(source_app)
         if since:
-            clauses.append("created_at >= ?")
+            # 「最近碰过的记录」要按 max(created_at, used_at) 判，不能只看创建时间：
+            # 一条三周前创建、刚刚被复制回来的记录，用户眼里就是「最近用过的」。
+            # 此前这里只筛 created_at，于是 SQL 层就把它丢了 —— 上层 `_filter`
+            # 用 max() 判得再对也没用，候选集里根本没有它。
+            clauses.append("MAX(created_at, used_at) >= ?")
             params.append(since)
 
         if not self._usable():

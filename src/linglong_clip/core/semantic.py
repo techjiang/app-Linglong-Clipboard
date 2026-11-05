@@ -205,7 +205,7 @@ _TIME_RANGES: Dict[str, tuple] = {
     "this month": ("month", None),
     "上个月": ("last_month", "month"),
     "last month": ("last_month", "month"),
-    "最近": ("recent", None),
+    "最近": ("recent", "now"),
     "recent": ("recent", None),
     "recently": ("recent", None),
 }
@@ -322,9 +322,21 @@ def _resolve_range(token: str) -> tuple:
     if token == "yesterday":
         return _day_start(1), _day_start(0)
     if token == "week":
+        # 本周 = [本周一 00:00, 本周末 24:00)。必须设上界：`_TIME_RANGES` 里
+        # 「本周」的第二个槽位就是 `"week"`，它同时充当「上周」的上界 ——
+        # 早先这里返回 `0.0` 表示「不限」，于是「上周」的上界直接消失，
+        # 本周记录一并被搜出来。
         weekday = time.localtime().tm_wday
-        return _day_start(weekday), 0.0
+        return _day_start(weekday), _day_start(weekday - 6)
+    if token == "now":
+        return 0.0, now
     if token == "last_week":
+        # 「上周」是一整周：`[上周一 00:00, 本周一 00:00)`。
+        # 此前上界直接取了本周一 00:00 那个**时刻**，而过滤判的是
+        # `created_at > until`，于是周一 00:00 之后的记录自己也被排除 ——
+        # 同一个库、同一条查询，周一跑是空、周二跑是对的，
+        # `tests/test_semantic.py` 那条 `上周的截图` 也因此只在周一周二通过。
+        # 用「下周起点」当上界，配 `<=` 就是标准半开区间，不再依赖今天是星期几。
         weekday = time.localtime().tm_wday
         return _day_start(weekday + 7), _day_start(weekday)
     if token == "month":
@@ -339,7 +351,10 @@ def _resolve_range(token: str) -> tuple:
         end = time.mktime((local.tm_year, local.tm_mon, 1, 0, 0, 0, 0, 0, -1))
         return start, end
     if token == "recent":
-        return now - 3 * 86400, 0.0
+        # 「最近」自然以**此刻**为终点：`created_at` 在未来的记录不是「最近的」。
+        # 这类时间戳并非凭空捏造 —— 跨设备同步、系统时钟回拨、
+        # 手工改过 `clipboard.json` 都会产生。
+        return now - 3 * 86400, now
     return 0.0, 0.0
 
 
@@ -645,7 +660,15 @@ class SemanticEngine:
         """
         query = (query or "").strip()
         intent = parse_intent(query) if query and use_intent else QueryIntent(keywords=query)
-        effective_kind = kind or (intent.kinds[0] if len(intent.kinds) == 1 else None)
+        # 显式 `kind`（侧栏/顶部类型按钮）与查询里解析出的类型必须**同时**成立。
+        # 此前是 `kind or intent.kinds[0]`：侧栏选了「链接」再搜「上周的截图」，
+        # 解析出的 `image` 被丢弃，于是按「链接 + 上周」返回一批无关记录 ——
+        # 用户看到的是「筛了类型却还出现别的东西」。两者矛盾时无交集，就该是空结果。
+        effective_kind = kind
+        if effective_kind and intent.kinds and effective_kind not in intent.kinds:
+            effective_kind = "\x00"  # 不可能等于任何记录的 kind
+        elif not effective_kind and len(intent.kinds) == 1:
+            effective_kind = intent.kinds[0]
         effective_since = since or intent.since
         # 意图里解析出的上界必须并进来：早先只把 `intent.until` 算出来却没用，
         # 结果搜「昨天」会把今天的记录一起带出来。
@@ -832,9 +855,18 @@ class SemanticEngine:
                 continue
             if intent.exclude_kinds and item.kind in intent.exclude_kinds:
                 continue
-            if effective_since and max(item.created_at, item.used_at) < effective_since:
+            # 上下界必须用同一个「这条记录属于哪个时间」的口径：
+            # 下界取 `max(created, used)`（用过一次就算「最近碰过」），
+            # 上界若只看 `created_at`，一条旧记录被重新复制后会落在
+            # 「since 之前、until 之后」的夹缝里 —— 两边都不收。
+            #
+            # 边界取半开区间 `[since, until)`：
+            # `until` 表示「这个时刻起就不算了」，所以 `<= until` 错在把
+            # **刚刚**用过的那条（`used_at = now`）排除在外 —— 而这正是「最近」最常见的命中级。
+            moment = max(item.created_at, item.used_at)
+            if effective_since and moment < effective_since:
                 continue
-            if until and item.created_at > until:
+            if until and moment >= until:
                 continue
             if effective_source and not source_matches(item, effective_source):
                 continue

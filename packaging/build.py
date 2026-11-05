@@ -39,7 +39,35 @@ def platform_label() -> str:
     return "Linux"
 
 
-def check_dependencies() -> bool:
+#: 各平台上「装了更好、没装则相应能力降级」的可选依赖。
+#: 缺了这些 PyInstaller 照样能打包成功，但打出来的包里会**少一整块功能**，
+#: 而使用者在界面上只会看到「不可用」，不知道是包的问题还是自己环境的问题。
+OPTIONAL_DEPS: dict[str, tuple[str, str]] = {
+    "linux": (
+        "Xlib",
+        "python-xlib",
+        "X11 上的全局快捷键与来源应用识别会不可用（--stats 里「主选择区」也会显示未启用）",
+    ),
+    "darwin": (
+        "Quartz",
+        "pyobjc-framework-Quartz",
+        "macOS 上的全局快捷键会不可用",
+    ),
+}
+
+#: 缺了这些但**必须**在打包时报告出来的可选依赖
+#: （`cryptography` / `pyyaml` 走的是运行时优雅降级，界面上会明确说明，不必拦）
+
+
+def _platform_key() -> str:
+    if sys.platform.startswith("win"):
+        return "win32"
+    if sys.platform == "darwin":
+        return "darwin"
+    return "linux"
+
+
+def check_dependencies(strict: bool = False) -> bool:
     try:
         import PyInstaller  # noqa: F401
     except ImportError:
@@ -50,6 +78,22 @@ def check_dependencies() -> bool:
     except ImportError:
         print("缺少 PySide6。请先安装：pip install -r requirements.txt")
         return False
+
+    key = _platform_key()
+    if key in OPTIONAL_DEPS:
+        module, package, consequence = OPTIONAL_DEPS[key]
+        try:
+            __import__(module)
+        except ImportError:
+            message = (
+                f"缺少可选依赖 {package}（import {module}）。\n"
+                f"  打出来的包会少一块功能：{consequence}\n"
+                f"  补装：pip install {package}"
+            )
+            if strict:
+                print(f"错误：{message}", file=sys.stderr)
+                return False
+            print(f"警告：{message}")
     return True
 
 
@@ -150,12 +194,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="玲珑剪切板打包脚本")
     parser.add_argument("--onedir", action="store_true", help="目录模式（启动更快）")
     parser.add_argument("--clean", action="store_true", help="打包前清理中间产物")
+    parser.add_argument(
+        "--require-native",
+        action="store_true",
+        help="原生依赖缺失时直接失败（发布流水线用，避免产出功能缺失的包）",
+    )
     args = parser.parse_args()
 
     print(f"平台：{platform_label()} ({platform.machine()})")
     print(f"Python：{platform.python_version()}")
 
-    if not check_dependencies():
+    if not check_dependencies(strict=args.require_native):
         return 1
 
     if args.clean:

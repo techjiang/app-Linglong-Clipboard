@@ -140,10 +140,35 @@ def test_intent_has_filters_flag():
 
 
 def test_search_by_natural_language_kind(engine, storage):
-    """「上周的截图」按类型 + 时间收窄（有「的」这个结构信号）。"""
+    """「上周的截图」按类型 + 时间收窄（有「的」这个结构信号）。
+
+    这条用例必须自己摆一个「确定落在上周」的时刻，不能靠 `_seed` 里的
+    「两天前」—— 那样命中与否取决于今天星期几：周一跑空、周二跑对，
+    只在周一周二通过。用 `_last_week_midday()` 把样本钉进上周区间，
+    用例才与运行日期无关。
+    """
     _seed(storage)
+    previous = ClipboardItem(
+        kind="image", content="last-week.png", preview="[图片]", hash="img",
+        created_at=_last_week_midday(), source_app="flameshot",
+    )
+    storage.add(previous)
+
     results = engine.search("上周的截图")
-    assert [item.hash for item in results] == ["img"]
+    hashes = [item.hash for item in results]
+    # `_seed` 里那张「两天前」的图是否算上周，取决于今天星期几；
+    # 这里只断言「确定在上周的那张被搜到」，别把日期规律写死进断言。
+    assert "img" in hashes
+    assert all(item.kind == "image" for item in results)
+
+
+def _last_week_midday() -> float:
+    """上周三中午 —— 无论今天星期几，这个时刻都落在一个完整的上周区间内。
+
+    注意 `_day_start(n)` 的参数是「往前推 n 天」，不是星期序号。
+    """
+    intent = parse_intent("上周")
+    return intent.since + (2 * 86400)
 
 
 def test_search_by_source(engine, storage):

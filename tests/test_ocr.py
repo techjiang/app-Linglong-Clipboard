@@ -163,10 +163,35 @@ def test_build_engine_disabled_by_config(config):
 
 
 def test_build_engine_uses_locale(config):
+    """没指定语言时按界面语言挑 `chi_tra`。
+
+    断言的是「想要什么」，不是「最终用了什么」：
+    后者要先过滤成**已装**的语言，而这取决于跑测试的机器装没装
+    `tesseract-ocr-chi-tra` —— CI 上多数没装，于是 `languages()` 返回空串
+    （`tesseract` 一行都没有时可用的语言就是「无」）。
+    两件事混在一个断言里，结果就是这条用例只在装了繁体语言包的机器上绿。
+    """
     config.set("ocr.languages", "", persist=False)
     config.set("ui.language", "zh_TW", persist=False)
     engine = build_engine(config)
-    assert engine.languages() == "chi_tra"
+    assert engine.language_choice().wants == "chi_tra"
+
+
+def test_build_engine_filters_to_installed_languages(config):
+    """已装语言里没有繁体时，不能硬把一个装不上的语言串丢给 tesseract。
+
+    与上一条是同一处的两面：`wants` 是用户意图，`languages` 是实际可用。
+    """
+    config.set("ocr.languages", "", persist=False)
+    config.set("ui.language", "zh_TW", persist=False)
+    engine = build_engine(config)
+    usable = engine.languages()
+    if engine.enabled and engine.backend.languages():
+        installed = set(engine.backend.languages())
+        assert all(code in installed for code in usable.split("+"))
+    else:
+        # 没装 tesseract：一个都用不了，返回空串而不是「假装能用」
+        assert usable == ""
 
 
 def test_build_engine_without_config_is_disabled():

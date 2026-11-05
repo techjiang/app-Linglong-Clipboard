@@ -148,3 +148,128 @@ def test_order_uses_max_of_used_and_created(storage):
 
     order = [item.id for item in storage.list(limit=10)]
     assert order.index(fresh.id) < order.index(stale.id)
+
+
+# ---- 检索：类型条件与时间区间 ----
+#
+# 这三条都是「只在某一类输入下现形」的缺陷：单看代码每一步都对，
+# 只有把「调用方传了什么」和「解析出了什么」并排放才看得出来。
+
+
+def test_explicit_kind_and_query_kind_must_both_hold(storage):
+    """现象：侧栏选「链接」，再搜「上周的截图」，返回的却是一批链接。
+
+    `kind or intent.kinds[0]` 把解析出的 `image` 直接丢弃了 ——
+    用户明确筛了类型，结果里却全是另一个类型。
+    两个条件互相矛盾时无交集，正确答案是空，不是「随便挑一个」。
+    """
+    now = time.time()
+    storage.add(
+        _item("https://cnb.cool/x", kind="link", created_at=now - 8 * 86400)
+    )
+    storage.add(_item("shot.png", kind="image", created_at=now - 8 * 86400))
+
+    engine = SemanticEngine(storage)
+    assert engine.search("上周的截图") != []
+    # 显式指定 kind=link 与查询里的 image 矛盾 → 空
+    assert engine.search("上周的截图", kind="link") == []
+    # 两者一致时照常返回
+    assert engine.search("上周的截图", kind="image") != []
+
+
+def test_last_week_upper_bound_is_today_not_monday(storage):
+    """现象：「上周」的命中范围随「今天星期几」漂移。
+
+    `last_week` 的上界取本周一 00:00，而过滤判的是 `created_at > until`，
+    于是**周一那天自己也被排除**：同一个库、同一条查询，周一跑是空，
+    周二跑是对的。测试也因此只在周一周二通过。
+    """
+    since = parse_intent("上周").since
+    # 区间必须真的覆盖上周末，且不吞掉今天
+    assert since > 0
+    inside = storage.add(_item("上周末的记录", created_at=since + 1))
+    outside = storage.add(_item("未来一周的记录", created_at=time.time() + 8 * 86400))
+
+    ids = [item.id for item in SemanticEngine(storage).search("上周", limit=20)]
+    assert inside.id in ids
+    assert outside.id not in ids
+
+
+def test_time_window_uses_one_clock_for_both_bounds(storage):
+    """现象：一条旧记录被重新复制后，落在「since 之前、until 之后」的夹缝里。
+
+    下界判 `max(created_at, used_at)`，上界只判 `created_at`，
+    两个口径不一致时，中间的记录两边都不收 —— 用户看到的是「明明有却搜不到」。
+    """
+    now = time.time()
+    # 创建很早、但刚刚用过一次 → 应算「最近碰过」，落在下界之内
+    reused = storage.add(
+        _item("很久以前写的但刚复制过", created_at=now - 30 * 86400, used_at=now - 60)
+    )
+    ids = [item.id for item in SemanticEngine(storage).search("最近", limit=20)]
+    assert reused.id in ids
+
+    # 反方向：创建在很久以后（时钟漂移 / 导入的未来时间戳），不该被「最近」收进来
+    future = storage.add(_item("未来时间戳", created_at=now + 10 * 86400))
+    ids = [item.id for item in SemanticEngine(storage).search("最近", limit=20)]
+    assert future.id not in ids
+
+
+def test_last_week_window_is_stable_across_weekdays(storage):
+    """现象：`上周的截图` 能不能搜到，取决于今天是星期几。
+
+    上界取的是「本周一 00:00」这个**时刻**，而过滤判 `created_at > until`，
+    周一 00:00 之后的事件全部落在区间外 —— 于是周一到周三的表现各不相同。
+    判据必须只看「上周那一整周」，与今天星期几无关。
+
+    这里用同一份数据、按不同 `tm_wday` 反复验，把日期依赖钉死。
+    """
+    import datetime as _dt
+
+    from linglong_clip.core import semantic as sem
+
+    real_localtime = time.localtime
+
+    def _range_for(weekday: int):
+        """伪造「今天是周 `weekday`」，取 `上周` 的区间。"""
+
+        def fake(sec=None):
+            value = real_localtime(sec)
+            return time.struct_time(
+                (value.tm_year, value.tm_mon, value.tm_mday,
+                 value.tm_hour, value.tm_min, value.tm_sec,
+                 weekday, value.tm_yday, value.tm_isdst)
+            )
+
+        original = sem.time.localtime
+        sem.time.localtime = fake
+        try:
+            return sem._resolve_range("last_week")
+        finally:
+            sem.time.localtime = original
+
+    for weekday in range(7):
+        since, until = _range_for(weekday)
+        assert since > 0 and until > since, f"周{weekday + 1} 区间退化"
+        span_days = round((until - since) / 86400)
+        assert span_days == 7, f"周{weekday + 1} 的上周不是 7 天：{span_days}"
+
+        # 上周三中午永远落在这个区间内
+        middle = _dt.datetime.fromtimestamp(since).replace(hour=12) + _dt.timedelta(days=2)
+        stamp = middle.timestamp()
+        assert since <= stamp < until, f"周{weekday + 1} 把上周三漏掉了"
+
+
+def test_week_window_has_an_upper_bound(storage):
+    """现象：搜「本周」会把下周的记录也带出来。
+
+    `_TIME_RANGES` 里「本周」的第二个槽位就是 `"week"`，它同时充当
+    「上周」的上界。早先这里返回 `0.0`（表示不限），两个词的上界一起消失。
+    """
+    since, until = __import__(
+        "linglong_clip.core.semantic", fromlist=["_resolve_range"]
+    )._resolve_range("week")
+    assert since > 0
+    assert until > since
+    # 本周的终点是「本周日结束」= 本周一 + 6 天，所以跨度是 6 天而非 7 天
+    assert round((until - since) / 86400) == 6

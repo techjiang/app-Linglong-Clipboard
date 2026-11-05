@@ -344,9 +344,42 @@ def test_report_summary_counts():
     assert "项正常" in report.summary
 
 
-def test_report_notes_default_when_all_good():
+def test_report_notes_default_when_all_good(monkeypatch):
+    """没有任何降级项时，结论只有一句话。
+
+    OCR 那一项必须**先钉住**：它探测的是宿主机的 `tesseract`，
+    没装时如实报「已降级」。不钉住的话，这条用例断言的就变成
+    「跑测试的机器装了 tesseract」—— CI 上（多数没装）必然红，
+    而开发者本机（装了）永远绿，两边的结果毫无关联。
+    """
+    from linglong_clip.utils.selfcheck import CheckResult
+
+    monkeypatch.setattr(
+        NativeSelfCheck,
+        "_check_ocr",
+        lambda self: CheckResult("截图 OCR", OK, "chi_sim · 已安装：chi_sim、eng"),
+    )
     report = _run(HealthBackend(), FakeHotkeys())
     assert report.notes == ["全部原生能力均按预期可用"]
+
+
+def test_report_notes_include_degraded_ocr(monkeypatch):
+    """OCR 不可用时，结论里必须**说出来**，而不是悄悄少一行。
+
+    这是上一条的另一面：把 OCR 钉成降级，看它有没有进 notes。
+    """
+    from linglong_clip.utils.selfcheck import CheckResult
+
+    monkeypatch.setattr(
+        NativeSelfCheck,
+        "_check_ocr",
+        lambda self: CheckResult(
+            "截图 OCR", DEGRADED, "未启用或未找到 tesseract"
+        ),
+    )
+    report = _run(HealthBackend(), FakeHotkeys())
+    assert report.notes != ["全部原生能力均按预期可用"]
+    assert any("OCR" in note for note in report.notes)
 
 
 def test_report_to_dict_is_json_serializable():
