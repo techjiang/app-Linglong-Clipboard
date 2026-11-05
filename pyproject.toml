@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "linglong-clipboard"
-version = "1.0.0"
+version = "1.0.1"
 description = "玲珑剪切板 —— 跨平台智能剪切板：本地优先、语义检索、可编程转换"
 readme = "README.md"
 requires-python = ">=3.9"

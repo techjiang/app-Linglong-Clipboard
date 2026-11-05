@@ -1743,7 +1743,28 @@ def wants_cli(args: argparse.Namespace) -> bool:
     return False
 
 
+def _make_streams_printable() -> None:
+    """让 stdout/stderr 能吃下中文。
+
+    Windows 控制台默认代码页（cp1252 / cp936）编码不了中文，`--version`、
+    `--stats` 这类纯打印的路径会在启动瞬间抛 UnicodeEncodeError。打包成
+    .exe 后异常连回显都没有，用户只看到程序闪退。这里把两个流换成 UTF-8
+    并且永不因编码失败中断输出 —— 宁可有乱码，也不要什么都没有。
+    """
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            # 流被重定向到不支持重配置的对象时，保持原样即可。
+            pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    _make_streams_printable()
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     args = parser.parse_args(argv)

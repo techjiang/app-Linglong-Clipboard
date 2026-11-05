@@ -1,8 +1,11 @@
 # CNB 流水线
 #
-# 注意：PyInstaller 不支持交叉编译，这里只能产出 Linux 二进制。
-# Windows / macOS 的产物由 .github/workflows/build.yml 的三平台矩阵负责，
-# 三平台产物汇总到 GitHub Release；CNB Release 只挂 Linux 包。
+# tag_push 一次出两个平台的包，都挂到同一个版本页：
+#   Linux   —— 本机 PyInstaller 直接打
+#   Windows —— PyInstaller 不支持交叉编译，但 Wine + Windows 版 Python
+#              能提供真实的 Windows 运行时，于是同一台 Linux 构建机就能产出
+#              原生 .exe（见 packaging/build_windows_wine.sh）。
+# macOS 的 .app 需要 macOS 才能签名/打包，仍由 .github/workflows/build.yml 承担。
 
 main:
   push:
@@ -44,6 +47,20 @@ $:
             - dist/*.tar.gz
             - dist/*.zip
 
+        # 任务之间只有 CNB_BUILD_WORKSPACE（/workspace）共享，dist/ 正好落在里面，
+        # Windows 包和上一个 stage 的 Linux 包会在同一个目录里汇合。
+        - name: 打包 Windows .exe（Wine）
+          image: cnbcool/default-npc:latest
+          script: |
+            set -e
+            apt-get update -qq && apt-get install -y -qq wine
+            # Wine 8 在没有终端的环境下会让 Windows 版 Python 起不来，
+            # packaging/build_windows_wine.sh 里用 tools/wine_run.py 借 pty 绕过。
+            bash packaging/build_windows_wine.sh
+          artifacts:
+            - dist/*.zip
+            - dist/*.exe
+
         # artifacts 只是「这次构建的产物」，不挂到版本页就没人能从 Releases 下载。
         # tag 名就是版本号，附件与 GitHub Release 用同一套 ASCII 命名。
         - name: 发布到 CNB Release
@@ -52,12 +69,14 @@ $:
             set -e
             TAG="${CNB_BRANCH}"
             REPO="${CNB_REPO_SLUG}"
-            PKG=$(ls dist/*.tar.gz 2>/dev/null | head -1 || find . -name '*.tar.gz' | head -1)
-            if [ -z "$PKG" ]; then
-              echo "找不到 Linux 发行包，终止发布" >&2
-              exit 1
-            fi
-            echo "发行包：$PKG"
+
+            # 两个平台的包缺一不可：只发一半等于把另一半用户挡在门外。
+            LINUX_PKG="dist/linglong-clipboard-linux.tar.gz"
+            WIN_PKG="dist/linglong-clipboard-windows.zip"
+            for pkg in "$LINUX_PKG" "$WIN_PKG"; do
+              [ -f "$pkg" ] || { echo "缺少发行包：$pkg，终止发布" >&2; exit 1; }
+              echo "发行包：$pkg ($(stat -c%s "$pkg") bytes)"
+            done
 
             # Release 可能还没建好（tag 触发的流水线可能先于 Release 创建），重试几次；
             # 拿不到就明确失败，不吞错——否则发布了个空版本页还以为成功了。
@@ -71,8 +90,12 @@ $:
             done
             [ -n "$RID" ] || { echo "Release $TAG 不存在，终止发布" >&2; exit 1; }
 
-            cnb releases post-release-asset-upload-url --repo "$REPO" --release-id "$RID" \
-              --asset-name linglong-clipboard-linux.tar.gz \
-              --size "$(stat -c%s "$PKG")" --overwrite > upload.out
-            python3 tools/release_asset.py upload upload.out "$PKG" "$REPO" "$RID"
-            echo "已发布：Release $TAG"
+            # 逐个上传：每个附件都是「要地址 -> PUT -> 确认」三步，confirm 之前不算数
+            for pkg in "$LINUX_PKG" "$WIN_PKG"; do
+              name=$(basename "$pkg")
+              echo "上传 $name"
+              cnb releases post-release-asset-upload-url --repo "$REPO" --release-id "$RID" \
+                --asset-name "$name" --size "$(stat -c%s "$pkg")" --overwrite > upload.out
+              python3 tools/release_asset.py upload upload.out "$pkg" "$REPO" "$RID"
+            done
+            echo "已发布：Release $TAG（Linux + Windows）"

@@ -2,6 +2,20 @@
 
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.1] - 2026-11-05
+
+### 修复
+
+- **Windows 版 `--version` / `--stats` 闪退**：控制台编码（cp1252 / cp936）装不下中文，
+  打印版本号时就抛 `UnicodeEncodeError`，打包成 .exe 后连报错都看不见。
+  入口现在会把标准流切到 UTF-8 并允许降级输出。
+
+### 发行
+
+- **CNB 版本页终于有 Windows 包了**：`linglong-clipboard-windows.zip`。
+  PyInstaller 不能交叉编译，但 Wine 里跑一个真正的 Windows Python 就能产出原生 .exe，
+  于是同一台 Linux 构建机一次出齐 Linux + Windows 两个包。
+
 ## [1.0.0] - 2025-11-03
 
 第一个正式版本。三平台共用一份代码，跨平台差异收敛在 `platform/` 适配层。

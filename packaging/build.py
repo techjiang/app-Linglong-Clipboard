@@ -121,7 +121,8 @@ def _prepare_dist() -> None:
             entry.unlink(missing_ok=True)
 
 
-def build(onedir: bool = False) -> int:
+def build(onedir: bool = False, dist: "Path | None" = None) -> int:
+    global DIST
     # 不能把 `--onefile/--onedir` 和 .spec 一起传：PyInstaller 会拒绝
     # （「makespec options not valid when a .spec file is given」），
     # 发版第一步就会卡在这里。模式改由环境变量传给 spec。
@@ -135,6 +136,12 @@ def build(onedir: bool = False) -> int:
     ]
     env = dict(os.environ)
     env["LINGLONG_ONEDIR"] = "1" if onedir else "0"
+    if dist is not None:
+        # 换输出目录：CI 里 /workspace 是任务间共享的，各平台产物挤在同一个
+        # dist/ 里会互相踩（_prepare_dist 会清空整个目录）。
+        # PyInstaller 也要一起改，否则它照样写回默认的 dist/。
+        DIST = dist
+        command += ["--distpath", str(dist)]
     _prepare_dist()
     print(f"在 {platform_label()} 上打包：{' '.join(command[2:])}"
           f"（{'目录' if onedir else '单文件'}模式）")
@@ -199,6 +206,11 @@ def main() -> int:
         action="store_true",
         help="原生依赖缺失时直接失败（发布流水线用，避免产出功能缺失的包）",
     )
+    parser.add_argument(
+        "--dist",
+        metavar="目录",
+        help="产物输出目录（默认 dist/）。多平台产物要并存时用它隔开",
+    )
     args = parser.parse_args()
 
     print(f"平台：{platform_label()} ({platform.machine()})")
@@ -210,7 +222,8 @@ def main() -> int:
     if args.clean:
         clean()
 
-    return build(onedir=args.onedir)
+    dist = Path(args.dist).resolve() if args.dist else None
+    return build(onedir=args.onedir, dist=dist)
 
 
 if __name__ == "__main__":

@@ -2220,3 +2220,47 @@ def test_stats_counts_wal_of_a_live_database(home, capsys):
     assert stats["db_size"] == footprint.total_bytes
     assert stats["storage_files"]["companion_bytes"] == footprint.companion_bytes
     store.close()
+
+class _ConsoleStream:
+    """模拟 Windows 控制台：默认 cp1252，reconfigure 之后按新编码走。
+
+    真机上 `sys.stdout` 就是这个脾气：中文一打印就抛 UnicodeEncodeError，
+    而打包成 .exe 时连异常回显都没有。
+    """
+
+    def __init__(self, encoding="cp1252"):
+        self.encoding = encoding
+        self.errors = "strict"
+        self.written = []
+
+    def write(self, text):
+        payload = text.encode(self.encoding, self.errors)
+        self.written.append(payload.decode(self.encoding, "replace"))
+
+    def flush(self):
+        pass
+
+    def reconfigure(self, encoding=None, errors=None):
+        if encoding:
+            self.encoding = encoding
+        if errors:
+            self.errors = errors
+
+
+def test_main_survives_console_that_cannot_encode_chinese(monkeypatch):
+    """`--version` 在 Windows 控制台不能因为中文而闪退。
+
+    打包成 .exe 后 stderr 也看不见，用户只会看到双击闪一下就没了。
+    入口必须自己把流切到 UTF-8 并允许降级。
+    """
+    stream = _ConsoleStream()
+    monkeypatch.setattr("sys.stdout", stream)
+    monkeypatch.setattr("sys.stderr", stream)
+
+    # argparse 的 --version 走 SystemExit(0)，这是正常退出
+    with pytest.raises(SystemExit) as excinfo:
+        main(["--version"])
+    assert excinfo.value.code == 0
+    assert stream.encoding == "utf-8"
+    assert stream.errors == "replace"
+    assert any("玲珑剪切板" in line for line in stream.written)
