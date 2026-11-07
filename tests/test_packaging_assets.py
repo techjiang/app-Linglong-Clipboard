@@ -239,3 +239,62 @@ def test_tray_prefers_resource_icon(qt_app):
     icon = tray_icon(DARK)
     sizes = {size.width() for size in icon.availableSizes()}
     assert len(sizes) > 1, "托盘图标只有一张位图，切换 DPI 时会发灰"
+
+
+# ---------------------------------------------------------------------------
+# 文档承诺 vs 实际交付
+#
+# 这一组用例的由来：版本页只有 zip / tar.gz，README 却写着「macOS 有 .app」、
+# 「两个仓库 Releases 内容一致」。用户照着文档去找，找到的是空页面 ——
+# 于是反馈变成「还是没有安装版」。文档说错了比没写更糟。
+# ---------------------------------------------------------------------------
+
+def _readme() -> str:
+    return (ROOT / "README.md").read_text(encoding="utf-8")
+
+
+def test_readme_does_not_promise_macos_binary():
+    """macOS 没有预编译包，README 就不该把它列进「下载安装包」的表里。"""
+    text = _readme()
+    # 只在「下载」章节里检查，别误伤正文里讲 macOS 源码运行的部分
+    start = text.index("### 下载安装包（推荐）")
+    end = text.index("### 便携版", start)
+    section = text[start:end]
+    assert "linglong-clipboard-macos.zip" not in section, (
+        "下载表里仍承诺了 macOS 预编译包，但版本页没有这个文件"
+    )
+    # 但要明确告诉读者为什么没有，否则又是「让人去猜」
+    assert "macOS" in section
+    assert "只能在 macOS 上打" in section or "从源码" in section
+
+
+def test_readme_portable_table_matches_real_assets():
+    """便携版表里的每个文件名，都必须是构建脚本真能产出的。"""
+    text = _readme()
+    start = text.index("### 便携版")
+    section = text[start:text.index("> **为什么现在是目录", start)]
+    for name in ("linglong-clipboard-windows.zip", "linglong-clipboard-linux.tar.gz"):
+        assert name in section, f"便携版表里缺了 {name}"
+    assert "linglong-clipboard-macos.zip" not in section
+
+
+def test_readme_build_commands_match_实际参数():
+    """README 里写的打包命令必须真的能跑：`--onedir` 早就改了名。"""
+    text = _readme()
+    build = (ROOT / "packaging" / "build.py").read_text(encoding="utf-8")
+    # 文档里提到的每个 --flag，都得在 argparse 里有定义
+    for line in text.splitlines():
+        if "packaging/build.py" not in line:
+            continue
+        for token in line.split():
+            if not token.startswith("--"):
+                continue
+            flag = token.strip("`#")
+            assert f'"{flag}"' in build, f"README 写了 {flag}，但 build.py 没这个参数"
+
+
+def test_readme_points_downloads_at_main_site():
+    """GitHub 镜像没有发布流水线，不能让用户以为那边也有安装包。"""
+    text = _readme()
+    assert "下载请走主站" in text
+    assert "两个仓库的 Releases 内容一致" not in text

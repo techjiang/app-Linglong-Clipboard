@@ -1324,7 +1324,9 @@ linglong-clipboard          # 或简写 llclip
 | --- | --- | --- |
 | Windows | `linglong-clipboard-<ver>-windows-setup.exe` | 开始菜单项、桌面快捷方式、添加/删除程序里的卸载入口 |
 | Linux | `linglong-clipboard_<ver>_amd64.deb` | 应用菜单里的图标、`linglong-clipboard` 命令、`apt remove` 可卸载 |
-| macOS | `linglong-clipboard-macos.zip` | `.app`，拖进「应用程序」即可 |
+
+> **macOS 目前没有预编译包。** `.app` 只能在 macOS 上打，而构建机是 Linux。
+> 在 Mac 上从源码跑：`pip install -e ".[packaging]" && python packaging/build.py`。
 
 Windows 装到当前用户目录（`%LOCALAPPDATA%\Programs\LinglongClipboard`），
 **不需要管理员权限**，也不会弹 UAC。
@@ -1342,7 +1344,6 @@ Debian/Ubuntu 上 `dpkg -i` 若报缺依赖，用 `sudo apt install -f` 补齐�
 | 平台 | 文件 | 用法 |
 | --- | --- | --- |
 | Windows | `linglong-clipboard-windows.zip` | 解压后进 `linglong-clipboard/` 双击 `linglong-clipboard.exe` |
-| macOS | `linglong-clipboard-macos.zip` | 解压得到 `Linglong Clipboard.app` |
 | Linux | `linglong-clipboard-linux.tar.gz` | `tar xzf` 后 `./linglong-clipboard/linglong-clipboard` |
 
 便携版适合 U 盘、别人机器、没有安装权限的环境。它的代价是：没有菜单项、
@@ -1365,7 +1366,9 @@ Debian/Ubuntu 上 `dpkg -i` 若报缺依赖，用 `sudo apt install -f` 补齐�
 
 > 主站：[cnb.cool/asoe/TechSauce/app-Linglong-Clipboard](https://cnb.cool/asoe/TechSauce/app-Linglong-Clipboard)
 > 镜像：[github.com/techjiang/app-Linglong-Clipboard](https://github.com/techjiang/app-Linglong-Clipboard)
-> 两个仓库的 Releases 内容一致。
+>
+> **下载请走主站。** GitHub 镜像只同步了代码，没有发布流水线产出的安装包，
+> 那边 Releases 是空的 —— 之前写「内容一致」是我写错了。
 
 ### Linux 桌面集成
 
@@ -1824,12 +1827,13 @@ Linux 侧塞一个假 `Xlib` 模块，走完 `_read_x11_selection` 与 `_focus_v
 ### 打包
 
 ```bash
-python packaging/build.py            # 单文件
-python packaging/build.py --onedir   # 目录模式（启动更快）
+python packaging/build.py            # 目录模式 + 安装包（默认）
+python packaging/build.py --onefile  # 单文件（便携，启动慢）
 ```
 
-> PyInstaller 不支持交叉编译。Windows 的 `.exe` 必须在 Windows 上打，
-> macOS 的 `.app` 只能在 macOS 上打。CI 用三平台矩阵解决（`.github/workflows/build.yml`）。
+> PyInstaller 不支持交叉编译。Windows 的 `.exe` 由 Wine + Windows 版 Python 在
+> Linux 构建机上来打（`packaging/build_windows_wine.sh`），所以主站的版本页能同时
+> 给出 Windows 与 Linux 的安装包。macOS 的 `.app` 只能在 macOS 上打，目前没有预编译包。
 
 ### 代码结构
 
