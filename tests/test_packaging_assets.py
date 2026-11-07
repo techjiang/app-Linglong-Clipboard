@@ -298,3 +298,28 @@ def test_readme_points_downloads_at_main_site():
     text = _readme()
     assert "下载请走主站" in text
     assert "两个仓库的 Releases 内容一致" not in text
+
+
+def test_version_numbers_agree_everywhere():
+    """版本号三处必须一致：`__init__`、`pyproject`、CHANGELOG 顶部条目。
+
+    三处各写一份是难免的（打包脚本读 `__init__`，pip 读 `pyproject`，
+    版本页对 CHANGELOG），但只要它们能分叉，就一定会分叉 ——
+    1.0.2 的安装包里写着 1.0.2，CHANGELOG 顶部却还是 1.0.1 这种情况，
+    用户看到的第一句话就是错的。
+    """
+    import re
+
+    init_text = (ROOT / "src" / "linglong_clip" / "__init__.py").read_text(encoding="utf-8")
+    version = re.search(r'__version__\s*=\s*"([^"]+)"', init_text).group(1)
+
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert re.search(r'^version\s*=\s*"([^"]+)"', pyproject, re.M).group(1) == version
+
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    first = re.search(r"^## \[([^\]]+)\]", changelog, re.M)
+    assert first is not None, "CHANGELOG 里一条版本记录都没有"
+    assert first.group(1) == version, (
+        f"CHANGELOG 顶部是 {first.group(1)}，代码是 {version}；"
+        "发版时两处都要改"
+    )
