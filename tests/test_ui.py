@@ -206,7 +206,24 @@ def test_window_empty_state(window, storage):
     window._search.setText("绝不存在的关键词xyz")
     window.reload()
     assert window._items == []
-    assert window._empty_label.isHidden() is False
+    assert window._empty_panel.isHidden() is False
+
+
+def test_window_empty_state_tells_where_data_lives(window, storage, home):
+    """空历史页必须直接说明数据存在哪。
+
+    此前空状态只有一句「复制任意内容后会自动出现在这里」，
+    「数据持久化」这件事完全靠用户猜，于是被当成缺陷报上来。
+    """
+    from linglong_clip.utils.paths import data_dir, database_path
+
+    window._search.setText("绝不存在的关键词xyz")
+    window.reload()
+
+    values = [label.text() for label in window._empty_panel._path_labels.values()]
+    assert str(data_dir()) in values
+    assert str(database_path()) in values
+    assert any("存储方式" == key for key in window._empty_panel._path_labels)
 
 
 def test_window_copy_signal(window, seeded):

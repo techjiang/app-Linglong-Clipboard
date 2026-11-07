@@ -38,6 +38,7 @@ from ..core.theme_spec import (
     normalize_density,
 )
 from ..utils.logger import get_logger
+from .icons import window_icon
 from .theme import build_stylesheet, palette_for
 
 _log = get_logger("settings")
@@ -89,6 +90,7 @@ class SettingsDialog(QDialog):
         self.changes: Dict[str, object] = {}
 
         self.setWindowTitle("设置 — 玲珑剪切板")
+        self.setWindowIcon(window_icon(palette_for(self._config.get("ui.theme", "system"))))
         self.resize(760, 640)
         # 独立窗口必须自己套一层全局样式表：QSS 不会从父窗口继承，
         # 不设的话设置页是系统默认灰白外观，和主界面完全脱节。
@@ -1147,6 +1149,13 @@ class SettingsDialog(QDialog):
         path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         form.addRow("存放位置", path_label)
 
+        # 「数据在哪」必须能一键打开，而不是只给一行只能看的路径。
+        # 会用命令行的人不需要问这个问题，问这个问题的人不会去敲 --where。
+        self._open_data_dir = QPushButton("打开数据目录")
+        self._open_data_dir.setToolTip("在系统文件管理器里打开历史数据所在目录")
+        self._open_data_dir.clicked.connect(self._open_data_directory)
+        form.addRow("", self._open_data_dir)
+
         # 真实占用。和「图片附件」那块是同一个理由：磁盘在涨而用户看不见 ——
         # 只报主文件更糟，`history.db` 后面的 `-wal` 里装着尚未并入主库的
         # 全部改动，它可能比主文件还大。
@@ -1389,6 +1398,16 @@ class SettingsDialog(QDialog):
                 f" + 索引 {storage_files.format_bytes(footprint.index_bytes)}）"
             )
         self._storage_size.setText(text)
+
+    def _open_data_directory(self) -> None:
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        from ..utils.paths import data_dir
+
+        path = data_dir()
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            QMessageBox.information(self, "无法打开文件管理器", f"数据目录：{path}")
 
     def _refresh_storage_hint(self) -> None:
         is_json = self._storage_backend.currentData() == "json"

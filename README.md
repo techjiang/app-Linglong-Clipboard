@@ -13,6 +13,11 @@
 
 ### 界面预览
 
+下面是**装好的程序在真实桌面上运行**时截的图（不是渲染出来的示意图）：
+`xclip` 真的往剪贴板里写内容，程序真的把它们采集进来，窗口管理器真的显示了这个窗口。
+
+![真实运行](docs/screenshots/real-linux-running.png)
+
 主界面（深色主题）—— 左侧筛选、中间卡片列表、右侧预览：
 
 ![主界面](docs/screenshots/main-dark.png)
@@ -1311,15 +1316,42 @@ pip install -e .
 linglong-clipboard          # 或简写 llclip
 ```
 
-### 下载预编译版本
+### 下载安装包（推荐）
 
-到 Releases 页面下载对应平台的文件。三平台都是压缩包，解压即用，无需安装 Python：
+到 Releases 页面下载对应平台的文件。**优先用安装版**：
+
+| 平台 | 安装包 | 装完得到什么 |
+| --- | --- | --- |
+| Windows | `linglong-clipboard-<ver>-windows-setup.exe` | 开始菜单项、桌面快捷方式、添加/删除程序里的卸载入口 |
+| Linux | `linglong-clipboard_<ver>_amd64.deb` | 应用菜单里的图标、`linglong-clipboard` 命令、`apt remove` 可卸载 |
+| macOS | `linglong-clipboard-macos.zip` | `.app`，拖进「应用程序」即可 |
+
+Windows 装到当前用户目录（`%LOCALAPPDATA%\Programs\LinglongClipboard`），
+**不需要管理员权限**，也不会弹 UAC。
+
+```bash
+# Linux
+sudo dpkg -i linglong-clipboard_1.0.2_amd64.deb
+linglong-clipboard --version        # 装完命令行就能用
+```
+
+Debian/Ubuntu 上 `dpkg -i` 若报缺依赖，用 `sudo apt install -f` 补齐即可。
+
+### 便携版（不装，解压即用）
 
 | 平台 | 文件 | 用法 |
 | --- | --- | --- |
-| Windows | `linglong-clipboard-windows.zip` | 解压得到 `玲珑剪切板.exe`，双击运行 |
-| macOS | `linglong-clipboard-macos.zip` | 解压得到 `玲珑剪切板.app` |
-| Linux | `linglong-clipboard-linux.tar.gz` | `tar xzf` 后得到 `linglong-clipboard`，`chmod +x` 再运行 |
+| Windows | `linglong-clipboard-windows.zip` | 解压后进 `linglong-clipboard/` 双击 `linglong-clipboard.exe` |
+| macOS | `linglong-clipboard-macos.zip` | 解压得到 `Linglong Clipboard.app` |
+| Linux | `linglong-clipboard-linux.tar.gz` | `tar xzf` 后 `./linglong-clipboard/linglong-clipboard` |
+
+便携版适合 U 盘、别人机器、没有安装权限的环境。它的代价是：没有菜单项、
+没有卸载记录、图标缓存里也不会有它 —— 想长期用还是装安装版。
+
+> **为什么现在是目录而不是单个 exe**：单文件版每次启动都要把几十 MB 的 Qt
+> 解压到临时目录，冷启动慢好几秒，托盘图标在解压期间还是空白。安装包里
+> 单文件没有任何收益，代价全落在使用者身上。所以两种发行物都是目录结构，
+> 但安装版会用向导把目录摆好、把入口建好，双击快捷方式直接用。
 
 发行包已内置各平台的原生依赖（Linux 的 `python-xlib`、macOS 的 `pyobjc`），
 所以「全局快捷键」和「来源应用识别」在包里是可用的，不需要用户另外装东西。
@@ -1337,6 +1369,16 @@ linglong-clipboard          # 或简写 llclip
 
 ### Linux 桌面集成
 
+装了 `.deb` 就已经做好了，不用手动配：
+
+```bash
+/usr/share/applications/linglong-clipboard.desktop       # 应用菜单项
+/usr/share/icons/hicolor/*/apps/linglong-clipboard.png   # 多档位图标
+/usr/bin/linglong-clipboard                              # 命令行入口
+```
+
+用便携版又想进菜单的话，自己放一份 desktop 文件（`Icon` 指向解压目录里的 PNG）：
+
 ```bash
 mkdir -p ~/.local/share/applications
 cat > ~/.local/share/applications/linglong-clipboard.desktop <<'EOF'
@@ -1344,8 +1386,8 @@ cat > ~/.local/share/applications/linglong-clipboard.desktop <<'EOF'
 Type=Application
 Name=玲珑剪切板
 Comment=跨平台智能剪切板
-Exec=linglong-clipboard
-Icon=edit-paste
+Exec=/path/to/linglong-clipboard/linglong-clipboard
+Icon=/path/to/linglong-clipboard/_internal/assets/icon/png/linglong-clipboard-256.png
 Categories=Utility;
 StartupNotify=false
 EOF
@@ -1598,6 +1640,17 @@ $ linglong-clipboard --stats
 | Windows | `%APPDATA%\LinglongClipboard\history.db`　或　`…\.clipboard\clipboard.json` |
 | macOS | `~/Library/Application Support/LinglongClipboard/` |
 | Linux | `~/.local/share/linglong-clipboard/`（配置在 `~/.config/linglong-clipboard/`） |
+
+**这件事不该只写在文档里。** 软件里三处都能直接看到：
+
+1. 首次启动时状态栏会提示一次目录路径；
+2. 历史为空时，主界面中间那张卡片直接写明「数据目录 / 存储方式 / 历史文件」，
+   带一个「打开数据目录」按钮；
+3. 设置 → 采集 → 「历史存储」里有同样的信息与按钮。
+
+![首次启动](docs/screenshots/empty-first-run.png)
+
+这样新装用户不必先猜、再翻文档、最后开终端敲 `--where`。
 
 选 JSON 方式时，历史落在数据目录下的 `.clipboard/clipboard.json`；
 选 SQLite 时是数据目录下的 `history.db`。两者可以共存，互不覆盖。

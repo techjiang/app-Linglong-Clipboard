@@ -12,6 +12,7 @@ from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPainterPath, QPen, 
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
 from ..utils.logger import get_logger
+from .icons import window_icon
 from .theme import KIND_COLORS, Palette
 
 _log = get_logger("tray")
@@ -62,6 +63,19 @@ def build_icon(palette: Palette, size: int = 64) -> QIcon:
     return QIcon(pixmap)
 
 
+def tray_icon(palette: Palette) -> QIcon:
+    """托盘实际使用的图标：优先资源文件，缺失时退回代码绘制。
+
+    托盘是这类常驻工具唯一的「存在感」，图标糊了等于没有。
+    资源文件是多档位的（16/24/32 用简化母版），系统按 DPI 自己挑；
+    代码绘制那版只有单张位图，缩放后边缘会发灰。
+    """
+    icon = window_icon(palette)
+    if not icon.isNull():
+        return icon
+    return build_icon(palette)
+
+
 class TrayIcon(QSystemTrayIcon):
     """托盘图标。
 
@@ -77,7 +91,7 @@ class TrayIcon(QSystemTrayIcon):
     quit_requested = Signal()
 
     def __init__(self, palette: Palette, parent=None) -> None:
-        super().__init__(build_icon(palette), parent)
+        super().__init__(tray_icon(palette), parent)
         self._palette_theme = palette
         self._capture_enabled = True
 

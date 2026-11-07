@@ -113,6 +113,9 @@ DEFAULTS: Dict[str, Any] = {
         "start_minimized": True,
         "close_to_tray": True,
         "card_density": "comfortable",  # comfortable / compact
+        # 首次启动时展示「数据存在哪」的引导。只影响一次性提示，
+        # 用户看过了就置 true，之后不再打扰。
+        "storage_intro_shown": False,
     },
     "ocr": {
         # 截图文字识别：让图片能被文字搜到。默认开启，缺 tesseract 时静默降级。

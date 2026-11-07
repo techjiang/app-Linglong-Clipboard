@@ -265,6 +265,45 @@ QLabel#EmptyHint {{
     background: transparent;
 }}
 
+/* ---- 空历史引导页 ---- */
+QLabel#EmptyStateTitle {{
+    color: {p.text};
+    font-size: 20px;
+    font-weight: 600;
+    background: transparent;
+}}
+QLabel#EmptyStateHint {{
+    color: {p.text_dim};
+    font-size: 13px;
+    background: transparent;
+}}
+QFrame#EmptyStateCard {{
+    background-color: {p.surface};
+    border: 1px solid {p.border};
+    border-radius: 10px;
+}}
+QLabel#EmptyStateCardTitle {{
+    color: {p.text};
+    font-size: 13px;
+    font-weight: 600;
+    background: transparent;
+}}
+QLabel#EmptyStateKey {{
+    color: {p.text_faint};
+    font-size: 12px;
+    background: transparent;
+}}
+QLabel#EmptyStateValue {{
+    color: {p.text_dim};
+    font-size: 12px;
+    background: transparent;
+}}
+QLabel#EmptyStateNote {{
+    color: {p.text_faint};
+    font-size: 11px;
+    background: transparent;
+}}
+
 /* ---- 侧栏与分组 ---- */
 QFrame#Sidebar {{
     background-color: {p.bg_alt};

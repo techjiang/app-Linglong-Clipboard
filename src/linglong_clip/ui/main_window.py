@@ -37,6 +37,8 @@ from ..core.semantic import SemanticEngine
 from ..core.theme_spec import DEFAULT_DENSITY
 from ..core.storage import Storage
 from ..utils.logger import get_logger
+from .empty_state import EmptyStatePanel
+from .icons import window_icon
 from .item_card import ItemCard, humanize_size, humanize_time, normalize_density  # noqa: F401
 from .theme import Palette, build_stylesheet, palette_for
 
@@ -209,6 +211,12 @@ class PreviewPanel(QFrame):
 class MainWindow(QWidget):
     """应用主界面。"""
 
+    #: 空状态面板上的「打开数据目录」
+    open_data_dir_requested = Signal()
+    #: 空状态面板上的「试试快速粘贴」
+    quick_paste_requested = Signal()
+    #: 空状态面板上的「打开设置」
+    settings_requested = Signal()
     copy_requested = Signal(int, bool)  # (item_id, plain_text_only)
     paste_requested = Signal(int)
     #: 「这条内容要出站了，请按 `trigger = outbound` 的规则加工一次」。
@@ -266,6 +274,9 @@ class MainWindow(QWidget):
         self._density = normalize_density(self._config.get("ui.card_density", DEFAULT_DENSITY))
 
         self.setWindowTitle("玲珑剪切板")
+        # 图标走 assets/ 里的多档位图；窗口管理器读的是 WM_HINTS 里的这一份，
+        # 不设的话标题栏和任务栏都是系统默认的空白方块。
+        self.setWindowIcon(window_icon(self._palette_theme))
         self.setMinimumSize(QSize(880, 560))
         self.resize(1180, 720)
         self.setObjectName("Root")
@@ -497,14 +508,13 @@ class MainWindow(QWidget):
         self._scroll.setWidget(container)
         layout.addWidget(self._scroll, 1)
 
-        self._empty_label = QLabel(
-            "还没有记录。\n\n复制任意内容后会自动出现在这里。\nCtrl+Shift+V 随时唤起快速粘贴。"
-        )
-        self._empty_label.setObjectName("EmptyHint")
-        self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._empty_label.setWordWrap(True)
-        self._empty_label.hide()
-        layout.addWidget(self._empty_label)
+        # 空历史时的引导面板：直接告诉用户数据存在哪（见 empty_state.py）
+        self._empty_panel = EmptyStatePanel()
+        self._empty_panel.open_data_dir_requested.connect(self.open_data_dir_requested.emit)
+        self._empty_panel.quick_paste_requested.connect(self.quick_paste_requested.emit)
+        self._empty_panel.settings_requested.connect(self.settings_requested.emit)
+        self._empty_panel.hide()
+        layout.addWidget(self._empty_panel)
 
         return area
 
@@ -599,12 +609,13 @@ class MainWindow(QWidget):
         self._list_layout.addStretch(1)
 
         if not self._items:
-            self._empty_label.show()
+            self._empty_panel.refresh()
+            self._empty_panel.show()
             self._scroll.hide()
             self._preview.show_item(None)
             return
 
-        self._empty_label.hide()
+        self._empty_panel.hide()
         self._scroll.show()
 
         for item in self._items:

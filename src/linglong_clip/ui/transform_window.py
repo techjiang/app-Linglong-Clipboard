@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 
 from ..core.automation import REGISTRY, AutomationEngine
 from ..core.models import ClipboardItem
+from .icons import window_icon
 from .theme import build_stylesheet, palette_for
 
 
@@ -36,6 +37,7 @@ class TransformWindow(QWidget):
         self._history: List[str] = []  # 已应用的动作 key
 
         self.setWindowTitle("转换结果 — 玲珑剪切板")
+        self.setWindowIcon(window_icon())
         self.resize(720, 520)
         self.setWindowFlag(Qt.WindowType.Window)
 

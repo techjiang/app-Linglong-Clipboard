@@ -48,6 +48,7 @@ from .main_window import MainWindow
 from .quick_paste import QuickPasteOverlay
 from ..utils.selfcheck import run_self_check
 from .settings_dialog import SettingsDialog
+from .icons import window_icon
 from .theme import palette_for
 from .transform_window import TransformWindow
 from .tray import TrayIcon
@@ -160,6 +161,10 @@ class Application(QObject):
         self.qt_app.setApplicationName("玲珑剪切板")
         self.qt_app.setApplicationDisplayName("玲珑剪切板")
         self.qt_app.setOrganizationName("Linglong")
+        # 应用级图标：没有窗口显示时（托盘、任务栏合并、通知气泡）
+        # 系统取的就是这一份。此前完全没设，任务栏里显示的是 Qt 默认方块。
+        self.qt_app.setWindowIcon(window_icon())
+        self.qt_app.setDesktopFileName("linglong-clipboard")
         self.qt_app.setQuitOnLastWindowClosed(False)
 
         self.config = Config()
@@ -387,6 +392,9 @@ class Application(QObject):
         window.connect_external(window.flag_toggled, self.toggle_flag)
         window.connect_external(window.clear_requested, self.clear_unpinned)
         window.connect_external(window.compact_requested, self.compact_storage)
+        window.connect_external(window.open_data_dir_requested, self.open_data_dir)
+        window.connect_external(window.quick_paste_requested, self.show_quick_paste)
+        window.connect_external(window.settings_requested, self.show_settings)
         window.transform_ready.connect(self._show_transform)
         window.form_ready.connect(self.copy_form)
         self.preview.item_chosen.connect(self._on_quick_chosen)
@@ -614,6 +622,8 @@ class Application(QObject):
         else:
             self.show_window()
 
+        self._announce_storage_once()
+
         signal.signal(signal.SIGINT, lambda *_: self.quit())
         # 让 Python 有机会处理信号：Qt 事件循环会吞掉 SIGINT
         self._signal_timer = QTimer(self)
@@ -621,6 +631,25 @@ class Application(QObject):
         self._signal_timer.timeout.connect(lambda: None)
 
         return self.qt_app.exec()
+
+    def _announce_storage_once(self) -> None:
+        """首次启动时把「数据存在哪」说清楚，只说一次。
+
+        为什么这件事值得占用一次提示：安装版装完，用户的第一反应是
+        「我复制的东西去哪了、删了软件会不会没」。空历史时引导页里有完整答案，
+        但**已经有历史的老用户看不到那个页面** —— 他们升级上来，界面上
+        同样一个字都不提。所以这里补一次状态栏提示，并把标记落盘，
+        之后不再打扰。
+        """
+        if self.config.get("ui.storage_intro_shown", False):
+            return
+        from ..utils.paths import data_dir
+
+        try:
+            self.window.notify(f"历史数据保存在 {data_dir()}", timeout_ms=8000)
+            self.config.set("ui.storage_intro_shown", True)
+        except Exception:  # noqa: BLE001 - 一次性提示失败不该影响启动
+            _log.debug("首次启动提示失败", exc_info=True)
 
     def quit(self) -> None:
         if self._shutting_down:
@@ -1096,6 +1125,21 @@ class Application(QObject):
             self.monitor.pause()
             self.window.notify("已暂停采集")
         self.tray.set_paused(self.monitor.is_paused)
+
+    def open_data_dir(self) -> None:
+        """用系统文件管理器打开数据目录。
+
+        「我的数据存哪」不该只能靠命令行 `--where` 回答 —— 会用命令行的人
+        不需要问这个问题。空状态面板上的按钮和设置页都调这里。
+        """
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        from ..utils.paths import data_dir
+
+        path = data_dir()
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            self.window.notify(f"无法打开文件管理器，数据目录：{path}")
 
     def show_settings(self) -> None:
         dialog = SettingsDialog(

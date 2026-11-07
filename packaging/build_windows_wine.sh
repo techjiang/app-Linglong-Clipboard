@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
-# 在 Linux 上用 Wine 交叉打包 Windows 版 .exe。
+# 在 Linux 上用 Wine 交叉打包 Windows 版 .exe 与安装包。
 #
 # 为什么不是「在 GitHub Actions 的 windows runner 上打」：
 # 那样 CNB 的版本页就只能挂 Linux 包，Windows 用户要跳去另一个站点下载。
 # PyInstaller 确实不支持交叉编译，但它只需要「一个能跑的 Windows Python」——
 # Wine 提供了这个环境，于是同一台 Linux 构建机上就能产出原生的 .exe。
 #
-# 三条容易踩空的坑，都在下面显式处理了：
+# 四条容易踩空的坑，都在下面显式处理了：
 #   1. PySide6 6.11+ 的 Qt6Core.dll 依赖 icuuc.dll，而 wheel 里没带，导入必崩。
 #      固定在 6.9.3——那是最后一版不引 ICU 的。
 #   2. Wine 的 ANSI 代码页决定「非 ASCII 文件名能不能落盘」。不设 UTF-8 时
 #      PyInstaller 写 `玲珑剪切板.pkg` 直接 FileNotFoundError。
 #   3. 控制台默认 cp1252，任何中文输出都会 UnicodeEncodeError。产品侧已修
 #      （见 __main__._make_streams_printable），这里再兜一层环境变量。
+#   4. 安装包（NSIS）**在 Linux 上编**，不在 Wine 里编。makensis 有原生 Linux
+#      版本，编出来的 setup.exe 与 Windows 上编的没有区别；Wine 里再套一层
+#      只会多一处没必要的失败面。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -47,10 +50,10 @@ if [ ! -x "$PREFIX/python.exe" ]; then
   log "准备 Windows Python $PY_VERSION 到 $PREFIX"
   mkdir -p "$PREFIX"
   curl -fsSL -o "$PREFIX/py.zip" "$EMBED_URL"
-  python3 - "$PREFIX/py.zip" "$PREFIX" <<'PY'
+  python3 - "$PREFIX/py.zip" "$PREFIX" <<'PYEXTRACT'
 import sys, zipfile
 zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])
-PY
+PYEXTRACT
   rm -f "$PREFIX/py.zip"
   # embed 版默认不启用 site，pip 装到 Lib/site-packages 的包会看不见。
   # 文件名形如 python311._pth（主次版本号，无点）。
@@ -79,24 +82,26 @@ fi
 
 # ---- 打包 ----
 cd "$ROOT"
-# 产物先落在独立目录，最后再挑出 Windows 那两个搬进 dist/。
+# 产物先落在独立目录，最后再挑出 Windows 那几个搬进 dist/。
 # 共用 dist/ 会被 build.py 的 _prepare_dist 清空——CI 的 /workspace 是任务间
 # 共享的，上一个 stage 刚打好的 Linux 包就躺在那儿。
 WIN_DIST="$ROOT/dist-windows"
 rm -rf "$WIN_DIST"
 log "开始打包 -> ${WIN_DIST#$ROOT/}"
-wine_py "$PY" packaging/build.py --require-native --dist "$WIN_DIST"
+
+# Windows 侧不打安装包（NSIS 在 Linux 侧编，理由见文件头）。
+# 默认就是目录模式：安装版和便携版都用这份产物，启动也快。
+wine_py "$PY" packaging/build.py --require-native --no-installer --dist "$WIN_DIST"
 mkdir -p dist
 
-EXE="$WIN_DIST/玲珑剪切板.exe"
-ZIP="$WIN_DIST/玲珑剪切板-windows.zip"
-[ -f "$EXE" ] || { log "没找到 $EXE"; exit 1; }
-[ -f "$ZIP" ] || { log "没找到 $ZIP"; exit 1; }
+APP_DIR="$WIN_DIST/linglong-clipboard"
+EXE="$APP_DIR/linglong-clipboard.exe"
+[ -f "$EXE" ] || { log "没找到 $EXE（目录模式产物）"; exit 1; }
 
 # ---- 冒烟：产物必须真能跑 ----
 # 打包成功不代表能启动：入口写错、控制台编码不兼容，都是「构建成功、双击闪退」。
 log "冒烟测试 .exe"
-cat > "$ROOT/packaging/_wine_smoke.py" <<'PY'
+cat > "$ROOT/packaging/_wine_smoke.py" <<'PYSMOKE'
 """在 Wine 里跑一遍刚打出来的 .exe，确认它不只是个几十 MB 的砖。"""
 import os
 import subprocess
@@ -115,7 +120,7 @@ for arg in ("--version", "--stats"):
         failed = True
         print(text[:800])
 raise SystemExit(1 if failed else 0)
-PY
+PYSMOKE
 # Wine 只认 Windows 路径写法：把 POSIX 路径换成 Z: 盘的 Windows 路径
 to_win() { printf 'Z:%s' "$(printf '%s' "$1" | tr '/' '\\')"; }
 LINGLONG_SMOKE_EXE="$(to_win "$EXE")" \
@@ -123,8 +128,24 @@ LINGLONG_CLIPBOARD_HOME='C:\smoke' \
   wine_py "$PY" "$(to_win "$ROOT/packaging/_wine_smoke.py")"
 rm -f "$ROOT/packaging/_wine_smoke.py"
 
+# ---- 便携版 zip ----
+ZIP="$WIN_DIST/linglong-clipboard-windows.zip"
+log "打便携版 zip"
+python3 "$ROOT/packaging/windows/zip_portable.py" "$APP_DIR" "$ZIP"
+
+# ---- 安装包（NSIS，在 Linux 侧编） ----
+if command -v makensis >/dev/null 2>&1; then
+  log "打安装包（NSIS）"
+  python3 "$ROOT/packaging/windows/make_installer.py" "$APP_DIR" "$WIN_DIST"
+else
+  log "未安装 makensis，跳过 Windows 安装包（apt-get install nsis）"
+fi
+
 # 挑出 Windows 产物，统一成 ASCII 名称，和 Linux 包 / GitHub Release 对齐
 cp -f "$ZIP" dist/linglong-clipboard-windows.zip
-cp -f "$EXE" dist/linglong-clipboard.exe
+SETUP=$(ls "$WIN_DIST"/*-setup.exe 2>/dev/null | head -1 || true)
+if [ -n "$SETUP" ]; then
+  cp -f "$SETUP" dist/
+fi
 ls -la dist/
 log "完成：dist/linglong-clipboard-windows.zip"

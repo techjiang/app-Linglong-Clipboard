@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 from ..core.models import ClipboardItem
 from ..core.semantic import SemanticEngine
 from ..core.storage import Storage
+from .icons import window_icon
 from .item_card import humanize_time
 from .theme import KIND_COLORS, Palette, palette_for, toast_style
 
@@ -130,6 +131,9 @@ class QuickPasteOverlay(QWidget):
             | Qt.WindowType.NoDropShadowWindowHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        # 浮层是 Popup 且无边框，图标主要给任务栏切换器与 Alt+Tab 用；
+        # 不设的话切到它时任务栏那个位置是空白的。
+        self.setWindowIcon(window_icon(self._palette_theme))
         self.setFixedWidth(560)
         # 样式挂在浮层本身：panel 是子控件，单独设样式时
         # 高亮行的 unpolish/polish 只在 panel 生效，切换选中容易不刷新

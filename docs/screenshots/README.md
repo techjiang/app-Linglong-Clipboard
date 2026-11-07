@@ -3,8 +3,20 @@
 界面截图由 `tests` 里的界面测试同样的 offscreen 渲染方式生成，
 可随代码更新重新产出，避免文档截图与实现脱节。
 
+## 两类截图的区别
+
+| 脚本 | 需要显示器 | 跑的是什么 | 能证明什么 |
+| --- | --- | --- | --- |
+| `packaging/screenshots.py` | 不需要（offscreen） | 界面代码 | 组件渲染正确、样式没坏 |
+| `packaging/screenshots_live.py` | 需要（Xvfb 也行） | **装好的可执行文件** | 窗口真的能起来、图标真的设进 `_NET_WM_ICON`、剪贴板真的被采集 |
+
+安装版的问题常常正落在第二类里：图标不显示、托盘空白、菜单项不出现 ——
+这些在 offscreen 渲染里一个都看不出来。
+
 | 文件 | 内容 |
 | --- | --- |
+| `real-linux-running.png` | **真实桌面运行**：真实剪贴板操作后的主界面 |
+| `empty-first-run.png` | 首次启动：空历史 + 数据存放位置说明 |
 | `main-dark.png` | 主界面（深色主题） |
 | `main-light.png` | 主界面（浅色主题） |
 | `quick-paste.png` | Ctrl+Shift+V 快速粘贴浮层 |

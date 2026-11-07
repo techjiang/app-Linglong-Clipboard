@@ -1,10 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller 打包配置：三平台共用一份。
 
-产出：
-- Windows: dist/玲珑剪切板.exe（单文件，无控制台窗口）
+产出（默认目录模式）：
+- Windows: dist/玲珑剪切板/玲珑剪切板.exe  + 同目录的 Qt 运行库
 - macOS:   dist/玲珑剪切板.app
-- Linux:   dist/linglong-clipboard（单文件）
+- Linux:   dist/linglong-clipboard/linglong-clipboard
+
+**为什么默认目录模式**：单文件模式每次启动都要把 60 MB 的 Qt 解压到临时目录，
+冷启动 3~5 秒，托盘图标在解压期间还是空白的。目录模式启动在 1 秒内。
+安装包本来就会把文件摊到安装目录里，单文件的那点「一个文件」好处在这里等于零，
+代价却全落在用户身上。`LINGLONG_ONEDIR=0` 仍可显式打单文件版。
 
 隐藏导入与排除项都写了注释说明理由，
 否则下次改动时会因为「不知道为什么有这行」而误删。
@@ -16,6 +21,23 @@ from pathlib import Path
 
 project_root = Path(SPECPATH).parent
 src_dir = project_root / "src"
+assets_dir = project_root / "assets"
+
+# ---- 图标 ----
+# 打包进二进制的图标不等于运行时用的图标：
+#   - icon= 只影响 exe/app 自身在资源管理器、任务栏里的那张脸；
+#   - datas 里那份是程序运行时 `setWindowIcon` 读的图。
+# 两者都得给，少一个就有一处是空白方块。
+if sys.platform.startswith("win"):
+    icon_file = str(assets_dir / "icon" / "linglong-clipboard.ico")
+elif sys.platform == "darwin":
+    icon_file = str(assets_dir / "icon" / "linglong-clipboard.icns")
+else:
+    icon_file = None  # Linux 的图标由 .desktop 文件指向，不进二进制
+if icon_file and not Path(icon_file).is_file():
+    raise SystemExit(
+        f"缺少图标文件：{icon_file}\n先跑一次：python packaging/icons.py"
+    )
 
 # ---- 需要显式声明的导入 ----
 # 平台后端是按名称动态导入的（见 platform/__init__.py 的 detect_backend），
@@ -122,7 +144,11 @@ a = Analysis(
     [str(_ENTRY)],
     pathex=[str(src_dir)],
     binaries=[],
-    datas=[],
+    # 运行时资源：图标的多档位图。`assets/icon` 整个目录带进去，
+    # 程序通过 `utils/resources.py` 定位，单文件/目录两种模式都能找到。
+    datas=[
+        (str(assets_dir / "icon"), "assets/icon"),
+    ],
     hiddenimports=hidden_imports,
     hookspath=[],
     hooksconfig={},
@@ -139,7 +165,9 @@ pyz = PYZ(a.pure)
 # 单文件还是目录模式由 build.py 通过环境变量传递。
 # 不能给 PyInstaller 同时传 .spec 和 --onefile/--onedir（它会直接报错拒绝），
 # 所以这个选择只能写在 spec 的结构里：onefile = 内联 binaries 且没有 COLLECT。
-ONEDIR = os.environ.get("LINGLONG_ONEDIR", "0") == "1"
+#: 默认目录模式（安装包里单文件没有好处，只有更慢的启动）。
+#: 显式 `LINGLONG_ONEDIR=0` 才打单文件版。
+ONEDIR = os.environ.get("LINGLONG_ONEDIR", "1") != "0"
 
 exe = EXE(
     pyz,
@@ -147,7 +175,12 @@ exe = EXE(
     [] if ONEDIR else a.binaries,
     [] if ONEDIR else a.datas,
     [],
-    name="linglong-clipboard" if sys.platform != "win32" else "玲珑剪切板",
+    # 可执行文件名统一用 ASCII。中文 exe 名在跨平台打包链路上是雷：
+    # Wine 里的代码页、Linux 版 NSIS 的 File 指令、zip 解压后的编码，
+    # 每一处都可能把它弄丢或弄乱 —— 实测 NSIS 编译能过，但写盘时主 exe
+    # 直接消失，装出来只剩 _internal 和卸载器。
+    # 界面上显示的中文名由快捷方式、窗口标题、安装向导负责，这与文件名无关。
+    name="linglong-clipboard",
     # 目录模式：EXE 只是 COLLECT 的输入，不该落到 dist/ 里和目录同名
     exclude_binaries=ONEDIR,
     debug=False,
@@ -162,8 +195,9 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # macOS 需要 .app 包才能出现在 Dock 与「应用程序」里
-    icon=None,
+    # macOS 需要 .app 包才能出现在 Dock 与「应用程序」里；
+    # Windows 的 .exe 靠它才有资源管理器里那张图。
+    icon=icon_file,
     bundle_identifier="cool.cnb.linglong.clipboard" if sys.platform == "darwin" else None,
 )
 
@@ -177,5 +211,10 @@ if ONEDIR:
         a.datas,
         strip=not sys.platform.startswith("win"),
         upx=False,
-        name="linglong-clipboard" if sys.platform != "win32" else "玲珑剪切板",
+        # 可执行文件名统一用 ASCII。中文 exe 名在跨平台打包链路上是雷：
+    # Wine 里的代码页、Linux 版 NSIS 的 File 指令、zip 解压后的编码，
+    # 每一处都可能把它弄丢或弄乱 —— 实测 NSIS 编译能过，但写盘时主 exe
+    # 直接消失，装出来只剩 _internal 和卸载器。
+    # 界面上显示的中文名由快捷方式、窗口标题、安装向导负责，这与文件名无关。
+    name="linglong-clipboard",
     )
