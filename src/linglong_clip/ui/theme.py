@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
+
+from PySide6.QtWidgets import QProxyStyle
 
 
 @dataclass(frozen=True)
@@ -92,8 +94,102 @@ KIND_COLORS: Dict[str, str] = {
 }
 
 
+#: 主题配置的合法取值，与设置页下拉一一对应
+THEME_VALUES = ("system", "light", "dark")
+
+
+def _system_prefers_light() -> bool:
+    """系统当前是不是浅色外观。
+
+    `ui.theme` 默认是 `system`，而此前 `palette_for()` 把「跟随系统」
+    直接当成深色 —— 也就是说选了「跟随系统」的用户，在白色桌面上
+    也永远拿到暗色窗口，连浅色主题长什么样都看不到。
+
+    只读 Qt 的 `colorScheme`，不自己去猜桌面环境：Windows / macOS /
+    GNOME / KDE 都会把它报给 Qt，自己按平台名判断反而会漏。
+    """
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QGuiApplication
+
+        app = QGuiApplication.instance()
+        if app is None:
+            return False
+        scheme = app.styleHints().colorScheme()
+        return scheme == Qt.ColorScheme.Light
+    except Exception:  # noqa: BLE001 - 取不到就按深色，界面不该因此打不开
+        return False
+
+
+def resolve_theme(theme: str) -> str:
+    """把配置里的主题值解析成实际渲染用的一档（`light` / `dark`）。
+
+    只有显式写了 `system`（或没写）才去问系统偏好；认不出来的值一律按
+    深色处理。认不出来往往是配置被手工改坏，此时「猜一个」比「按默认」
+    更容易让人困惑 —— 而且系统的深浅色本来就是会被用户改的东西，
+    拿它解释一个拼错的配置值，等于把一个谜面换成另一个谜面。
+    """
+    text = str(theme or "").strip().lower()
+    if text == "light":
+        return "light"
+    if text in ("system", ""):
+        return "light" if _system_prefers_light() else "dark"
+    return "dark"
+
+
 def palette_for(theme: str) -> Palette:
-    return LIGHT if theme == "light" else DARK
+    return LIGHT if resolve_theme(theme) == "light" else DARK
+
+
+def apply_palette(palette: Palette, target=None) -> None:
+    """把色板同步到 Qt 的 `QPalette`。
+
+    QSS 只负责 `build_stylesheet()` 里显式写到的部件。**没写到的部分由
+    `QPalette` 决定**，而 `QPalette` 默认来自系统主题：白色桌面上启动，
+    深色界面里那些没被 QSS 覆盖的原生绘制（勾选框底板、下拉箭头、
+    滚动条轨道、禁用态文字）就仍是浅色 —— 深底上画浅色，勾选框整个
+    看不见，用户只能看到一团灰。
+
+    此前只有 QSS、没有这一步，所以「勾选框看不出勾没勾」不是某个控件的
+    样式写漏了，而是这条链路缺了一环。`build_stylesheet()` 能盖住的
+    控件越多，这一环越不明显，但永远盖不全。
+    """
+    from PySide6.QtGui import QColor, QGuiApplication, QPalette
+
+    def color(value: str) -> QColor:
+        return QColor(value)
+
+    qpal = QPalette()
+    qpal.setColor(QPalette.ColorRole.Window, color(palette.bg))
+    qpal.setColor(QPalette.ColorRole.WindowText, color(palette.text))
+    qpal.setColor(QPalette.ColorRole.Base, color(palette.surface))
+    qpal.setColor(QPalette.ColorRole.AlternateBase, color(palette.surface_hover))
+    qpal.setColor(QPalette.ColorRole.Text, color(palette.text))
+    qpal.setColor(QPalette.ColorRole.Button, color(palette.surface))
+    qpal.setColor(QPalette.ColorRole.ButtonText, color(palette.text_dim))
+    qpal.setColor(QPalette.ColorRole.BrightText, color("#ffffff"))
+    qpal.setColor(QPalette.ColorRole.Highlight, color(palette.accent))
+    qpal.setColor(QPalette.ColorRole.HighlightedText, color(palette.accent_text))
+    qpal.setColor(QPalette.ColorRole.PlaceholderText, color(palette.text_faint))
+    qpal.setColor(QPalette.ColorRole.ToolTipBase, color(palette.surface))
+    qpal.setColor(QPalette.ColorRole.ToolTipText, color(palette.text))
+    # Light/Mid/Dark 是原生控件 3D 描边的灰度阶梯。给成中性的边框色，
+    # 深浅两套主题下都不会出现「白色高光边」。
+    qpal.setColor(QPalette.ColorRole.Light, color(palette.border))
+    qpal.setColor(QPalette.ColorRole.Midlight, color(palette.border))
+    qpal.setColor(QPalette.ColorRole.Mid, color(palette.text_faint))
+    qpal.setColor(QPalette.ColorRole.Dark, color(palette.text_dim))
+    qpal.setColor(QPalette.ColorRole.Shadow, color(palette.bg_alt))
+    for role in (
+        QPalette.ColorRole.WindowText,
+        QPalette.ColorRole.Text,
+        QPalette.ColorRole.ButtonText,
+    ):
+        qpal.setColor(QPalette.ColorGroup.Disabled, role, color(palette.text_faint))
+
+    application = target if target is not None else QGuiApplication.instance()
+    if application is not None:
+        application.setPalette(qpal)
 
 
 def _kind_border_rules(palette: Palette) -> str:
@@ -451,13 +547,20 @@ QSpinBox, QComboBox, QLineEdit {{
     padding: 5px 8px;
     color: {p.text};
 }}
+/* 右侧留出按钮的宽度：不留的话「300 ms」会顶到上下箭头下面，
+   数字被箭头压掉一截，看起来像显示不全。 */
+QSpinBox, QComboBox {{
+    padding-right: 22px;
+}}
 QSpinBox:focus, QComboBox:focus, QLineEdit:focus {{
     border-color: {p.accent};
 }}
-QComboBox::drop-down {{
-    border: none;
-    width: 20px;
-}}
+/* 刻意不给 `QComboBox::drop-down` / `::down-arrow` 设规则：
+   一旦覆盖过子控件，Qt 就不再画默认的箭头，需要自己提供图片。
+   曾写过 `QComboBox::drop-down {{ border:none; width:20px; }}`，结果
+   下拉框里那个箭头整块消失 —— 用户看到的是一个「不知道能不能点」的输入框。
+   同理，QSpinBox 的上下箭头交给 `IndicatorStyle` 用矢量画（见下），
+   不依赖任何位图资源。 */
 QComboBox QAbstractItemView {{
     background-color: {p.surface};
     border: 1px solid {p.border};
@@ -467,6 +570,12 @@ QTabWidget::pane {{
     border: 1px solid {p.border};
     border-radius: 8px;
     background-color: {p.surface};
+}}
+/* 设置页每页内容放在滚动区里。QScrollArea 的视口默认吃 QPalette.Base，
+   不清掉的话页面上会浮出一块与对话框底色不同的矩形，看着像内容错位。 */
+QScrollArea#SettingsPage, QScrollArea#SettingsPage > QWidget > QWidget {{
+    background: transparent;
+    border: none;
 }}
 QTabBar::tab {{
     background: transparent;
@@ -495,6 +604,201 @@ QGroupBox::title {{
     font-weight: 600;
 }}
 """
+
+
+class IndicatorStyle(QProxyStyle):
+    """把勾选框、单选框、下拉/微调箭头改成矢量绘制。
+
+    为什么需要它：`build_stylesheet()` 给这些控件设了底板（深色背景 +
+    边框），而**图标本身仍由样式画**。在深色主题下这些图标跟着
+    `QPalette` 走，白色桌面启动时会拿到浅色图标 —— 深底浅边，勾选框
+    只剩一个几乎看不见的方块，用户根本看不出自己勾没勾。这是实测
+    截图上「设置页每个选项都像没勾」的直接原因。
+
+    用矢量而不是几张 PNG：图标要在 100%~200% 缩放下都清楚，也要跟着
+    主题换色。位图方案要按 DPI × 主题各备一套，迟早漏一个。
+
+    接在原生样式外面（`QProxyStyle(base)`）而不是自己从零画：按钮、
+    滚动条、输入框的其余部分继续用平台实现，只接管那几个图标。
+    """
+
+    #: 箭头宽度/高度，单位像素（逻辑像素，高分屏由 Qt 自己缩放）
+    ARROW_HALF_WIDTH = 3.5
+    ARROW_HALF_HEIGHT = 2.6
+
+    def __init__(self, base: str = "Fusion") -> None:
+        super().__init__(base)
+        #: 当前主题的色板，由 `apply_theme()` 设置
+        self._palette: Optional[Palette] = None
+
+    def set_palette_spec(self, palette: Palette) -> None:
+        self._palette = palette
+
+    # ---- 取色 ----
+
+    def _text_color(self, widget):
+        from PySide6.QtGui import QColor, QPalette
+
+        if widget is not None:
+            return widget.palette().color(QPalette.ColorRole.WindowText)
+        if self._palette is not None:
+            return QColor(self._palette.text)
+        return QColor("#eef1f7")
+
+    def _border_color(self, widget):
+        from PySide6.QtGui import QColor
+
+        if self._palette is not None:
+            return QColor(self._palette.text_faint)
+        return self._text_color(widget)
+
+    def _accent_color(self, widget):
+        from PySide6.QtGui import QColor
+
+        if self._palette is not None:
+            return QColor(self._palette.accent)
+        return self._text_color(widget)
+
+    # ---- 绘制 ----
+
+    def drawPrimitive(self, element, option, painter, widget=None) -> None:  # noqa: N802 - Qt 命名
+        from PySide6.QtWidgets import QStyle
+
+        arrows = {
+            QStyle.PrimitiveElement.PE_IndicatorArrowDown: 1,
+            QStyle.PrimitiveElement.PE_IndicatorSpinDown: 1,
+            QStyle.PrimitiveElement.PE_IndicatorArrowUp: -1,
+            QStyle.PrimitiveElement.PE_IndicatorSpinUp: -1,
+        }
+        if element in arrows:
+            self._draw_arrow(element, arrows[element], option, painter, widget)
+            return
+
+        if element in (
+            QStyle.PrimitiveElement.PE_IndicatorCheckBox,
+            QStyle.PrimitiveElement.PE_IndicatorRadioButton,
+        ):
+            self._draw_tick(
+                element == QStyle.PrimitiveElement.PE_IndicatorRadioButton,
+                option,
+                painter,
+                widget,
+            )
+            return
+
+        super().drawPrimitive(element, option, painter, widget)
+
+    def _draw_arrow(self, element, sign: int, option, painter, widget) -> None:
+        from PySide6.QtCore import QPointF
+        from PySide6.QtGui import QPainter, QPen, QPolygonF
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = option.rect
+        cx = rect.center().x() + 0.5
+        cy = rect.center().y() + 0.5
+        half_w = self.ARROW_HALF_WIDTH
+        half_h = self.ARROW_HALF_HEIGHT
+        if sign > 0:
+            points = [
+                QPointF(cx - half_w, cy - half_h),
+                QPointF(cx + half_w, cy - half_h),
+                QPointF(cx, cy + half_h),
+            ]
+        else:
+            points = [
+                QPointF(cx - half_w, cy + half_h),
+                QPointF(cx + half_w, cy + half_h),
+                QPointF(cx, cy - half_h),
+            ]
+        color = self._text_color(widget)
+        painter.setPen(QPen(color, 1.2))
+        painter.setBrush(color)
+        painter.drawPolygon(QPolygonF(points))
+        painter.restore()
+
+    def _draw_tick(self, radio: bool, option, painter, widget) -> None:
+        from PySide6.QtCore import QPointF, QRectF, Qt
+        from PySide6.QtGui import QColor, QPainter, QPen
+        from PySide6.QtWidgets import QStyle
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        state = option.state
+        checked = bool(state & QStyle.StateFlag.State_On)
+        enabled = bool(state & QStyle.StateFlag.State_Enabled)
+        partially = bool(state & QStyle.StateFlag.State_NoChange)
+        rect = QRectF(option.rect).adjusted(0.5, 0.5, -0.5, -0.5)
+
+        accent = self._accent_color(widget)
+        outline = self._border_color(widget)
+        if not enabled:
+            outline = QColor(outline)
+            outline.setAlpha(110)
+
+        if checked or partially:
+            painter.setBrush(accent)
+            painter.setPen(QPen(accent, 1))
+            if radio:
+                painter.drawEllipse(rect)
+            else:
+                painter.drawRoundedRect(rect, 3, 3)
+            # 对勾用底色画，深浅两套主题下都和强调色有足够对比
+            mark = QColor("#ffffff" if accent.lightness() < 170 else "#14161c")
+            pen = QPen(mark, 1.8)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            if partially:
+                painter.drawLine(
+                    QPointF(rect.left() + 3, rect.center().y()),
+                    QPointF(rect.right() - 3, rect.center().y()),
+                )
+            else:
+                painter.drawPolyline(
+                    [
+                        QPointF(rect.left() + rect.width() * 0.24, rect.center().y()),
+                        QPointF(rect.center().x() - 0.5, rect.bottom() - rect.height() * 0.26),
+                        QPointF(rect.right() - rect.width() * 0.22, rect.top() + rect.height() * 0.28),
+                    ]
+                )
+        else:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(outline, 1.2))
+            if radio:
+                painter.drawEllipse(rect)
+            else:
+                painter.drawRoundedRect(rect, 3, 3)
+        painter.restore()
+
+
+def install_style(palette: Palette, application=None) -> Optional["IndicatorStyle"]:
+    """把 `IndicatorStyle` 装到应用上，并同步配色。
+
+    必须走 `QApplication.setStyle()` 而不是给单个控件设：勾选框、下拉框、
+    微调框散落在主窗口、设置页、转换结果窗口、快速粘贴浮层四处，
+    逐个装等于把「漏一个」留成常态。
+
+    返回装上的样式对象；拿不到 `QApplication` 时返回 None（测试里用桩
+    应用时会走到这条路，不该因此报错）。
+    """
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtWidgets import QApplication
+
+    target = application if application is not None else QGuiApplication.instance()
+    if not isinstance(target, QApplication):
+        return None
+
+    current = target.style()
+    if isinstance(current, IndicatorStyle):
+        style = current
+    else:
+        style = IndicatorStyle(current.objectName() or "Fusion")
+        target.setStyle(style)
+    style.set_palette_spec(palette)
+    return style
 
 
 def toast_style(palette: Palette) -> str:

@@ -34,13 +34,15 @@ def dialog(config, qt_app):
 
 def test_dialog_reflects_current_config(dialog, config):
     assert dialog._capture_enabled.isChecked() == config.get("capture.enabled")
-    assert dialog._theme.currentText() == config.get("ui.theme")
+    # 主题显示中文文案，值仍是配置里的英文键
+    assert dialog._theme.currentData() == config.get("ui.theme")
+    assert dialog._theme.currentText() != config.get("ui.theme")
     assert dialog._max_items.value() == config.get("history.max_items")
 
 
 def test_dialog_saves_changes(dialog, config):
     dialog._capture_enabled.setChecked(False)
-    dialog._theme.setCurrentText("dark")
+    dialog._theme.setCurrentIndex(dialog._theme.findData("dark"))
     dialog._max_items.setValue(500)
     dialog._save()
 
@@ -1867,3 +1869,78 @@ def test_quick_overlay_stylesheet_on_itself(storage, config, qt_app):
 
     overlay = QuickPasteOverlay(storage, SemanticEngine(storage), config)
     assert overlay.styleSheet() == toast_style(overlay._palette_theme)
+
+
+# ---- 设置页：探测结果不该改写用户的选择 ----
+
+def test_unsupported_primary_keeps_configured_intent(qt_app, home, monkeypatch):
+    """现象：本机读不到主选择区时，光打开设置页点「保存」，配置就被改成关。
+
+    `_refresh_primary_state()` 会把勾去掉（对：勾了也不会生效），
+    而保存时又把界面状态写回配置（错：那是探测结果，不是用户意图）。
+    换到支持的机器上，开关仍然关着，且没有地方能解释为什么。
+    """
+    import linglong_clip.platform as platform_module
+
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    class _NoPrimary:
+        name = "linux"
+
+        def capabilities(self):
+            return {"primary_selection": False}
+
+    monkeypatch.setattr(platform_module, "detect_backend", lambda: _NoPrimary())
+
+    config = Config(home / "config.json")
+    config.set("capture.monitor_primary", True)
+
+    dialog = SettingsDialog(config)
+    assert dialog._monitor_primary.isChecked() is False  # 界面上必须显示成不可用
+    assert "原样保留" in dialog._primary_status.text()  # 并说清保存会怎样
+
+    dialog._save()
+    assert config.get("capture.monitor_primary") is True
+
+
+def test_unsupported_primary_can_still_be_turned_off(qt_app, home, monkeypatch):
+    """开着但本机不支持时，用户仍要能把它关掉（意图是以配置为起点改的）。"""
+    import linglong_clip.platform as platform_module
+
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    class _WithPrimary:
+        name = "linux"
+
+        def capabilities(self):
+            return {"primary_selection": True}
+
+    monkeypatch.setattr(platform_module, "detect_backend", lambda: _WithPrimary())
+
+    config = Config(home / "config.json")
+    config.set("capture.monitor_primary", True)
+    dialog = SettingsDialog(config)
+    dialog._monitor_primary.setChecked(False)
+    dialog._save()
+    assert config.get("capture.monitor_primary") is False
+
+
+def test_theme_dropdown_shows_chinese_labels(dialog):
+    """现象：外观页的主题下拉里写着 system / dark / light 三个英文单词。"""
+    labels = [dialog._theme.itemText(i) for i in range(dialog._theme.count())]
+    assert labels == ["跟随系统", "深色", "浅色"]
+    values = [dialog._theme.itemData(i) for i in range(dialog._theme.count())]
+    assert values == ["system", "dark", "light"]
+
+
+def test_theme_dropdown_round_trips_unknown_value(qt_app, home):
+    """配置里躺着认不出的主题值时，下拉要落在「跟随系统」上而不是空白。"""
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    config = Config(home / "config.json")
+    config.set("ui.theme", "darkk")
+    dialog = SettingsDialog(config)
+    assert dialog._theme.currentData() == "system"

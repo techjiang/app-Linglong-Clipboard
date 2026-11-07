@@ -49,7 +49,7 @@ from .quick_paste import QuickPasteOverlay
 from ..utils.selfcheck import run_self_check
 from .settings_dialog import SettingsDialog
 from .icons import window_icon
-from .theme import palette_for
+from .theme import apply_palette, install_style, palette_for
 from .transform_window import TransformWindow
 from .tray import TrayIcon
 
@@ -169,6 +169,10 @@ class Application(QObject):
 
         self.config = Config()
         self._setup_logging()
+        # 主题要在建任何窗口之前落到应用上：QPalette 与样式是全局的，
+        # 窗口构造时就去读它们（勾选框、下拉箭头这些原生绘制都靠这一层）。
+        # 装在后面的话，先建出来的窗口会留着旧配色，直到下一次切主题。
+        self._apply_theme_globally()
 
         self.storage = open_repository(self.config)
         self.backend = detect_backend()
@@ -577,6 +581,19 @@ class Application(QObject):
         self.preview.paste_nth(index)
 
     # ---- 启动与退出 ----
+
+    def _apply_theme_globally(self) -> None:
+        """把当前主题同步到应用级配色与图标样式。
+
+        主题在这个程序里不是「某个窗口的属性」——主窗口、设置页、
+        快速粘贴浮层、转换结果窗口都是独立顶层窗口，各自持有样式表，
+        但勾选框、下拉箭头、禁用态这些**没被 QSS 覆盖的原生绘制**
+        只认应用级的 `QPalette` 与样式。分散在各窗口里设，漏一个的表现
+        就是「这个窗口的勾选框看不见」。
+        """
+        palette = palette_for(self.config.get("ui.theme", "system"))
+        apply_palette(palette, self.qt_app)
+        install_style(palette, self.qt_app)
 
     def _resolve_start_minimized(self) -> bool:
         """决定启动时是否直接进托盘。
@@ -1154,7 +1171,10 @@ class Application(QObject):
             return
 
         self.guard.reload_rules()
+        self._apply_theme_globally()
         self.window.apply_theme(self.config.get("ui.theme", "system"))
+        self.preview.apply_theme(self.config.get("ui.theme", "system"))
+        self.transformer.apply_theme(self.config.get("ui.theme", "system"))
         self.window.apply_density(
             self.config.get("ui.card_density", "comfortable")
         )

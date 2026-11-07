@@ -37,7 +37,7 @@ from ..core.semantic import SemanticEngine
 from ..core.theme_spec import DEFAULT_DENSITY
 from ..core.storage import Storage
 from ..utils.logger import get_logger
-from .empty_state import EmptyStatePanel
+from .empty_state import EmptyStatePanel, EmptyStateScroll
 from .icons import window_icon
 from .item_card import ItemCard, humanize_size, humanize_time, normalize_density  # noqa: F401
 from .theme import Palette, build_stylesheet, palette_for
@@ -277,9 +277,8 @@ class MainWindow(QWidget):
         # 图标走 assets/ 里的多档位图；窗口管理器读的是 WM_HINTS 里的这一份，
         # 不设的话标题栏和任务栏都是系统默认的空白方块。
         self.setWindowIcon(window_icon(self._palette_theme))
-        self.setMinimumSize(QSize(880, 560))
-        self.resize(1180, 720)
         self.setObjectName("Root")
+        self._apply_startup_geometry()
         self.setAcceptDrops(False)
 
         self._search_timer = QTimer(self)
@@ -290,6 +289,47 @@ class MainWindow(QWidget):
         self._build_ui()
         self.setStyleSheet(build_stylesheet(self._palette_theme))
         self.reload()
+
+    #: 有足够屏幕时的理想尺寸
+    PREFERRED_SIZE = (1180, 720)
+    #: 再小就不给缩了 —— 三栏布局（侧栏 + 列表 + 预览）到 880×560 已经是
+    #: 每一栏都还能用的下限
+    COMPACT_SIZE = (760, 480)
+
+    def _apply_startup_geometry(self) -> None:
+        """按当前屏幕算一个放得下的初始尺寸。
+
+        原来写死 `resize(1180, 720)` + 最小 880×560：在 1366×768 的笔记本上
+        窗口比可用区域还高（任务栏一占就更不够），标题栏被顶到屏幕外，
+        按钮栏压在屏幕下沿。用户看到的是「窗口打不开 / 内容被截断」，
+        而不是「这个程序有一点点大」。
+
+        最小尺寸也一起收敛：880×560 在 1024×600 的机器上就是放不下，
+        此时宁可让三栏各窄一点，也不要给一个永远超出屏幕的下限。
+        """
+        from PySide6.QtGui import QGuiApplication
+
+        screen = QGuiApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else None
+        if available is None or available.height() <= 0:
+            self.setMinimumSize(QSize(*self.COMPACT_SIZE))
+            self.resize(*self.PREFERRED_SIZE)
+            return
+
+        # 给标题栏与可能的任务栏留余量
+        usable_width = max(480, available.width() - 40)
+        usable_height = max(360, available.height() - 60)
+        width = min(self.PREFERRED_SIZE[0], usable_width)
+        height = min(self.PREFERRED_SIZE[1], usable_height)
+        # 最小尺寸也得夹到屏幕内：写死一个比屏幕还大的下限，
+        # 窗口会永远有一条边在屏幕外，且用户无法缩小它。
+        self.setMinimumSize(
+            QSize(
+                min(self.COMPACT_SIZE[0], usable_width),
+                min(self.COMPACT_SIZE[1], usable_height),
+            )
+        )
+        self.resize(width, height)
 
     def connect_external(self, signal, slot) -> None:
         """连接一个对外信号，并记下它，供 `shutdown` 断开。
@@ -340,6 +380,9 @@ class MainWindow(QWidget):
         self._palette_theme = palette_for(theme)
         self._preview._palette_theme = self._palette_theme
         self.setStyleSheet(build_stylesheet(self._palette_theme))
+        # 窗口图标也分深浅：小尺寸母版在大底色块上换了一份，
+        # 不跟着换的话浅色主题下标题栏里是个看不清的暗块。
+        self.setWindowIcon(window_icon(self._palette_theme))
         self.reload()
 
     def apply_density(self, density: str) -> None:
@@ -509,12 +552,15 @@ class MainWindow(QWidget):
         layout.addWidget(self._scroll, 1)
 
         # 空历史时的引导面板：直接告诉用户数据存在哪（见 empty_state.py）
-        self._empty_panel = EmptyStatePanel()
+        # 套一层滚动容器：小窗口里这个面板比可视区高，
+        # 直接塞进布局会把底部「卸载程序不会删除这个目录」和按钮压掉。
+        self._empty_scroll = EmptyStateScroll(EmptyStatePanel())
+        self._empty_panel = self._empty_scroll.panel
         self._empty_panel.open_data_dir_requested.connect(self.open_data_dir_requested.emit)
         self._empty_panel.quick_paste_requested.connect(self.quick_paste_requested.emit)
         self._empty_panel.settings_requested.connect(self.settings_requested.emit)
-        self._empty_panel.hide()
-        layout.addWidget(self._empty_panel)
+        self._empty_scroll.hide()
+        layout.addWidget(self._empty_scroll)
 
         return area
 
@@ -610,12 +656,12 @@ class MainWindow(QWidget):
 
         if not self._items:
             self._empty_panel.refresh()
-            self._empty_panel.show()
+            self._empty_scroll.show()
             self._scroll.hide()
             self._preview.show_item(None)
             return
 
-        self._empty_panel.hide()
+        self._empty_scroll.hide()
         self._scroll.show()
 
         for item in self._items:

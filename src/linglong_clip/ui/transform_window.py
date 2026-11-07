@@ -82,6 +82,10 @@ class TransformWindow(QWidget):
         footer.addWidget(close_button)
         layout.addLayout(footer)
 
+    def apply_theme(self, theme: str) -> None:
+        """跟随主窗口换主题（独立顶层窗口，不继承主窗口样式表）。"""
+        self.setStyleSheet(build_stylesheet(palette_for(theme)))
+
     # ---- 展示 ----
 
     def show_result(

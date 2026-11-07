@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -157,6 +158,19 @@ class EmptyStatePanel(QWidget):
         card.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         return card
 
+    def sizeHint(self):  # noqa: N802 - Qt 命名
+        """按内容给足高度。
+
+        默认的 `QWidget.sizeHint` 只看布局的「推荐尺寸」，而这个面板里
+        有 `addStretch`：窗口一变矮，布局就把弹性空间压成负值，卡片被压到
+        比内容还小 —— 最后那行「卸载程序不会删除这个目录」被切掉半截，
+        恰恰是最该读到的一句。这里报布局的最小高度，让外层滚动区决定怎么滚。
+        """
+        layout = self.layout()
+        if layout is None:  # pragma: no cover - 布局必定存在
+            return super().sizeHint()
+        return layout.minimumSize().expandedTo(super().sizeHint())
+
     def refresh(self) -> None:
         """数据目录可能在运行中被改（LINGLONG_CLIPBOARD_HOME），重新读一次。"""
         backend, target = _storage_facts()
@@ -164,3 +178,27 @@ class EmptyStatePanel(QWidget):
             self._path_labels["数据目录"].setText(str(data_dir()))
         if "历史文件" in self._path_labels:
             self._path_labels["历史文件"].setText(str(target))
+
+
+class EmptyStateScroll(QScrollArea):
+    """空状态面板的滚动容器。
+
+    小窗口（1024×600 的笔记本，或 1366×768 开 150% 缩放）里这个面板
+    比可视区高，直接塞进布局会把底部那句「卸载程序不会删除这个目录」
+    和三个按钮一起压掉 —— 而那句话正是这个面板存在的理由。
+    """
+
+    def __init__(self, panel: "EmptyStatePanel", parent: QWidget = None) -> None:
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # 视口默认吃 QPalette.Base，不清掉会在引导页后面浮出一块
+        # 与主背景不同的矩形，看着像内容错位。
+        self.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        self.viewport().setAutoFillBackground(False)
+        self.setWidget(panel)
+        self.panel = panel
+
+    def refresh(self) -> None:
+        self.panel.refresh()

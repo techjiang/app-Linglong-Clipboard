@@ -296,3 +296,321 @@ def test_week_window_has_an_upper_bound(storage):
     assert until > since
     # 本周的终点是「本周日结束」= 本周一 + 6 天，所以跨度是 6 天而非 7 天
     assert round((until - since) / 86400) == 6
+
+
+# ---- 界面：设置页与窗口在真实屏幕上放得下 ----
+#
+# 这一组用例守的是同一件事的两个表现：控件「存在」但用户看不到 / 点不到。
+# 纯逻辑测试测不出来（控件对象都在，`isChecked()` 也读得到），
+# 所以断言的是几何关系：窗口在屏幕内、按钮在窗口内。
+
+def test_settings_dialog_fits_a_short_screen(qt_app, monkeypatch):
+    """现象：768px 高的屏幕上，设置页从 y=0 长到 1282，保存按钮在屏幕外。
+
+    Qt 会把 QDialog 撑到内容的最小高度，「采集」那一页内容就有 1200 多像素。
+    此前是固定 `resize(760, 640)`，于是窗口被内容撑开，按钮点不到 ——
+    用户只能强杀进程，并合理地认为「设置页坏了」。
+    """
+    from PySide6.QtCore import QRect
+    from PySide6.QtGui import QGuiApplication
+
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    class _Screen:
+        """把可用区域伪装成 1024×600 的小屏。"""
+
+        def availableGeometry(self):
+            return QRect(0, 0, 1024, 600)
+
+        def geometry(self):
+            return QRect(0, 0, 1024, 600)
+
+    fake_screen = _Screen()
+    monkeypatch.setattr(
+        QGuiApplication, "primaryScreen", staticmethod(lambda: fake_screen)
+    )
+    monkeypatch.setattr(
+        QGuiApplication, "screenAt", staticmethod(lambda _point: fake_screen)
+    )
+    dialog = SettingsDialog(Config())
+    dialog.show()
+    qt_app.processEvents()
+
+    assert dialog.height() <= 600, f"设置页比屏幕还高：{dialog.height()}"
+    # 保存按钮必须落在窗口内，否则用户点不到它
+    button_bottom = dialog._save_button.mapTo(dialog, dialog._save_button.rect().bottomLeft()).y()
+    assert 0 <= button_bottom <= dialog.height()
+
+
+def test_settings_pages_are_scrollable(qt_app):
+    """内容超出一屏时必须能滚，而不是把整个窗口撑高。"""
+    from PySide6.QtWidgets import QScrollArea
+
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils.config import Config
+
+    dialog = SettingsDialog(Config())
+    pages = dialog.findChildren(QScrollArea, "SettingsPage")
+    assert len(pages) == dialog._tabs.count()
+    for page in pages:
+        assert page.widgetResizable() is True
+        assert page.widget() is not None
+
+
+def test_main_window_fits_a_short_screen(qt_app, storage, config, monkeypatch):
+    """现象：1366×768 的笔记本上主窗口比可用区域还高，标题栏被顶出屏幕。"""
+    from PySide6.QtCore import QRect
+    from PySide6.QtGui import QGuiApplication
+
+    from linglong_clip.core.semantic import SemanticEngine
+    from linglong_clip.ui.main_window import MainWindow
+
+    class _Screen:
+        def availableGeometry(self):
+            return QRect(0, 0, 1024, 600)
+
+        def geometry(self):
+            return QRect(0, 0, 1024, 600)
+
+    monkeypatch.setattr(
+        QGuiApplication, "primaryScreen", staticmethod(lambda: _Screen())
+    )
+    window = MainWindow(storage, config, SemanticEngine(storage))
+    try:
+        assert window.width() <= 1024
+        assert window.height() <= 600
+        # 最小尺寸也不能超过屏幕 —— 否则窗口永远有一条边在屏幕外
+        assert window.minimumWidth() <= 1024
+        assert window.minimumHeight() <= 600
+    finally:
+        window.shutdown()
+
+
+def test_quick_paste_stays_inside_the_screen(qt_app, storage, config, monkeypatch):
+    """现象：小屏上浮层按 22% 定位，9 行时底边跑到屏幕外，提示行被切掉。"""
+    from PySide6.QtCore import QRect
+    from PySide6.QtGui import QGuiApplication
+
+    from linglong_clip.core.models import ClipboardItem, content_hash
+    from linglong_clip.core.semantic import SemanticEngine
+    from linglong_clip.ui.quick_paste import QuickPasteOverlay
+
+    for index in range(12):
+        content = f"第 {index} 条"
+        storage.add(
+            ClipboardItem(kind="text", content=content, hash=content_hash("text", content))
+        )
+
+    class _Screen:
+        def availableGeometry(self):
+            return QRect(0, 0, 1024, 600)
+
+    monkeypatch.setattr(
+        QGuiApplication, "screenAt", staticmethod(lambda _point: _Screen())
+    )
+    overlay = QuickPasteOverlay(storage, SemanticEngine(storage), config)
+    overlay.show_centered()
+    qt_app.processEvents()
+    assert overlay.geometry().bottom() <= 600
+    assert overlay.geometry().top() >= 0
+    overlay.close_overlay()
+
+
+# ---- 界面：主题这件事的三处漏接 ----
+
+def test_theme_palette_reaches_the_application(qt_app):
+    """现象：深色界面里勾选框是深底浅边，看不出勾没勾。
+
+    QSS 只负责它显式写到的部件，其余原生绘制跟着 `QPalette` 走；
+    而此前从未设置过 `QPalette` —— 白色桌面上启动就拿到浅色图标。
+    """
+    from PySide6.QtGui import QPalette
+
+    from linglong_clip.ui.theme import DARK, apply_palette
+
+    apply_palette(DARK, qt_app)
+    assert qt_app.palette().color(QPalette.ColorRole.Window).name() == DARK.bg
+    assert qt_app.palette().color(QPalette.ColorRole.Base).name() == DARK.surface
+    assert qt_app.palette().color(QPalette.ColorRole.Highlight).name() == DARK.accent
+
+
+def test_indicator_style_is_vendor_neutral(qt_app):
+    """勾选/箭头图标由自己画，不依赖位图资源。"""
+    from linglong_clip.ui.theme import IndicatorStyle, install_style, DARK
+
+    style = install_style(DARK, qt_app)
+    assert isinstance(style, IndicatorStyle)
+    assert isinstance(qt_app.style(), IndicatorStyle)
+    assert style._palette is not None
+
+
+def test_overlay_and_transform_follow_theme_switch(qt_app, storage, config):
+    """现象：切到浅色主题后，按快捷键弹出的浮层还是深色。
+
+    浮层与转换窗口是独立顶层窗口，不继承主窗口样式表。
+    此前换主题只重建了主窗口，这两个窗口一直带着启动那一刻的色板。
+    """
+    from linglong_clip.core.automation import AutomationEngine
+    from linglong_clip.core.semantic import SemanticEngine
+    from linglong_clip.ui.quick_paste import QuickPasteOverlay
+    from linglong_clip.ui.transform_window import TransformWindow
+    from linglong_clip.ui.theme import LIGHT, toast_style, build_stylesheet
+
+    overlay = QuickPasteOverlay(storage, SemanticEngine(storage), config)
+    transformer = TransformWindow(config, AutomationEngine())
+
+    overlay.apply_theme("light")
+    transformer.apply_theme("light")
+
+    assert overlay._palette_theme.name == "light"
+    assert overlay.styleSheet() == toast_style(LIGHT)
+    assert transformer.styleSheet() == build_stylesheet(LIGHT)
+
+
+def test_system_theme_consults_the_platform(qt_app, monkeypatch):
+    """现象：选了「跟随系统」，白色桌面上也永远是深色。
+
+    `palette_for()` 此前把 `system` 直接当 dark，`system` 是默认值 ——
+    于是默认配置下浅色主题根本不可能出现。
+    """
+    from linglong_clip.ui import theme as theme_module
+
+    monkeypatch.setattr(theme_module, "_system_prefers_light", lambda: True)
+    assert theme_module.resolve_theme("system") == "light"
+    assert theme_module.palette_for("system").name == "light"
+
+    monkeypatch.setattr(theme_module, "_system_prefers_light", lambda: False)
+    assert theme_module.resolve_theme("system") == "dark"
+    # 显式指定永远优先于系统偏好
+    assert theme_module.resolve_theme("light") == "light"
+    assert theme_module.resolve_theme("dark") == "dark"
+
+
+# ---- 平台提示：别在 Windows/macOS 上指错方向 ----
+
+
+def test_primary_selection_hint_is_platform_aware(qt_app, config, monkeypatch):
+    """现象：Windows / macOS 用户在设置页看到「装 python-xlib 或 xclip/xsel」。
+
+    主选择区是 X11 / Wayland 的概念，那两个平台上压根不存在。报「缺功能」
+    还教用户去装一个不存在的包，比不说更糟 —— 用户会去搜、去装、发现装不上，
+    然后认为软件坏了。
+    """
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils import paths
+
+    dialog = SettingsDialog(config)
+
+    monkeypatch.setattr(paths, "is_linux", lambda: False)
+    monkeypatch.setattr(paths, "is_macos", lambda: False)
+    windows_text = dialog._primary_unavailable_text()
+    assert "python-xlib" not in windows_text
+    assert "没有主选择区" in windows_text
+
+    monkeypatch.setattr(paths, "is_macos", lambda: True)
+    mac_text = dialog._primary_unavailable_text()
+    assert "python-xlib" not in mac_text
+    assert "macOS" in mac_text
+
+    # Linux 上仍然要给可操作的安装建议 —— 那里确实缺库
+    monkeypatch.setattr(paths, "is_linux", lambda: True)
+    monkeypatch.setattr(paths, "is_macos", lambda: False)
+    assert "xclip" in dialog._primary_unavailable_text()
+
+
+def test_native_history_hint_is_platform_aware(qt_app, config, monkeypatch):
+    """现象：Linux 与 macOS 上也写「需要 Windows 10 1809+」。
+
+    用户既不知道自己该做什么，也无从判断这功能跟自己有没有关系。
+    """
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+    from linglong_clip.utils import paths
+
+    dialog = SettingsDialog(config)
+
+    monkeypatch.setattr(paths, "is_windows", lambda: False)
+    monkeypatch.setattr(paths, "is_macos", lambda: False)
+    linux_text = dialog._native_history_unavailable_text()
+    assert "Windows 10 1809" not in linux_text
+    assert "Linux" in linux_text
+
+    monkeypatch.setattr(paths, "is_linux", lambda: False)
+    monkeypatch.setattr(paths, "is_macos", lambda: True)
+    mac_text = dialog._native_history_unavailable_text()
+    assert "Windows 10 1809" not in mac_text
+    assert "macOS" in mac_text
+
+    # Windows 上才是那句话该出现的地方
+    monkeypatch.setattr(paths, "is_macos", lambda: False)
+    monkeypatch.setattr(paths, "is_windows", lambda: True)
+    assert "1809" in dialog._native_history_unavailable_text()
+
+
+# ---- 「关于」页：装成安装版的用户手里没有 README ----
+
+
+def test_about_tab_lists_author_and_channels(qt_app, config):
+    """现象：「关于」页只有版本号和运行环境。
+
+    用户想问「这是谁做的、去哪反馈、有没有新版本」，界面上一个入口都没有。
+    """
+    from PySide6.QtWidgets import QLabel
+
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+
+    dialog = SettingsDialog(config)
+    page = dialog._build_about_tab()
+    joined = "\n".join(label.text() for label in page.findChildren(QLabel))
+
+    assert "科技酱" in joined
+    assert "同一个世界" in joined
+    assert "asoe.cn" in joined
+    assert "291974598" in joined
+
+
+def test_author_channels_defined_once():
+    """作者信息只存一处，界面与文档都从这里取 —— 两处各写一份迟早分叉。"""
+    from linglong_clip import AUTHOR, AUTHOR_CHANNELS, AUTHOR_QQ_GROUPS
+
+    assert AUTHOR == "科技酱"
+    urls = dict(AUTHOR_CHANNELS)
+    assert urls["主站"] == "https://www.asoe.cn"
+    assert urls["技术文档"] == "https://docs.asoe.cn"
+    assert urls["GitHub"] == "https://github.com/techjiang/"
+    assert urls["哔哩哔哩"] == "https://space.bilibili.com/1768832152"
+    assert urls["玲珑论坛"] == "https://forums.asoe.cn/"
+    assert urls["邮箱"] == "official@tech.asoe.cn"
+    assert AUTHOR_QQ_GROUPS == ("291974598", "474819022", "631167288")
+
+
+# ---- 空状态引导页：矮窗口里别把最该读的那句切掉 ----
+
+
+def test_empty_state_panel_is_scrollable(qt_app, storage, config):
+    """现象：540px 高的主窗口里，「卸载程序不会删除这个目录」被切掉半截。
+
+    面板内部有 addStretch，窗口一变矮布局就把弹性空间压成负值，
+    卡片被压到比内容还小。而那句话正是这个面板存在的理由 ——
+    「装完软件我的数据会不会被删」。
+    """
+    from PySide6.QtWidgets import QLabel
+
+    from linglong_clip.core.automation import AutomationEngine
+    from linglong_clip.core.semantic import SemanticEngine
+    from linglong_clip.ui.main_window import MainWindow
+
+    window = MainWindow(storage, config, SemanticEngine(storage), AutomationEngine())
+    window.resize(900, 540)
+    window.reload()
+    qt_app.processEvents()
+
+    assert window._empty_scroll.widgetResizable()
+    panel = window._empty_panel
+    notes = [
+        label for label in panel.findChildren(QLabel)
+        if label.objectName() == "EmptyStateNote"
+    ]
+    assert notes, "引导页缺少「卸载程序不会删除这个目录」那句说明"
+    # 面板要按内容报高度，否则外层滚动区无从滚起
+    assert panel.sizeHint().height() >= panel.layout().minimumSize().height()

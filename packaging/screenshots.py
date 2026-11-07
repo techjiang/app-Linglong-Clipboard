@@ -60,6 +60,14 @@ def seed_storage(storage) -> None:
 def _render(widget, target: Path) -> None:
     from PySide6.QtWidgets import QApplication
 
+    # 设置页在屏幕上是「限高 + 滚动」的（内容 1200px 高，屏幕可能只有 600px）。
+    # 截图要的是整页内容，所以先把窗口高度放到这一页的真实高度，
+    # 否则滚出视野的那半页永远拍不进图。
+    if hasattr(widget, "fit_height_to_page"):
+        widget.show()
+        QApplication.processEvents()
+        widget.fit_height_to_page(limit=1500)
+
     widget.show()
     widget.repaint()
     QApplication.processEvents()

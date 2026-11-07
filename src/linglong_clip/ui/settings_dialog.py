@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
-    QDialogButtonBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -91,7 +90,6 @@ class SettingsDialog(QDialog):
 
         self.setWindowTitle("设置 — 玲珑剪切板")
         self.setWindowIcon(window_icon(palette_for(self._config.get("ui.theme", "system"))))
-        self.resize(760, 640)
         # 独立窗口必须自己套一层全局样式表：QSS 不会从父窗口继承，
         # 不设的话设置页是系统默认灰白外观，和主界面完全脱节。
         self.setStyleSheet(
@@ -100,24 +98,103 @@ class SettingsDialog(QDialog):
 
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
-        tabs.addTab(self._build_capture_tab(), "采集")
-        tabs.addTab(self._build_privacy_tab(), "隐私")
-        tabs.addTab(self._build_sync_tab(), "同步")
-        tabs.addTab(self._build_ui_tab(), "外观")
-        tabs.addTab(self._build_automation_tab(), "自动化")
-        tabs.addTab(self._build_about_tab(), "关于")
-        layout.addWidget(tabs)
+        # 每页都装进滚动区：一页内容 1200px 高而屏幕可能只有 600px，
+        # 不给滚动条的话 Qt 会把整个窗口撑高，「保存」直接被推出屏幕。
+        # 滚的是页内容、不是窗口，按钮就永远在看得见的地方。
+        tabs.addTab(self._scrollable(self._build_capture_tab()), "采集")
+        tabs.addTab(self._scrollable(self._build_privacy_tab()), "隐私")
+        tabs.addTab(self._scrollable(self._build_sync_tab()), "同步")
+        tabs.addTab(self._scrollable(self._build_ui_tab()), "外观")
+        tabs.addTab(self._scrollable(self._build_automation_tab()), "自动化")
+        tabs.addTab(self._scrollable(self._build_about_tab()), "关于")
+        layout.addWidget(tabs, 1)
+        self._tabs = tabs
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        # 中文界面里按钮文案也要跟着走：Qt 自带翻译不一定加载，
-        # 直接把默认的 OK / Cancel 改掉更可靠。
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("保存")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        buttons.accepted.connect(self._save)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        # 不用 `QDialogButtonBox` 的标准按钮：它带的是平台主题图标
+        # （Linux 上是一个绿色箭头 + 一个红叉），既和这套配色打架，
+        # 也会因为图标比文字宽而把「保存 / 取消」挤到不像一组。
+        # 两个普通按钮 + 明确的主次，反而更清楚。
+        button_row = QHBoxLayout()
+        button_row.setSpacing(8)
+        button_row.addStretch(1)
+        cancel_button = QPushButton("取消")
+        cancel_button.clicked.connect(self.reject)
+        button_row.addWidget(cancel_button)
+        save_button = QPushButton("保存")
+        save_button.setObjectName("Primary")
+        save_button.setDefault(True)
+        save_button.clicked.connect(self._save)
+        button_row.addWidget(save_button)
+        layout.addLayout(button_row)
+        self._save_button = save_button
+        self._cancel_button = cancel_button
+        self._fit_to_screen()
+
+    # ---- 尺寸 ----
+
+    def _fit_to_screen(self, preferred=(760, 640)) -> None:
+        """把窗口收敛到当前屏幕放得下的尺寸。
+
+        「采集」这一页的内容有 1200 多像素高，而对话框此前用固定
+        `resize(760, 640)`：Qt 会把窗口撑到内容的最小高度，
+        于是屏幕只有 768 像素高的机器上，窗口从 y=0 一直伸到 1282 ——
+        **「保存」「取消」两个按钮落在屏幕外，点不到**。用户只能强杀进程，
+        而且会合理地认为「设置页坏了」。
+
+        所以这里做两件事：把每页内容装进滚动区（见 `_scrollable()`），
+        再把窗口尺寸夹到屏幕可用区域内。夹完之后窗口内所有控件都可达，
+        因为内容超出时滚的是页内容，不是整个窗口。
+        """
+        from PySide6.QtGui import QGuiApplication
+
+        screen = QGuiApplication.screenAt(self.cursor().pos()) or QGuiApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else None
+        width, height = preferred
+        if available is not None and available.height() > 0:
+            # 留出标题栏与任务栏的余量，别算得太满
+            height = min(height, max(360, available.height() - 80))
+            width = min(width, max(420, available.width() - 80))
+        self.resize(width, height)
+        self.setMinimumSize(420, 360)
+
+    @staticmethod
+    def _scrollable(page: QWidget) -> QWidget:
+        """给一页内容套上纵向滚动。
+
+        背景必须显式透明：`QScrollArea` 的视口自带 `QPalette.Base`，
+        不设的话每页上会有一块与对话框底色不同的矩形。
+        """
+        from PySide6.QtWidgets import QFrame, QScrollArea
+
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QFrame.Shape.NoFrame)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        area.setWidget(page)
+        area.setObjectName("SettingsPage")
+        area.viewport().setAutoFillBackground(False)
+        page.setAutoFillBackground(False)
+        return area
+
+    def fit_height_to_page(self, limit: int = 0) -> None:
+        """把窗口高度调到当前这一页的内容高度。
+
+        屏幕上运行的设置页是「限高 + 滚动」的（见 `_fit_to_screen()`），
+        但文档截图需要把整页内容一次拍全 —— 滚动条背后那半页拍不进图，
+        README 里就会出现「设置页看着只有三行」的错觉。
+
+        `limit` 给一个上限（0 表示不设限），截图时按需传。
+        """
+        from PySide6.QtWidgets import QScrollArea
+
+        page = self._tabs.currentWidget()
+        if not isinstance(page, QScrollArea) or page.widget() is None:
+            return
+        chrome = self.height() - page.height()
+        needed = page.widget().sizeHint().height() + chrome
+        if limit:
+            needed = min(needed, limit)
+        self.resize(self.width(), max(360, needed))
 
     # ---- 各标签页 ----
 
@@ -164,9 +241,17 @@ class SettingsDialog(QDialog):
         form.addRow("单条最大字符数", self._max_length)
 
         self._monitor_primary = QCheckBox("同时记录主选择区（选中即记录）")
-        self._monitor_primary.setChecked(
-            bool(self._config.get("capture.monitor_primary", False))
+        #: 配置里「用户想要的样子」，与界面上那个勾分开记。
+        #:
+        #: 本机不支持主选择区时 `_refresh_primary_state()` 会把勾去掉，
+        #: 而保存时又把界面上的状态写回配置 —— 于是仅仅打开一次设置页、
+        #: 点个「保存」，用户原来的设置就被一次探测结果抹掉了。
+        #: 换到支持的机器上（或装上 xclip）之后，那个开关仍然关着，
+        #: 而且找不到任何地方解释为什么。
+        self._monitor_primary_wanted = bool(
+            self._config.get("capture.monitor_primary", False)
         )
+        self._monitor_primary.setChecked(self._monitor_primary_wanted)
         self._monitor_primary.setToolTip(
             "Linux（X11 / Wayland）上「选中文字」和「复制」是两条互不相干的通道。\n"
             "开启后，选中一段文字就会进历史，不必再按 Ctrl+C。\n"
@@ -178,7 +263,10 @@ class SettingsDialog(QDialog):
         self._primary_status.setWordWrap(True)
         form.addRow("主选择区", self._primary_status)
         self._refresh_primary_state()
-        # 勾选状态直接跟随可用性：不支持时禁用，而不是留一个按了没反应的开关
+        # 勾选状态直接跟随可用性：不支持时禁用，而不是留一个按了没反应的开关。
+        # 只在开关可用时记下用户意图 —— 禁用状态下的 setChecked(False)
+        # 是「本机做不到」，不是「用户不想」。
+        self._monitor_primary.toggled.connect(self._on_monitor_primary_toggled)
         self._monitor_primary.toggled.connect(self._refresh_primary_state)
 
         self._primary_interval = QSpinBox()
@@ -336,6 +424,12 @@ class SettingsDialog(QDialog):
         except Exception:  # noqa: BLE001 - 状态展示失败不该挡住设置页
             self._ocr_status.setText("无法探测（不影响其它功能）")
 
+    def _on_monitor_primary_toggled(self, checked: bool) -> None:
+        """记住用户对「记录主选择区」的真实意图（仅当开关可用时）。"""
+        if not self._monitor_primary.isEnabled():
+            return
+        self._monitor_primary_wanted = bool(checked)
+
     def _refresh_primary_state(self) -> None:
         """探测主选择区到底读不读得到，并据此决定开关是否可动。
 
@@ -354,13 +448,35 @@ class SettingsDialog(QDialog):
 
         self._monitor_primary.setEnabled(supported)
         if supported:
+            self._monitor_primary.setChecked(self._monitor_primary_wanted)
             self._primary_status.setText(
                 "可用 · 选中文字即进历史，与剪贴板记录走同一套隐私判定"
             )
             return
 
         self._monitor_primary.setChecked(False)
-        self._primary_status.setText(
+        status = self._primary_unavailable_text()
+        if self._monitor_primary_wanted:
+            # 区分「你本来就没开」和「你开着但这台机器读不到」：
+            # 后者保存后配置保持不变，换台机器就好，得说清楚。
+            status += "\n配置里是开启的，本机读取不到，保存后会原样保留这一设置。"
+        self._primary_status.setText(status)
+
+    def _primary_unavailable_text(self) -> str:
+        """按平台给出「为什么没有主选择区」。
+
+        此前不分平台，一律写「X11 需要 python-xlib 或 xclip / xsel；
+        Wayland 需要 wl-clipboard」。Windows / macOS 用户看到的是
+        一段跟自己系统无关的说明，还会去找一个在那两个平台上根本
+        不存在的东西 —— 报「缺功能」还指错方向，比不说更糟。
+        """
+        from ..utils.paths import is_linux, is_macos
+
+        if is_macos():
+            return "不可用 · macOS 没有主选择区这个概念（复制与选中是同一件事）"
+        if not is_linux():
+            return "不可用 · 当前系统没有主选择区这个概念（Linux 桌面专属功能）"
+        return (
             "不可用 · 本机没有可读主选择区的通道（X11 需要 python-xlib "
             "或 xclip / xsel；Wayland 需要 wl-clipboard）"
         )
@@ -402,11 +518,32 @@ class SettingsDialog(QDialog):
             )
             self._native_import_button.setEnabled(True)
         else:
-            self._native_import_status.setText(
-                "不可用 · 需要 Windows 10 1809+ 且在「设置 → 系统 → 剪贴板」"
-                "里打开历史（其它平台由系统决定，程序侧无法补齐）"
-            )
+            self._native_import_status.setText(self._native_history_unavailable_text())
             self._native_import_button.setEnabled(False)
+
+    @staticmethod
+    def _native_history_unavailable_text() -> str:
+        """按平台说明为什么读不到系统历史。
+
+        原来无论哪个平台都写「需要 Windows 10 1809+ ……」。于是在
+        Windows 11 上（历史被关掉时）、Linux 上、macOS 上，用户看到的
+        是同一句话：既不知道自己该做什么，也不知道这功能跟自己有没有关系。
+        """
+        from ..utils.paths import is_linux, is_macos, is_windows
+
+        if is_windows():
+            return (
+                "不可用 · 请先在「设置 → 系统 → 剪贴板」里打开剪贴板历史"
+                "（需要 Windows 10 1809 及以上），再回到这里点导入"
+            )
+        if is_macos():
+            return "不可用 · macOS 没有对第三方开放剪贴板历史（系统侧不提供该接口）"
+        if is_linux():
+            return (
+                "不可用 · Linux 桌面没有系统级剪贴板历史；"
+                "需要开机之前的记录请用「同步」把其它设备的历史拉过来"
+            )
+        return "不可用 · 当前系统不提供剪贴板历史接口"
 
     def _run_native_history_import(self) -> None:
         """真的执行一次导入，并把结果（含被拦下的条数）摊给用户看。"""
@@ -933,8 +1070,15 @@ class SettingsDialog(QDialog):
         form = QFormLayout(group)
 
         self._theme = QComboBox()
-        self._theme.addItems(["system", "dark", "light"])
-        self._theme.setCurrentText(str(self._config.get("ui.theme", "system")))
+        # 显示文案走中文、值仍是配置里的英文键。此前直接把 `system/dark/light`
+        # 塞进下拉，界面上一眼看到三个英文单词 —— 而这个程序其余部分全中文，
+        # 用户会以为这是某种「内部标识」，不知道该选哪个。
+        for label, value in (("跟随系统", "system"), ("深色", "dark"), ("浅色", "light")):
+            self._theme.addItem(label, value)
+        current_theme = str(self._config.get("ui.theme", "system"))
+        index = self._theme.findData(current_theme)
+        self._theme.setCurrentIndex(index if index >= 0 else 0)
+        self._theme.setToolTip("「跟随系统」会读系统当前的深浅色偏好")
         form.addRow("主题", self._theme)
 
         self._fuzzy = QCheckBox("启用语义检索与建议")
@@ -1454,8 +1598,50 @@ class SettingsDialog(QDialog):
 
         if self._native_report is not None:
             layout.addWidget(self._build_native_group())
+
+        layout.addWidget(self._build_author_group())
         layout.addStretch(1)
         return page
+
+    def _build_author_group(self) -> QWidget:
+        """作者与联系渠道。
+
+        此前「关于」页只有版本号和运行环境 —— 用户想问「这是谁做的、
+        去哪反馈、有没有更新」，界面上一个入口都没有，只能去 README 里翻。
+        装成安装版的用户手里没有 README。
+        """
+        from .. import AUTHOR, AUTHOR_CHANNELS, AUTHOR_QQ_GROUPS
+
+        group = QGroupBox("关于作者")
+        layout = QVBoxLayout(group)
+
+        intro = QLabel(f"<b>{AUTHOR}</b><br>同一个世界，同一个互联网！")
+        intro.setTextFormat(Qt.TextFormat.RichText)
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        for label, url in AUTHOR_CHANNELS:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            name = QLabel(f"{label}：")
+            name.setMinimumWidth(72)
+            row.addWidget(name)
+
+            # 邮箱那条要写成 mailto:，但显示的是纯地址 ——
+            # 直接显示 `mailto:xxx` 既不像地址也不像链接。
+            href = url if "://" in url else f"mailto:{url}"
+            link = QLabel(f'<a href="{href}" style="color:#4c8dff">{url}</a>')
+            link.setTextFormat(Qt.TextFormat.RichText)
+            link.setOpenExternalLinks(True)
+            link.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+            link.setWordWrap(True)
+            row.addWidget(link, 1)
+            layout.addLayout(row)
+
+        groups = QLabel("QQ 群：" + "　·　".join(AUTHOR_QQ_GROUPS))
+        groups.setWordWrap(True)
+        layout.addWidget(groups)
+        return group
 
     def _build_native_group(self) -> QWidget:
         """原生能力面板。
@@ -1527,7 +1713,11 @@ class SettingsDialog(QDialog):
             "capture.types": [kind for kind, box in self._type_boxes.items() if box.isChecked()],
             "capture.poll_interval_ms": self._poll_interval.value(),
             "capture.max_text_length": self._max_length.value(),
-            "capture.monitor_primary": self._monitor_primary.isChecked(),
+            "capture.monitor_primary": (
+                self._monitor_primary.isChecked()
+                if self._monitor_primary.isEnabled()
+                else self._monitor_primary_wanted
+            ),
             "capture.primary_interval_ms": self._primary_interval.value(),
             "history.max_items": self._max_items.value(),
             "history.max_days": self._max_days.value(),
@@ -1564,7 +1754,7 @@ class SettingsDialog(QDialog):
                 if line.strip()
             ],
             "sync.lan_discovery": self._lan_discovery.isChecked(),
-            "ui.theme": self._theme.currentText(),
+            "ui.theme": self._theme.currentData(),
             "ui.fuzzy_search": self._fuzzy.isChecked(),
             "ui.card_density": self._density.currentData(),
             "ui.global_hotkey": self._hotkey.text().strip(),

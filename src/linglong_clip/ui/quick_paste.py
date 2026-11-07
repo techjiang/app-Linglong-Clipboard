@@ -176,6 +176,20 @@ class QuickPasteOverlay(QWidget):
         self._hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._hint)
 
+    def apply_theme(self, theme: str) -> None:
+        """跟随主窗口换主题。
+
+        浮层是独立顶层窗口，不继承主窗口的样式表 —— 此前换主题只重建了
+        主窗口，浮层仍带着启动那一刻的色板：浅色主题下按快捷键，
+        弹出的还是一个深色面板。它不是「另一个程序」，用户看不出这是
+        「两个窗口各管各的」。
+        """
+        self._palette_theme = palette_for(theme)
+        self.setWindowIcon(window_icon(self._palette_theme))
+        self.setStyleSheet(toast_style(self._palette_theme))
+        # 每一行的序号底色取自色板，重建列表才会跟着换
+        self._render()
+
     # ---- 展示 ----
 
     def show_centered(self) -> None:
@@ -191,6 +205,13 @@ class QuickPasteOverlay(QWidget):
             self.adjustSize()
             x = area.center().x() - self.width() // 2
             y = area.top() + int(area.height() * 0.22)
+            # 窗口高度跟着记录条数走：9 行接近 530px，而 1024×600 的机器
+            # 可用高度只有 600。按 22% 定位的话底边会跑到屏幕外，
+            # 提示行和最后一行被切掉 —— 用户看到的是「浮层好像没显示全」。
+            # 所以超了就往上让，至少保住顶部标题栏。
+            if y + self.height() > area.bottom():
+                y = max(area.top(), area.bottom() - self.height())
+            x = max(area.left(), min(x, area.right() - self.width()))
             self.move(x, y)
         self.show()
         self.raise_()
