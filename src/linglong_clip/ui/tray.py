@@ -13,7 +13,7 @@ from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
 from ..utils.logger import get_logger
 from .icons import window_icon
-from .theme import KIND_COLORS, Palette
+from .theme import KIND_COLORS, Palette, build_stylesheet
 
 _log = get_logger("tray")
 
@@ -97,9 +97,24 @@ class TrayIcon(QSystemTrayIcon):
 
         self.setToolTip("玲珑剪切板")
         self._menu = QMenu()
+        # 托盘菜单是独立的顶层窗口，不吃主窗口的样式表。早先没给它设，
+        # 深色主题下它仍是系统配色：「暂停采集」那个勾选框画成浅灰空框，
+        # 勾上之后对勾几乎看不见 —— 用户不知道自己现在是不是暂停状态。
+        self._menu.setStyleSheet(build_stylesheet(palette))
         self._build_menu()
         self.setContextMenu(self._menu)
         self.activated.connect(self._on_activated)
+
+    def apply_theme(self, palette: Palette) -> None:
+        """跟随主窗口换主题。
+
+        托盘图标与右键菜单都是独立于主窗口的：图标由色板绘制、菜单是独立
+        顶层窗口。此前换主题只重建了主窗口，托盘图标与菜单仍停在启动那一
+        刻的配色 —— 浅色主题下菜单还是深色底，深色主题下勾选框又是浅色的。
+        """
+        self._palette_theme = palette
+        self.setIcon(tray_icon(palette))
+        self._menu.setStyleSheet(build_stylesheet(palette))
 
     def _build_menu(self) -> None:
         self._menu.clear()

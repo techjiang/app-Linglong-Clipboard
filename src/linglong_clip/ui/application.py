@@ -1172,9 +1172,13 @@ class Application(QObject):
 
         self.guard.reload_rules()
         self._apply_theme_globally()
-        self.window.apply_theme(self.config.get("ui.theme", "system"))
-        self.preview.apply_theme(self.config.get("ui.theme", "system"))
-        self.transformer.apply_theme(self.config.get("ui.theme", "system"))
+        theme = self.config.get("ui.theme", "system")
+        self.window.apply_theme(theme)
+        self.preview.apply_theme(theme)
+        self.transformer.apply_theme(theme)
+        # 托盘图标与它的右键菜单也是顶层对象，不跟着换就会停在旧配色上：
+        # 浅色主题下点托盘弹出一个深色菜单，深色主题下菜单里的勾选框是浅色空框。
+        self.tray.apply_theme(palette_for(theme))
         self.window.apply_density(
             self.config.get("ui.card_density", "comfortable")
         )

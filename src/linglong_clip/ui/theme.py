@@ -33,6 +33,14 @@ class Palette:
     warning: str
     success: str
     shadow: str
+    #: 列表/下拉里「选中行」的底色。不能用 `surface_active`：它和 `surface`
+    #: 只差 1.3 对比度，深色下选中行与未选中行看起来一模一样。
+    selection: str
+    #: 选中行上的文字色
+    selection_text: str
+    #: 滚动条滑块与悬停态。同样不能用 `border`（1.35 对比度 = 看不见）
+    scrollbar: str
+    scrollbar_hover: str
 
     def to_dict(self) -> Dict[str, str]:
         return {
@@ -48,10 +56,10 @@ DARK = Palette(
     surface="#1c1f28",
     surface_hover="#252936",
     surface_active="#2e3342",
-    border="#2a2f3d",
+    border="#363d4f",
     text="#eef1f7",
     text_dim="#a4adc2",
-    text_faint="#6c7590",
+    text_faint="#828cab",
     accent="#4c8dff",
     accent_dim="#2f5fb8",
     accent_text="#ffffff",
@@ -59,6 +67,10 @@ DARK = Palette(
     warning="#f2b447",
     success="#3ddc97",
     shadow="rgba(0, 0, 0, 0.45)",
+    selection="#2a4068",
+    selection_text="#eef1f7",
+    scrollbar="#434c66",
+    scrollbar_hover="#5a6480",
 )
 
 LIGHT = Palette(
@@ -68,10 +80,10 @@ LIGHT = Palette(
     surface="#ffffff",
     surface_hover="#f0f3f9",
     surface_active="#e4e9f3",
-    border="#d7dde9",
+    border="#ccd4e2",
     text="#1b1f2a",
     text_dim="#5a6376",
-    text_faint="#8d96a8",
+    text_faint="#6f7889",
     accent="#2f6fed",
     accent_dim="#1f4fae",
     accent_text="#ffffff",
@@ -79,6 +91,10 @@ LIGHT = Palette(
     warning="#b8801f",
     success="#1f9e6b",
     shadow="rgba(15, 24, 46, 0.12)",
+    selection="#c9dafa",
+    selection_text="#1b1f2a",
+    scrollbar="#a2adc3",
+    scrollbar_hover="#8894ab",
 )
 
 #: 各类型的强调色，列表里作为色条使用
@@ -209,15 +225,26 @@ def build_stylesheet(palette: Palette) -> str:
 
     只覆盖必要的控件，其余交给 Qt 默认样式，
     避免「样样都改」导致原生控件失去平台观感。
+
+    关于开头那条 `QWidget`：**故意不写 `background-color`**。
+    写过 `QWidget { background-color: <底色> }` 之后，下拉框弹出列表、
+    列表控件的选中行填充就全部失效 —— 深色主题的下拉里，当前选中项和
+    其它项长得一模一样，用户看不出自己在选哪一个（浅色主题下因为底色
+    本来就接近白色，反而看不出来，于是只在深色下报障）。这是
+    「全局选择器给所有 QWidget 刷底色」压掉了子控件自带的选区绘制，
+    不是某条选中态规则写漏了。改由 `QWidget#Root` / `QMainWindow` /
+    `QDialog` 这几个真正的窗口容器各自负责底色，其余容器透明。
     """
     p = palette
     return f"""
 QWidget {{
-    background-color: {p.bg};
     color: {p.text};
     font-size: 13px;
 }}
-QWidget#Root, QMainWindow, QDialog {{
+/* 只给「窗口级」容器刷底色。QScrollArea / QTabWidget 的页、分割器
+   这些中间层必须透明：它们各自的底色由下面更具体的规则决定，
+   在这里统一刷会把圆角卡片、滚动区视口都盖成一块方底。 */
+QWidget#Root, QMainWindow, QDialog, QMessageBox {{
     background-color: {p.bg};
 }}
 
@@ -271,6 +298,13 @@ QPushButton#Primary {{
 QPushButton#Primary:hover {{
     background-color: {p.accent_dim};
 }}
+/* `#Primary` 比 `:disabled` 更具体，会盖掉上面那条 disabled 规则 ——
+   于是禁用的主按钮还是一条亮蓝色，看着能点。这里必须再钉一次。 */
+QPushButton#Primary:disabled {{
+    background-color: {p.bg_alt};
+    border-color: {p.border};
+    color: {p.text_faint};
+}}
 QPushButton#Ghost {{
     background-color: transparent;
     border: none;
@@ -311,7 +345,8 @@ QListView#ItemList::item {{
     border-radius: 10px;
 }}
 QListView#ItemList::item:selected {{
-    background-color: {p.surface_active};
+    background-color: {p.selection};
+    color: {p.selection_text};
 }}
 QListView#ItemList::item:hover {{
     background-color: {p.surface_hover};
@@ -328,11 +363,11 @@ QFrame#Card {{
     background-color: {p.surface_hover};
 }}
 QFrame#Card[selected="true"] {{
-    background-color: {p.surface_active};
+    background-color: {p.selection};
     border: 1px solid {p.accent};
     border-left: 3px solid {p.accent};
 }}
-/* 卡片内标签必须透明：QLabel 默认会画一层 window 背景，
+/* 卡片内标签一律透明：QLabel 默认会画一层 window 背景，
    在带圆角与色条的卡片上就变成一条突兀的实心长条。 */
 QLabel#CardTitle {{
     color: {p.text};
@@ -433,8 +468,8 @@ QListWidget#SideList::item {{
     color: {p.text_dim};
 }}
 QListWidget#SideList::item:selected {{
-    background-color: {p.surface_active};
-    color: {p.text};
+    background-color: {p.selection};
+    color: {p.selection_text};
 }}
 QListWidget#SideList::item:hover {{
     background-color: {p.surface_hover};
@@ -462,13 +497,15 @@ QScrollBar:vertical {{
     width: 10px;
     margin: 2px;
 }}
+/* 滑块的色必须单独给：用 `border` 时它和背景只差 1.35 对比度，
+   深色下等于没有滚动条 —— 用户看到「内容被截断了，但没地方能拖」。 */
 QScrollBar::handle:vertical {{
-    background: {p.border};
+    background: {p.scrollbar};
     border-radius: 5px;
     min-height: 28px;
 }}
 QScrollBar::handle:vertical:hover {{
-    background: {p.text_faint};
+    background: {p.scrollbar_hover};
 }}
 QScrollBar:horizontal {{
     background: transparent;
@@ -476,9 +513,12 @@ QScrollBar:horizontal {{
     margin: 2px;
 }}
 QScrollBar::handle:horizontal {{
-    background: {p.border};
+    background: {p.scrollbar};
     border-radius: 5px;
     min-width: 28px;
+}}
+QScrollBar::handle:horizontal:hover {{
+    background: {p.scrollbar_hover};
 }}
 QScrollBar::add-line, QScrollBar::sub-line {{
     height: 0;
@@ -511,7 +551,24 @@ QMenu::item {{
     border-radius: 6px;
 }}
 QMenu::item:selected {{
-    background-color: {p.surface_active};
+    background-color: {p.selection};
+    color: {p.selection_text};
+}}
+QMenu::item:disabled {{
+    color: {p.text_faint};
+}}
+/* 菜单项前的勾选框（「暂停采集」「固定」这些可勾选项）。
+   这里**只给尺寸，不给底色和边框** —— 一旦 QSS 画了那个方块，
+   勾形就得自己补（`QMenu::indicator:checked` 只能刷底色，不能画勾），
+   于是「勾上」看起来就是一块纯蓝方块，和「未勾选」的空框同样认不出。
+   留白之后绘制交回 `IndicatorStyle.PE_IndicatorMenuCheckMark`，
+   它用正文色画一道实心对勾，深浅两套主题下都清楚。
+   尺寸必须给：不给的话指示器按原生尺寸走，和这里的行高对不齐。 */
+QMenu::indicator {{
+    width: 14px;
+    height: 14px;
+    margin-left: 8px;
+    margin-right: 4px;
 }}
 QMenu::separator {{
     height: 1px;
@@ -540,8 +597,22 @@ QCheckBox {{
     spacing: 7px;
     color: {p.text};
 }}
-QSpinBox, QComboBox, QLineEdit {{
+/* 输入类控件**故意不给 QComboBox 写 background-color**。
+   这是一个实测出来的坑，不是漏写：只要 QSS 里给 QComboBox 设了底色，
+   Qt 就会把它判成「被样式表接管」，连带把它的弹出列表也交给 QSS 画 ——
+   于是 `selection-background-color` 与 `::item:selected` **全部失效**，
+   弹出的下拉里所有行都是同一块底色，用户看不出当前选中的是哪一项。
+   浅色主题下底色本来就接近白色，看不出来；深色主题下就成了
+   「下拉框没有选中态」。底色交给 `QPalette.Base`（见 `apply_palette`），
+   边框、圆角、内边距仍由这里给。 */
+QSpinBox, QLineEdit {{
     background-color: {p.surface};
+    border: 1px solid {p.border};
+    border-radius: 7px;
+    padding: 5px 8px;
+    color: {p.text};
+}}
+QComboBox {{
     border: 1px solid {p.border};
     border-radius: 7px;
     padding: 5px 8px;
@@ -561,10 +632,66 @@ QSpinBox:focus, QComboBox:focus, QLineEdit:focus {{
    下拉框里那个箭头整块消失 —— 用户看到的是一个「不知道能不能点」的输入框。
    同理，QSpinBox 的上下箭头交给 `IndicatorStyle` 用矢量画（见下），
    不依赖任何位图资源。 */
+
+/* 弹出列表（下拉、补全）的选中行。
+   这里三处都要写，缺一行就有一处看不出来：
+   1. `selection-*` 给「当前高亮行」（键盘上下走的那一行）；
+   2. `::item:selected` 给「已经选中的值」（打开下拉时落点那一行）；
+   3. `::item:hover` 给鼠标滑过。
+   此前只写了 `selection-background-color: surface_active`，而
+   `surface_active` 与 `surface` 只差 1.3 对比度 —— 深色下三者
+   全是同一块底色，用户看不出自己选的是哪一项。 */
 QComboBox QAbstractItemView {{
     background-color: {p.surface};
     border: 1px solid {p.border};
-    selection-background-color: {p.surface_active};
+    outline: none;
+    selection-background-color: {p.selection};
+    selection-color: {p.selection_text};
+}}
+QComboBox QAbstractItemView::item {{
+    padding: 5px 9px;
+    min-height: 20px;
+    color: {p.text};
+    background: transparent;
+}}
+QComboBox QAbstractItemView::item:hover {{
+    background-color: {p.surface_hover};
+    color: {p.text};
+}}
+QComboBox QAbstractItemView::item:selected {{
+    background-color: {p.selection};
+    color: {p.selection_text};
+}}
+QComboBox QAbstractItemView::item:disabled {{
+    color: {p.text_faint};
+}}
+
+/* 通用列表/表格/树的选中行。主窗口的卡片列表走的是自定义 QFrame，
+   但设置页、预览、补全这些地方用的是原生 view，同一套配色。 */
+QListView, QTreeView, QTableView, QListWidget, QTreeWidget, QTableWidget {{
+    background-color: {p.surface};
+    border: 1px solid {p.border};
+    outline: none;
+    selection-background-color: {p.selection};
+    selection-color: {p.selection_text};
+}}
+QListView::item:selected, QTreeView::item:selected,
+QTableView::item:selected, QListWidget::item:selected,
+QTreeWidget::item:selected, QTableWidget::item:selected {{
+    background-color: {p.selection};
+    color: {p.selection_text};
+}}
+QListView::item:hover, QTreeView::item:hover,
+QListWidget::item:hover, QTreeWidget::item:hover {{
+    background-color: {p.surface_hover};
+}}
+QHeaderView::section {{
+    background-color: {p.bg_alt};
+    color: {p.text_dim};
+    border: none;
+    border-right: 1px solid {p.border};
+    border-bottom: 1px solid {p.border};
+    padding: 4px 8px;
 }}
 QTabWidget::pane {{
     border: 1px solid {p.border};
@@ -585,8 +712,8 @@ QTabBar::tab {{
     margin-right: 3px;
 }}
 QTabBar::tab:selected {{
-    background-color: {p.surface_active};
-    color: {p.text};
+    background-color: {p.selection};
+    color: {p.selection_text};
 }}
 QGroupBox {{
     border: 1px solid {p.border};
@@ -686,6 +813,12 @@ class IndicatorStyle(QProxyStyle):
             )
             return
 
+        if element == QStyle.PrimitiveElement.PE_IndicatorMenuCheckMark:
+            # 菜单项被勾上时的那道勾。交给原生会按系统配色画浅灰对勾，
+            # 深色菜单底上等于看不见 —— 用户不知道自己是否已经暂停采集。
+            self._draw_menu_tick(option, painter, widget)
+            return
+
         super().drawPrimitive(element, option, painter, widget)
 
     def _draw_arrow(self, element, sign: int, option, painter, widget) -> None:
@@ -715,6 +848,39 @@ class IndicatorStyle(QProxyStyle):
         painter.setPen(QPen(color, 1.2))
         painter.setBrush(color)
         painter.drawPolygon(QPolygonF(points))
+        painter.restore()
+
+    def _draw_menu_tick(self, option, painter, widget) -> None:
+        """画菜单项被勾上时的那道对勾。
+
+        QSS 那边只给了指示器的尺寸、不画方块（见 `QMenu::indicator`），
+        于是这个 primitive 会落到这里，由我们自己画勾 —— 深浅两套主题
+        都能控制颜色，不会跟着系统原生的浅色指示器走。
+        """
+        from PySide6.QtCore import QPointF, QRectF, Qt
+        from PySide6.QtGui import QPainter, QPen
+        from PySide6.QtWidgets import QStyle
+
+        if not option.state & QStyle.StateFlag.State_On:
+            return
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = QRectF(option.rect).adjusted(1, 1, -1, -1)
+        # 用正文色而不是强调色：浅色主题的强调蓝偏亮，白勾压上去几乎看不出，
+        # 而正文色在两套主题下都和菜单底色有足够对比。
+        pen = QPen(self._text_color(widget), 2.0)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPolyline(
+            [
+                QPointF(rect.left() + rect.width() * 0.26, rect.center().y()),
+                QPointF(rect.center().x() - 0.5, rect.bottom() - rect.height() * 0.28),
+                QPointF(rect.right() - rect.width() * 0.24, rect.top() + rect.height() * 0.30),
+            ]
+        )
         painter.restore()
 
     def _draw_tick(self, radio: bool, option, painter, widget) -> None:
@@ -814,8 +980,11 @@ QFrame#QuickRow {{
     background-color: transparent;
     border-radius: 9px;
 }}
+/* 浮层里键盘指向的那一行。用 `surface_active` 时它和面板底色只差
+   1.3 对比度，深色下等于没有高亮 —— 用户按上下键看不出焦点在哪。 */
 QFrame#QuickRow[active="true"] {{
-    background-color: {p.surface_active};
+    background-color: {p.selection};
+    color: {p.selection_text};
 }}
 QLabel#QuickIndex {{
     color: {p.accent};

@@ -614,3 +614,172 @@ def test_empty_state_panel_is_scrollable(qt_app, storage, config):
     assert notes, "引导页缺少「卸载程序不会删除这个目录」那句说明"
     # 面板要按内容报高度，否则外层滚动区无从滚起
     assert panel.sizeHint().height() >= panel.layout().minimumSize().height()
+
+
+# ---- 深色主题：那些「看不见」的控件 ----
+
+
+def _contrast(fore: str, back: str) -> float:
+    """WCAG 相对对比度，1.0 表示完全一样、21.0 表示黑白。"""
+
+    def channel(value: int) -> float:
+        c = value / 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+
+    def luminance(color: str) -> float:
+        text = color.lstrip("#")
+        r, g, b = (int(text[i : i + 2], 16) for i in (0, 2, 4))
+        return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+
+    hi, lo = sorted((luminance(fore), luminance(back)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def test_selection_is_visible_against_surface():
+    """现象：切到深色主题后，列表与下拉里的「选中行」和普通行一样。
+
+    选中态此前借用 `surface_active`，它与 `surface` 只差 1.3 对比度；
+    而 `surface_hover` 更接近。三者挤在一起，深色下谁也看不出选中的是哪一行。
+    """
+    from linglong_clip.ui.theme import DARK, LIGHT
+
+    for palette in (DARK, LIGHT):
+        assert _contrast(palette.selection, palette.surface) >= 1.4, palette.name
+        assert _contrast(palette.selection_text, palette.selection) >= 4.5, palette.name
+
+
+def test_scrollbar_handle_is_visible():
+    """现象：内容超出时看不到滚动条，只有一条和背景同色的细缝。"""
+    from linglong_clip.ui.theme import DARK, LIGHT
+
+    for palette in (DARK, LIGHT):
+        assert _contrast(palette.scrollbar, palette.bg) >= 2.0, palette.name
+        assert _contrast(palette.scrollbar_hover, palette.scrollbar) > 1.0, palette.name
+
+
+def test_combo_has_no_background_color_in_qss():
+    """现象：深色主题里下拉框弹出后所有选项一个色，看不出当前选了哪个。
+
+    根因不在「选中态规则写漏了」，而是 QSS 里给 `QComboBox` 设了
+    `background-color` —— 一旦设了，Qt 就把它判成被样式表接管，
+    连带把弹出列表也交给 QSS 画，`selection-background-color`
+    与 `::item:selected` 全部失效。底色改由 `QPalette.Base` 提供。
+
+    这里按选择器精确匹配：`QSpinBox, QComboBox, QLineEdit` 那种群组里
+    混进 `QComboBox` 也一样会触发，所以不能只找 `QComboBox {`。
+    """
+    import re
+
+    from linglong_clip.ui.theme import DARK, build_stylesheet
+
+    sheet = build_stylesheet(DARK)
+    for match in re.finditer(r"([^{}]+)\{([^{}]*)\}", sheet):
+        selectors, body = match.group(1), match.group(2)
+        names = [part.strip() for part in selectors.split(",")]
+        if "QComboBox" not in names:
+            continue
+        assert "background-color" not in body, f"QComboBox 不能设 background-color：{selectors.strip()}"
+
+
+def test_combo_popup_selection_is_styled():
+    """`selection-*` 与 `::item:selected` 必须真的写进样式表。"""
+    from linglong_clip.ui.theme import DARK, build_stylesheet
+
+    sheet = build_stylesheet(DARK)
+    assert "QComboBox QAbstractItemView" in sheet
+    assert f"selection-background-color: {DARK.selection};" in sheet
+    assert "QComboBox QAbstractItemView::item:selected" in sheet
+
+
+def test_no_global_widget_background():
+    """现象：给 `QWidget` 刷底色后，子控件的选区填充被一起压掉。
+
+    写过 `QWidget { background-color: ... }` 之后，下拉弹出列表与
+    原生列表的选中行都不再绘制。窗口级容器各自负责底色就够了。
+    """
+    import re
+
+    from linglong_clip.ui.theme import DARK, build_stylesheet
+
+    sheet = build_stylesheet(DARK)
+    for match in re.finditer(r"([^{}]+)\{([^{}]*)\}", sheet):
+        selectors, body = match.group(1), match.group(2)
+        names = [part.strip() for part in selectors.split(",")]
+        if "QWidget" not in names:
+            continue
+        assert "background-color" not in body, "裸 QWidget 选择器不能再刷底色"
+
+
+def test_disabled_primary_button_looks_disabled():
+    """现象：禁用的主按钮仍是一条亮蓝色，看着能点。
+
+    `#Primary` 的优先级高于 `:disabled`，必须再钉一条 `#Primary:disabled`。
+    """
+    from linglong_clip.ui.theme import DARK, build_stylesheet
+
+    sheet = build_stylesheet(DARK)
+    assert "QPushButton#Primary:disabled" in sheet
+    assert f"color: {DARK.text_faint};" in sheet
+
+
+def test_menu_indicator_leaves_the_tick_to_the_style():
+    """现象：托盘的「恢复采集」勾上之后只是一块纯蓝方块，和没勾一样认不出。
+
+    菜单是独立顶层窗口，不吃主窗口样式表。这里踩过两次坑：
+    完全不管 —— 原生指示器按系统浅色配色画，深色底上是浅灰空框；
+    而用 QSS 接管 `::indicator` 之后，`::indicator:checked` 只能刷一块
+    底色，勾形不会画。所以只能给尺寸，把绘制交回 `IndicatorStyle`
+    的 `PE_IndicatorMenuCheckMark`。
+    """
+    import re
+
+    from linglong_clip.ui.theme import DARK, LIGHT, build_stylesheet
+
+    for palette in (DARK, LIGHT):
+        sheet = build_stylesheet(palette)
+        block = re.search(r"QMenu::indicator\s*\{([^}]*)\}", sheet)
+        assert block, "菜单勾选框需要定尺寸"
+        body = block.group(1)
+        # 一旦画了方块，对勾就没机会画，勾选和不勾选长得一样
+        assert "background" not in body
+        assert "border" not in body
+        assert _contrast(palette.text_faint, palette.bg) >= 3.0, palette.name
+
+
+def test_tray_menu_follows_theme(qt_app):
+    """现象：切到浅色主题后，点托盘弹出的还是深色菜单。"""
+    from linglong_clip.ui.theme import DARK, LIGHT, build_stylesheet
+    from linglong_clip.ui.tray import TrayIcon
+
+    tray = TrayIcon(DARK)
+    assert tray._menu.styleSheet() == build_stylesheet(DARK)
+
+    tray.apply_theme(LIGHT)
+    assert tray._menu.styleSheet() == build_stylesheet(LIGHT)
+
+
+def test_settings_dialog_uses_palette_not_hardcoded_colors(qt_app, config):
+    """现象：设置页里红色的校验失败、橙色的「不会生效」在浅色主题下淡到看不清。
+
+    这些颜色此前写死成 `#e5484d` / `#e5a00d`，两套主题共用一份 ——
+    橙色在浅色底上的对比度只有 2.07。现在统一从色板取。
+    """
+    from linglong_clip.ui.settings_dialog import SettingsDialog
+
+    from linglong_clip.ui.theme import palette_for
+
+    dialog = SettingsDialog(config, None, {})
+    # 对话框持有的色板必须与当前主题一致，后面几处着色都从它取
+    assert dialog._palette is palette_for(config.get("ui.theme", "system"))
+    # 没有告警时状态标签不着色（空串），说明这些颜色是按需从色板取的
+    assert dialog._rules_state.styleSheet() == ""
+
+
+def test_secondary_text_contrast_passes_both_themes():
+    """次要文字（时间、来源、说明）在两套主题下都要读得出来。"""
+    from linglong_clip.ui.theme import DARK, LIGHT
+
+    for palette in (DARK, LIGHT):
+        assert _contrast(palette.text_faint, palette.bg) >= 3.5, palette.name
+        assert _contrast(palette.text_faint, palette.surface) >= 3.0, palette.name
+        assert _contrast(palette.text_dim, palette.surface) >= 4.5, palette.name

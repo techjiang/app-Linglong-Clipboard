@@ -88,13 +88,17 @@ class SettingsDialog(QDialog):
         self._storage = storage
         self.changes: Dict[str, object] = {}
 
+        #: 这次打开对话框时用的色板。页内各处状态文案（校验失败的红、
+        #: 半生效的黄、说明文字、链接）都从它取色 —— 早先这里是写死的
+        #: `#e5484d` / `#e5a00d` / `#8d96a8` / `#4c8dff`，在浅色主题下
+        #: 橙色的对比度只有 2.07、蓝色 2.96，等于淡到看不清。
+        self._palette = palette_for(self._config.get("ui.theme", "system"))
+
         self.setWindowTitle("设置 — 玲珑剪切板")
-        self.setWindowIcon(window_icon(palette_for(self._config.get("ui.theme", "system"))))
+        self.setWindowIcon(window_icon(self._palette))
         # 独立窗口必须自己套一层全局样式表：QSS 不会从父窗口继承，
         # 不设的话设置页是系统默认灰白外观，和主界面完全脱节。
-        self.setStyleSheet(
-            build_stylesheet(palette_for(self._config.get("ui.theme", "system")))
-        )
+        self.setStyleSheet(build_stylesheet(self._palette))
 
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
@@ -706,7 +710,7 @@ class SettingsDialog(QDialog):
             return
         rules, error = self._redact_rules()
         if error:
-            self._redact_state.setStyleSheet("color:#e5484d")
+            self._redact_state.setStyleSheet(f"color:{self._palette.danger}")
             self._redact_state.setText(f"✗ {error}")
             return
 
@@ -729,7 +733,7 @@ class SettingsDialog(QDialog):
             )
 
         if broken:
-            self._redact_state.setStyleSheet("color:#e5a00d")
+            self._redact_state.setStyleSheet(f"color:{self._palette.warning}")
         else:
             self._redact_state.setStyleSheet("")
         self._redact_state.setText(("✓ " if not broken else "✗ ") + "\n".join(lines))
@@ -1214,12 +1218,12 @@ class SettingsDialog(QDialog):
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError as exc:
-            self._rules_state.setStyleSheet("color:#e5484d")
+            self._rules_state.setStyleSheet(f"color:{self._palette.danger}")
             self._rules_state.setText(f"✗ JSON 无法解析：第 {exc.lineno} 行 {exc.msg}")
             return
 
         if not isinstance(parsed, list):
-            self._rules_state.setStyleSheet("color:#e5484d")
+            self._rules_state.setStyleSheet(f"color:{self._palette.danger}")
             self._rules_state.setText("✗ 规则必须是一个 JSON 数组")
             return
 
@@ -1251,7 +1255,7 @@ class SettingsDialog(QDialog):
         ]
         for report in broken:
             lines.append(f"  · {report.name}：{report.problems[0]}")
-        self._rules_state.setStyleSheet("color:#e5a00d")
+        self._rules_state.setStyleSheet(f"color:{self._palette.warning}")
         self._rules_state.setText("\n".join(lines))
 
     def _build_storage_group(self) -> QGroupBox:
@@ -1585,7 +1589,7 @@ class SettingsDialog(QDialog):
         text = QLabel(
             f"<h3>玲珑剪切板 {__version__}</h3>"
             "<p>跨平台智能剪贴板：本地优先、语义检索、可编程转换。</p>"
-            "<p style='color:#8d96a8'>"
+            f"<p style='color:{self._palette.text_faint}'>"
             f"运行环境：{_platform.platform()}<br>"
             f"Python {sys.version.split()[0]}<br>"
             f"配置目录：{self._config.path.parent}<br>"
@@ -1630,7 +1634,9 @@ class SettingsDialog(QDialog):
             # 邮箱那条要写成 mailto:，但显示的是纯地址 ——
             # 直接显示 `mailto:xxx` 既不像地址也不像链接。
             href = url if "://" in url else f"mailto:{url}"
-            link = QLabel(f'<a href="{href}" style="color:#4c8dff">{url}</a>')
+            link = QLabel(
+                f'<a href="{href}" style="color:{self._palette.accent}">{url}</a>'
+            )
             link.setTextFormat(Qt.TextFormat.RichText)
             link.setOpenExternalLinks(True)
             link.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
@@ -1660,15 +1666,15 @@ class SettingsDialog(QDialog):
             value = QLabel(item.detail or "-")
             value.setWordWrap(True)
             if item.status == FAIL:
-                value.setStyleSheet("color:#e5484d")
+                value.setStyleSheet(f"color:{self._palette.danger}")
                 value.setText(f"{item.detail}\n{item.hint}")
             elif item.status == DEGRADED:
-                value.setStyleSheet("color:#e5a00d")
+                value.setStyleSheet(f"color:{self._palette.warning}")
                 value.setText(f"{item.detail}\n{item.hint}")
             form.addRow(item.name, value)
 
         hint = QLabel(
-            "<p style='color:#8d96a8'>命令行可随时复查："
+            f"<p style='color:{self._palette.text_faint}'>命令行可随时复查："
             "<code>linglong-clipboard --selfcheck</code></p>"
         )
         hint.setTextFormat(Qt.TextFormat.RichText)
