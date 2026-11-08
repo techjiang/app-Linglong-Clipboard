@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import ctypes
 import threading
-from typing import Callable, Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..utils.logger import get_logger
 from ..utils.paths import is_linux, is_macos, is_windows
@@ -147,6 +147,8 @@ class HotkeyManager:
         self._next_id = 1
         self._backend = self._select_backend()
         self._unsupported_reason = ""
+        #: 真的要跑回调的那个线程上的派发器（见 `set_dispatcher`）。
+        self._dispatcher: Optional[Callable[[Callable[[], None]], None]] = None
 
     @property
     def backend_name(self) -> str:
@@ -179,6 +181,37 @@ class HotkeyManager:
             return _LinuxHotkeys()
         return None
 
+    def set_dispatcher(self, dispatcher: Optional[Callable[[Callable[[], None]], None]]) -> None:
+        """指定「回调放进哪个线程的事件循环里跑」。
+
+        为什么需要它：三平台里只有 X11 是靠**自己起线程读事件**来收按键的
+        （`RegisterHotKey` 与 Quartz tap 都直接投进 Qt 的消息循环）。
+        那个读线程里直接调回调，等于在非 GUI 线程里操作控件 —— Qt 不报错，
+        只会静默失败：父窗口设不上（`QObject::setParent: Cannot set parent`）、
+        定时器起不来，于是弹出的浮层里一行记录都没有，只剩输入框。
+
+        注意派发器**不能**是 `QTimer.singleShot(0, ...)`：`singleShot` 把
+        定时器建在**调用它的那个线程**上，而读线程没有事件循环，
+        那个定时器永远不会触发 —— 实测就是「按键被捕获了，但界面上
+        什么也没发生」。必须是能跨线程投递的东西：Qt 的信号连到主线程
+        对象上会自动走 queued connection，应用里用的就是这个。
+
+        `None` 表示就在当前线程直接执行（命令行自检、无 GUI 场景）。
+        """
+        self._dispatcher = dispatcher
+
+    def _dispatch(self, callback: Callable[[], None]) -> None:
+        """把回调送到该去的线程。"""
+        dispatcher = self._dispatcher
+        if dispatcher is None:
+            _invoke_safely(callback)
+            return
+        try:
+            dispatcher(callback)
+        except Exception:  # noqa: BLE001 - 派发失败就退回本线程，别把按键吞了
+            _log.debug("快捷键派发器失败，退回本线程执行", exc_info=True)
+            _invoke_safely(callback)
+
     def register(self, sequence: str, callback: Callable[[], None]) -> bool:
         """注册一个全局快捷键。"""
         with self._lock:
@@ -204,10 +237,7 @@ class HotkeyManager:
         if entry is None:
             return
         _sequence, callback = entry
-        try:
-            callback()
-        except Exception:  # noqa: BLE001 - 快捷键回调异常不能拖垮消息循环
-            _log.exception("快捷键回调执行失败")
+        self._dispatch(callback)
 
     def unregister(self, sequences: Sequence[str]) -> int:
         """按快捷键串撤销注册，返回撤销的条数。
@@ -613,12 +643,38 @@ def _invoke_safely(callback: Callable[[], None]) -> None:
 
 
 class _LinuxHotkeys(_BaseHotkeys):
+    """X11 全局快捷键：`XGrabKey` 抓键 + **自己读事件队列**。
+
+    这里此前只做了前半截：`grab_key` 成功了，`register()` 返回 True，
+    `--selfcheck` 也报「已注册全局快捷键 Ctrl+Shift+V（linux-x11）」——
+    但**没有任何代码去读 X 连接上的事件**。抓到的按键因此没人收，
+    回调永远不触发。用户按快捷键什么也不会发生，而所有诊断都说正常。
+
+    Windows / macOS 那边不需要这一步：`RegisterHotKey` 与 Quartz tap
+    会把事件主动投递进 Qt 的消息循环。X11 不是 —— `XGrabKey` 只是
+    让服务器把按键事件送到**我们自己这条连接**上，还得自己读。
+
+    所以这里起一个后台线程 `select()` 这条连接的 fd，把 `KeyPress`
+    按 keycode + 修饰键状态对回注册时记下的那一组，命中就触发回调。
+    线程是 daemon，`unregister_all()` 会把它停掉并关掉连接。
+    """
+
     name = "linux-x11"
+
+    #: 读事件的线程多久醒一次去看停止标志（秒）。`select` 有超时，
+    #: 不必靠信号打断，也就不用担心「卡在 select 里退不出去」。
+    POLL_INTERVAL = 0.2
 
     def __init__(self) -> None:
         self._display = None
         self._root = None
         self._x = None
+        self._thread = None
+        self._stop = threading.Event()
+        #: `(keycode, state) -> (hotkey_id, callback)`。
+        #: 存展开后的组合，不在回调时再解析 —— 解析要查 keysym 表，
+        #: 而这张表只对当前键盘布局成立，注册时算一次就够。
+        self._grabs: Dict[Tuple[int, int], Tuple[int, Callable[[], None]]] = {}
         self.unavailable_reason = ""
 
         import os
@@ -637,8 +693,36 @@ class _LinuxHotkeys(_BaseHotkeys):
             self._display = Xlib.display.Display()
             self._root = self._display.screen().root
             self._x = X
+            self._install_error_trap()
         except Exception as exc:  # noqa: BLE001
             self.unavailable_reason = f"无法连接 X 服务器：{exc}"
+
+    def _install_error_trap(self) -> None:
+        """把 X 的异步错误记下来，别让它只往 stderr 打一行。
+
+        `grab_key` 的错误是**异步**的：组合已被别的程序占用时，
+        服务器回一个 `BadAccess`，`grab_key()` 本身不抛异常，
+        `sync()` 也只是把错误交给 Xlib 的默认处理器打印出来 ——
+        于是 `register()` 照样返回 True。实测两个进程抢同一个
+        `Ctrl+Shift+V`，两边都报「已注册」，只有一处真的生效。
+
+        这里换掉默认处理器，把最近一次错误的错误码存下来，
+        `register()` 在 `sync()` 之后据此如实返回 False。
+        """
+        try:
+            self._last_x_error = None
+            backend = self
+
+            def handler(err, request=None):  # noqa: ANN001 - Xlib 的签名
+                backend._last_x_error = getattr(err, "code", None)
+
+            self._display.set_error_handler(handler)
+            # 要的是 X 协议里的错误码（`BadAccess` = 10），不是
+            # `Xlib.error.BadAccess` 那个异常类 —— 同名，含义不同。
+            self._bad_access_code = getattr(self._x, "BadAccess", None)
+        except Exception:  # noqa: BLE001
+            self._last_x_error = None
+            self._bad_access_code = None
 
     def is_available(self) -> bool:
         return self._display is not None and self._x is not None
@@ -672,10 +756,103 @@ class _LinuxHotkeys(_BaseHotkeys):
                 self._root.grab_key(
                     keycode, state | extra, True, X.GrabModeAsync, X.GrabModeAsync
                 )
+                # 每个变体都记下「按键 + 实际可能出现的状态」。
+                # 事件里的 state 会带上 Lock / Mod2 这些锁键位，必须按
+                # 掩掉锁键位之后的组合去比对，否则开着 CapsLock 就失配。
+                self._grabs[(keycode, state | extra)] = (hotkey_id, callback)
+            self._last_x_error = None
             self._display.sync()
+            if self._last_x_error is not None:
+                # 组合被别的程序占了（BadAccess）。必须如实回报失败：
+                # 报成功而实际抓不到，用户按下去不会有任何反应，
+                # 而设置页/自检都显示「已启用」—— 这类「注册成功但功能失效」
+                # 比干脆不可用更难排查。
+                self._grabs = {
+                    key: value
+                    for key, value in self._grabs.items()
+                    if value[0] != hotkey_id
+                }
+                self.unavailable_reason = (
+                    f"快捷键 {sequence} 已被其它程序占用"
+                    if self._last_x_error == self._bad_access_code
+                    else f"抓取快捷键 {sequence} 失败（X 错误码 {self._last_x_error}）"
+                )
+                try:
+                    self._root.ungrab_all_keys(self._x.CurrentTime)
+                    self._display.sync()
+                    self._regrab_locked()
+                except Exception:  # noqa: BLE001
+                    pass
+                return False
+            self._ensure_reader()
             return True
         except Exception:  # noqa: BLE001
             return False
+
+    # ---- 事件读取（这一步此前整个缺失） ----
+
+    def _ensure_reader(self) -> None:
+        """确保有线程在读这条 X 连接。"""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._read_loop, name="linglong-hotkeys-x11", daemon=True
+        )
+        self._thread.start()
+
+    def _read_loop(self) -> None:
+        display = self._display
+        if display is None:
+            return
+        try:
+            import select
+
+            fd = display.fileno()
+        except Exception:  # noqa: BLE001
+            return
+
+        while not self._stop.is_set():
+            try:
+                readable, _, _ = select.select([fd], [], [], self.POLL_INTERVAL)
+            except (OSError, ValueError):
+                # 连接被关掉时 fd 会失效，正常退出线程
+                return
+            if not readable:
+                continue
+            # 一次读干净：`pending_events()` 是本地计数，不会阻塞
+            while True:
+                try:
+                    if not display.pending_events():
+                        break
+                    event = display.next_event()
+                except Exception:  # noqa: BLE001
+                    return
+                self._on_key_event(event)
+
+    def _on_key_event(self, event) -> None:
+        """把一条 X 事件对回注册表。
+
+        `XGrabKey` 送出的是 `KeyPress`，`state` 里带按下的修饰键。
+        锁键位（CapsLock / NumLock）不影响命中 —— 它们只说明「当前
+        锁着什么」，不改变用户按了什么组合。
+        """
+        x = self._x
+        if x is None or getattr(event, "type", None) != x.KeyPress:
+            return
+        keycode = int(getattr(event, "detail", 0) or 0)
+        raw_state = int(getattr(event, "state", 0) or 0)
+        # 只保留四个真正的修饰键位，其余（Lock / Mod2 / button 位）一律抹掉
+        mask = x.ShiftMask | x.ControlMask | x.Mod1Mask | x.Mod4Mask
+        state = raw_state & mask
+        if (keycode, state) in self._grabs:
+            _id, callback = self._grabs[(keycode, state)]
+            _invoke_safely(callback)
+            return
+        if (keycode, raw_state) in self._grabs:
+            # 有些环境报的 state 不带锁键位，原样再比一次，两种情况都兜住
+            _id, callback = self._grabs[(keycode, raw_state)]
+            _invoke_safely(callback)
 
     def _keysym(self, key: str):
         try:
@@ -709,10 +886,40 @@ class _LinuxHotkeys(_BaseHotkeys):
         return XK.string_to_keysym(name) if name else None
 
     def unregister_all(self, ids: List[int]) -> None:
+        wanted = {int(i) for i in ids} if ids else None
+        if wanted is None:
+            self._grabs.clear()
+        else:
+            self._grabs = {
+                key: value for key, value in self._grabs.items() if value[0] not in wanted
+            }
         if not self.is_available():
             return
         try:
             self._root.ungrab_all_keys(self._x.CurrentTime)
+            self._display.sync()
+            if not self._grabs:
+                # 全撤光了就连读线程一起停：没有要收的键，留着只是空转 select。
+                self._stop.set()
+            else:
+                # 只撤了一部分：`ungrab_all_keys` 把剩下的也一起撤了，得重新抓上
+                self._regrab_locked()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _regrab_locked(self) -> None:
+        """`ungrab_all_keys` 之后把还留在表里的组合重新抓上。"""
+        x = self._x
+        if x is None:
+            return
+        for keycode, state in list(self._grabs):
+            try:
+                self._root.grab_key(
+                    keycode, state, True, x.GrabModeAsync, x.GrabModeAsync
+                )
+            except Exception:  # noqa: BLE001
+                continue
+        try:
             self._display.sync()
         except Exception:  # noqa: BLE001
             pass

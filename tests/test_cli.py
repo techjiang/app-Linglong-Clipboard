@@ -2264,3 +2264,40 @@ def test_main_survives_console_that_cannot_encode_chinese(monkeypatch):
     assert stream.encoding == "utf-8"
     assert stream.errors == "replace"
     assert any("玲珑剪切板" in line for line in stream.written)
+
+
+def test_config_audit_reports_unavailable_outside_source_tree(cli_env, capsys, monkeypatch):
+    """现象：安装版跑 `--config-audit`，报「46 个空转配置」。
+
+    打包后 `.py` 全在压缩包里，磁盘上没有源码目录，`rglob` 扫到 0 个文件，
+    于是把 47 个键全判成「没有读取方」。结论错得彻底，输出却信心十足。
+    """
+    import sys as _sys
+
+    from linglong_clip.utils import config_audit as module
+
+    monkeypatch.setattr(module, "_source_root", lambda: None)
+    monkeypatch.setattr(_sys, "frozen", True, raising=False)
+
+    assert main(["--config-audit"]) == 3, "没查成要单独一个退出码，不能报「有 46 个问题」"
+    out = capsys.readouterr().out
+    assert "空转" not in out, "扫不到源码时不许给出「全都空转」这种结论"
+    assert "扫不到源码" in out
+
+
+def test_config_audit_json_marks_skipped(cli_env, capsys, monkeypatch):
+    from linglong_clip.utils import config_audit as module
+
+    monkeypatch.setattr(module, "_source_root", lambda: None)
+
+    assert main(["--config-audit", "--json"]) == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["skipped"] is True
+    assert payload["unread"] == []
+
+
+def test_config_audit_from_source_tree_still_works(cli_env, capsys):
+    """源码目录下必须照旧给出真结论。"""
+    assert main(["--config-audit"]) == 0
+    out = capsys.readouterr().out
+    assert "未发现空转配置" in out

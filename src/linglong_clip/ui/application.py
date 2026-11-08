@@ -128,6 +128,8 @@ class Application(QObject):
 
     #: 采集线程 -> 主线程
     item_captured = Signal(object, str)
+    #: 全局快捷键（X11 的读线程）-> 主线程
+    hotkey_triggered = Signal(object)
 
     def __init__(
         self,
@@ -206,6 +208,16 @@ class Application(QObject):
         self._sync_signature_cache = self._sync_signature()
 
         self.hotkeys = HotkeyManager()
+        # 回调必须回到主线程：X11 后端是自己起线程读 X 事件的，在那一刻
+        # 直接操作 Qt 控件会静默失败 —— 浮层弹出来了，但里面一行记录都没有
+        # （父窗口设不上、定时器起不来）。
+        #
+        # 这里刻意**不用** `QTimer.singleShot(0, ...)`：它把定时器建在调用
+        # 它的线程（读线程）上，那个线程没有事件循环，定时器永远不触发。
+        # 走信号就不一样：接收者住在主线程，Qt 会自动按 queued connection
+        # 投递，这就把调用送回了主线程的事件循环。
+        self.hotkeys.set_dispatcher(self._on_hotkey_threadsafe)
+        self.hotkey_triggered.connect(self._run_hotkey_callback)
         self.window = MainWindow(self.storage, self.config, self.engine, self.automation)
         self.preview = QuickPasteOverlay(self.storage, self.engine, self.config)
         self.transformer = TransformWindow(self.config, self.automation)
@@ -723,6 +735,23 @@ class Application(QObject):
         if saved is None:
             return
         self.item_captured.emit(saved, outcome)
+
+    def _on_hotkey_threadsafe(self, callback) -> None:
+        """读线程里命中快捷键时，把回调投回主线程。
+
+        `emit` 是线程安全的：跨线程连接会自动走 queued connection，
+        调用被排进主线程的事件循环 —— 这正是控件操作该待的地方。
+        """
+        self.hotkey_triggered.emit(callback)
+
+    def _run_hotkey_callback(self, callback) -> None:
+        """主线程：真正执行快捷键动作。"""
+        if self._shutting_down:
+            return
+        try:
+            callback()
+        except Exception:  # noqa: BLE001 - 快捷键动作失败不能拖垮事件循环
+            _log.exception("快捷键动作执行失败")
 
     def _on_collected_threadsafe(self, item: ClipboardItem, outcome: str) -> None:
         """`Collector` 内部的回调，与采集成败无关，仅用于日志。"""

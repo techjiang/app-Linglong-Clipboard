@@ -556,3 +556,193 @@ def test_manager_handle_native_event_without_backend():
     instance = HotkeyManager()
     instance._backend = None
     assert instance.handle_native_event(0, None) is False
+
+
+# ---------------------------------------------------------------------------
+# 全局快捷键：X11 上「注册成功」必须真的能收到按键
+# ---------------------------------------------------------------------------
+
+
+def test_linux_hotkey_reader_thread_started_on_register(monkeypatch):
+    """现象：`--selfcheck` 报「已注册全局快捷键」，按下去毫无反应。
+
+    `XGrabKey` 只是让服务器把按键送到我们这条连接，还得自己读。
+    此前只做了前半截，于是回调永远不触发 —— 而所有诊断都说正常。
+    """
+    from linglong_clip.ui import hotkeys as module
+
+    backend = module._LinuxHotkeys.__new__(module._LinuxHotkeys)
+    backend._grabs = {}
+    backend._stop = __import__("threading").Event()
+    backend._thread = None
+
+    started = []
+
+    def fake_ensure():
+        started.append(True)
+
+    backend._ensure_reader = fake_ensure
+    # 手工走一遍 register 的抓键部分
+    class FakeRoot:
+        def grab_key(self, *a, **kw):
+            return None
+
+    class FakeDisplay:
+        def keysym_to_keycode(self, sym):
+            return 42
+
+        def sync(self):
+            return None
+
+        def set_error_handler(self, fn):
+            return None
+
+    class FakeX:
+        ShiftMask = 0x01
+        ControlMask = 0x04
+        Mod1Mask = 0x08
+        Mod4Mask = 0x40
+        LockMask = 0x02
+        Mod2Mask = 0x10
+        GrabModeAsync = 1
+        KeyPress = 2
+
+    backend._root = FakeRoot()
+    backend._display = FakeDisplay()
+    backend._x = FakeX()
+    backend._last_x_error = None
+    backend._bad_access_code = 10
+
+    assert backend.register(1, "Ctrl+Shift+V", lambda: None) is True
+    assert started == [True], "注册成功后必须有人开始读事件"
+
+
+def test_linux_hotkey_keypress_dispatches_callback():
+    """抓到的 KeyPress 要能对回注册时的组合并触发回调。"""
+    from linglong_clip.ui import hotkeys as module
+
+    backend = module._LinuxHotkeys.__new__(module._LinuxHotkeys)
+    fired = []
+    backend._grabs = {(55, 0x05): (1, lambda: fired.append("hit"))}
+    backend._x = type(
+        "X", (), {"KeyPress": 2, "ShiftMask": 1, "ControlMask": 4, "Mod1Mask": 8, "Mod4Mask": 64}
+    )
+    event = type("Ev", (), {"type": 2, "detail": 55, "state": 0x05})()
+    backend._on_key_event(event)
+    assert fired == ["hit"]
+
+
+def test_linux_hotkey_capslock_does_not_break_dispatch():
+    """开着 CapsLock 时 state 会多出 LockMask，不能因此失配。"""
+    from linglong_clip.ui import hotkeys as module
+
+    backend = module._LinuxHotkeys.__new__(module._LinuxHotkeys)
+    fired = []
+    backend._grabs = {(55, 0x05): (1, lambda: fired.append("hit"))}
+    backend._x = type(
+        "X",
+        (),
+        {"KeyPress": 2, "ShiftMask": 1, "ControlMask": 4, "Mod1Mask": 8, "Mod4Mask": 64},
+    )
+    event = type("Ev", (), {"type": 2, "detail": 55, "state": 0x05 | 0x02})()
+    backend._on_key_event(event)
+    assert fired == ["hit"], "锁键位不该影响命中"
+
+
+def test_linux_hotkey_other_key_not_dispatched():
+    from linglong_clip.ui import hotkeys as module
+
+    backend = module._LinuxHotkeys.__new__(module._LinuxHotkeys)
+    fired = []
+    backend._grabs = {(55, 0x05): (1, lambda: fired.append("hit"))}
+    backend._x = type(
+        "X",
+        (),
+        {"KeyPress": 2, "ShiftMask": 1, "ControlMask": 4, "Mod1Mask": 8, "Mod4Mask": 64},
+    )
+    event = type("Ev", (), {"type": 2, "detail": 99, "state": 0x05})()
+    backend._on_key_event(event)
+    assert fired == []
+
+
+def test_linux_hotkey_occupied_reports_failure():
+    """现象：两个进程抢同一个组合，两边都报「已注册」，只有一处真的生效。
+
+    `grab_key` 的错误是异步的（BadAccess），`sync()` 只是把它交给
+    默认处理器打印。必须自己抓下来，如实返回失败。
+    """
+    from linglong_clip.ui import hotkeys as module
+
+    backend = module._LinuxHotkeys.__new__(module._LinuxHotkeys)
+    backend._grabs = {}
+    backend._thread = None
+    backend._stop = __import__("threading").Event()
+
+    class FakeRoot:
+        def grab_key(self, *a, **kw):
+            return None
+
+        def ungrab_all_keys(self, *a):
+            return None
+
+    class FakeDisplay:
+        def keysym_to_keycode(self, sym):
+            return 42
+
+        def set_error_handler(self, fn):
+            return None
+
+        def sync(self):
+            # 模拟服务器回 BadAccess
+            backend._last_x_error = 10
+
+    backend._root = FakeRoot()
+    backend._display = FakeDisplay()
+    backend._x = type(
+        "X",
+        (),
+        {
+            "ShiftMask": 1, "ControlMask": 4, "Mod1Mask": 8, "Mod4Mask": 64,
+            "LockMask": 2, "Mod2Mask": 16, "GrabModeAsync": 1,
+            "CurrentTime": 0, "BadAccess": 10,
+        },
+    )
+    backend._last_x_error = None
+    backend._bad_access_code = 10
+    backend.unavailable_reason = ""
+
+    assert backend.register(1, "Ctrl+Shift+V", lambda: None) is False
+    assert "占用" in backend.unavailable_reason
+
+
+def test_hotkey_manager_runs_callback_through_dispatcher():
+    """回调必须走派发器：X11 的读线程不是 GUI 线程。
+
+    现象：浮层弹出来了但里面一行记录都没有 —— 读线程里直接操作控件，
+    父窗口设不上、定时器起不来，Qt 只往 stderr 打两行警告。
+    """
+    manager = HotkeyManager()
+    seen = []
+
+    def dispatcher(callback):
+        seen.append("dispatched")
+        callback()
+
+    manager.set_dispatcher(dispatcher)
+    manager._bindings[7] = ("Ctrl+Shift+V", lambda: seen.append("ran"))
+    manager._fire(7)
+    assert seen == ["dispatched", "ran"]
+
+
+def test_hotkey_manager_dispatcher_failure_falls_back():
+    """派发器自己炸了也不能把按键吞掉。"""
+    manager = HotkeyManager()
+    ran = []
+
+    def boom(callback):
+        raise RuntimeError("dispatcher blew up")
+
+    manager.set_dispatcher(boom)
+    manager._bindings[8] = ("Ctrl+Shift+V", lambda: ran.append("ran"))
+    manager._fire(8)
+    assert ran == ["ran"]

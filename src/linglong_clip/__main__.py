@@ -1242,6 +1242,10 @@ def _run_cli(args: argparse.Namespace) -> int:
         else:
             print(format_audit(report))
         storage.close()
+        if report.skipped:
+            # 「没查成」不能算通过，也不能算「发现空转配置」——
+            # 用一个独立的退出码，脚本才分得清这两种结局。
+            return 3
         return 0 if report.healthy else 1
 
     if args.ui_status:

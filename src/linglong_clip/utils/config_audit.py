@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -60,10 +61,18 @@ class AuditReport:
     scanned_files: int = 0
     #: 读取点统计：键 -> 引用它的模块（相对路径）
     references: Dict[str, List[str]] = field(default_factory=dict)
+    #: 没扫到源码（打包运行）时的说明。非空表示「这次审计给不出结论」，
+    #: 与「扫过了、全都接上了」必须分得开 —— 后者是 ✓，前者什么都不是。
+    skipped_reason: str = ""
 
     @property
     def healthy(self) -> bool:
         return not self.unread
+
+    @property
+    def skipped(self) -> bool:
+        """这次审计没扫到源码，结论不可用。"""
+        return bool(self.skipped_reason)
 
     @property
     def total(self) -> int:
@@ -75,9 +84,13 @@ class AuditReport:
             "read_count": self.read_count,
             "total": self.total,
             "scanned_files": self.scanned_files,
+            "skipped": self.skipped,
+            "skipped_reason": self.skipped_reason,
         }
 
     def summary(self) -> str:
+        if self.skipped:
+            return self.skipped_reason
         if self.healthy:
             return f"未发现空转配置（共 {self.total} 个配置键，全部有读取方）"
         return f"发现 {len(self.unread)} 个空转配置（共 {self.total} 个配置键）"
@@ -103,7 +116,23 @@ def default_keys() -> List[str]:
 
 
 def _source_root() -> pathlib.Path:
-    return pathlib.Path(__file__).resolve().parent.parent
+    """要扫描的源码根目录。
+
+    这个命令的判据是「拿配置键去源码里找读取点」，所以它只能在**有源码**
+    的地方给出有意义的答案。打包成可执行文件之后，`.py` 全被打进
+    `base_library.zip` / PYZ 里，磁盘上没有源码目录 —— 此前照样 `rglob`
+    一遍，扫到 0 个文件，于是把 47 个配置键全报成「空转」。
+
+    这是最糟的一种失败方式：结论错得彻底，而输出看起来信心十足
+    （`✗ 发现 46 个空转配置`）。用户据此去改代码，改的却是不存在的问题。
+
+    所以打包态明确返回 None，由 `audit_config_usage()` 给出「这个环境
+    查不了」的结论，而不是给一个假的「全都没接上」。
+    """
+    if getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS"):
+        return None  # type: ignore[return-value]
+    root = pathlib.Path(__file__).resolve().parent.parent
+    return root if root.is_dir() else None  # type: ignore[return-value]
 
 
 def _scan(root: Optional[pathlib.Path] = None) -> Dict[str, List[str]]:
@@ -139,9 +168,16 @@ def audit_config_usage(
     不必依赖当前仓库的实际内容。
     """
     keys = list(keys) if keys is not None else default_keys()
-    references = _scan(root)
-
+    base = root if root is not None else _source_root()
     report = AuditReport()
+    if base is None:
+        report.skipped_reason = (
+            "扫不到源码，这次审计给不出结论 —— "
+            "配置项审计靠读 .py 找读取方，打包成可执行文件后源码不在磁盘上。"
+            "请在源码目录里用 `python -m linglong_clip --config-audit` 跑。"
+        )
+        return report
+    references = _scan(base)
     report.scanned_files = len({p for paths in references.values() for p in paths})
     for key in keys:
         if key.startswith(_SELF_CONSUMED_PREFIXES):
@@ -175,6 +211,9 @@ def format_audit(report: AuditReport) -> str:
         "玲珑剪切板 · 配置项审计",
         "",
     ]
+    if report.skipped:
+        lines.append(f"！{report.summary()}")
+        return "\n".join(lines)
     if report.healthy:
         lines.append(f"✓ {report.summary()}")
         return "\n".join(lines)
