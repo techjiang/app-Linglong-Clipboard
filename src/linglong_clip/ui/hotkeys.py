@@ -225,7 +225,14 @@ class HotkeyManager:
             hotkey_id = self._next_id
             self._next_id += 1
             if not self._backend.register(hotkey_id, sequence, lambda: self._fire(hotkey_id)):
-                self._unsupported_reason = f"快捷键 {sequence} 注册失败（可能被其它程序占用）"
+                # 后端说得更具体就用它的：X11 那边能分出「被占用」和
+                # 「这个键在当前键位表里根本不存在」两件事，笼统地一句
+                # 「可能被其它程序占用」会把后者也盖成前者，用户照着
+                # 提示去关别的程序，怎么关都没用。
+                self._unsupported_reason = (
+                    self._backend.unavailable_reason
+                    or f"快捷键 {sequence} 注册失败（可能被其它程序占用）"
+                )
                 return False
             self._bindings[hotkey_id] = (sequence, callback)
             _log.info("已注册全局快捷键 %s（%s）", sequence, self._backend.name)
@@ -750,6 +757,12 @@ class _LinuxHotkeys(_BaseHotkeys):
 
             keycode = self._display.keysym_to_keycode(keysym)
             if not keycode:
+                # 这个键在当前键位表里没绑定（Xvfb 上没有 F24 这类键）。
+                # 不说清楚的话，上层只能报「可能被其它程序占用」——
+                # 用户去关别的程序，怎么关都不会好。
+                self.unavailable_reason = (
+                    f"当前键盘布局里没有 {key} 这个键，无法注册 {sequence}"
+                )
                 return False
             # NumLock / CapsLock 组合也要抓，否则开启这些锁键时快捷键会失效
             for extra in (0, X.LockMask, X.Mod2Mask, X.LockMask | X.Mod2Mask):

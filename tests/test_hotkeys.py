@@ -746,3 +746,51 @@ def test_hotkey_manager_dispatcher_failure_falls_back():
     manager._bindings[8] = ("Ctrl+Shift+V", lambda: ran.append("ran"))
     manager._fire(8)
     assert ran == ["ran"]
+
+
+def test_manager_prefers_backend_reason_over_generic_hint():
+    """后端说得更具体时，别用「可能被其它程序占用」盖掉它。
+
+    现象（Xvfb 上跑 `--selfcheck`）：报「快捷键 Ctrl+Alt+Shift+F24 注册失败
+    （可能被其它程序占用）」，而真实原因是这个隔离环境里根本没有 F24 这个键。
+    用户照着提示去关别的程序，怎么关都不会好。
+    """
+    class Backend:
+        unavailable_reason = "当前键盘布局里没有 f24 这个键"
+        name = "fake"
+
+        def is_available(self):
+            return True
+
+        def register(self, hotkey_id, sequence, callback):
+            return False
+
+        def unregister_all(self, ids):
+            return None
+
+    manager = HotkeyManager()
+    manager._backend = Backend()
+    manager._backend_name = "fake"
+    assert manager.register("Ctrl+Alt+Shift+F24", lambda: None) is False
+    assert "键盘布局" in manager.reason
+    assert "其它程序占用" not in manager.reason
+
+
+def test_manager_falls_back_to_generic_hint_when_backend_is_silent():
+    class Backend:
+        unavailable_reason = ""
+        name = "fake"
+
+        def is_available(self):
+            return True
+
+        def register(self, hotkey_id, sequence, callback):
+            return False
+
+        def unregister_all(self, ids):
+            return None
+
+    manager = HotkeyManager()
+    manager._backend = Backend()
+    assert manager.register("Ctrl+Shift+V", lambda: None) is False
+    assert "注册失败" in manager.reason
