@@ -1333,7 +1333,7 @@ Windows 装到当前用户目录（`%LOCALAPPDATA%\Programs\LinglongClipboard`�
 
 ```bash
 # Linux
-sudo dpkg -i linglong-clipboard_1.0.4_amd64.deb
+sudo dpkg -i linglong-clipboard_1.0.5_amd64.deb
 linglong-clipboard --version        # 装完命令行就能用
 ```
 
